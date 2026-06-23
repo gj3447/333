@@ -24,6 +24,7 @@ docker run --rm \
 | crate | block | status |
 |-------|-------|--------|
 | `crates/identity` | substrate identity — Ed25519 (RFC 8032) DID == libp2p PeerId | **receipt #1 green** |
+| `crates/discovery` | substrate discovery — PKARR announce/resolve Super-Peer location by DID | **receipt #2 green** |
 
 ### Hard core
 - Identity is **Ed25519 (RFC 8032)**, never secp256k1/BIP-340. The curve-trap guard
@@ -33,7 +34,7 @@ docker run --rm \
 
 ## Done / next (PROM step 0)
 - [x] receipt #1 — Ed25519 RFC-8032 conformance + DID==PeerId derivation + round-trip
-- [ ] receipt #2 — PKARR publish/resolve round-trip (DID → Super-Peer multiaddr)
+- [x] receipt #2 — PKARR publish/resolve over a local DHT testnet (cross-client put+get)
 - [ ] `did:key` (W3C) interop decision (currently DID := PeerId base58)
 - [ ] step 1 — browser ephemeral-client reachability via Circuit-Relay-v2 / TURN
 - [ ] step 2 — coturn relay metering → Credit bucket gate
