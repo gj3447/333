@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/identity"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "local:p333"
+
+# 333 v2 substrate — built PROM-style (test-first, no fake green, adversarial
+# self-check). Each crate maps to a build-block from the OSS survey
+# (KG: research-333-oss-survey-promv2). `identity` is PROM step 0.

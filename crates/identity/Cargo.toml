@@ -1,0 +1,16 @@
+[package]
+name = "p333-identity"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "333 v2 substrate identity: an Ed25519 (RFC 8032) DID that IS a libp2p PeerId. Never secp256k1/BIP-340."
+
+[dependencies]
+# Canonical PeerId derivation. Ed25519 curve == 333 DID curve (the lucky match,
+# per the OSS survey). secp256k1 feature deliberately NOT enabled (curve-trap guard).
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid"] }
+# RFC 8032 conformance oracle for the keygen+sign path.
+ed25519-dalek = "2"
+
+[dev-dependencies]
+hex = "0.4"
