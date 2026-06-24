@@ -1,0 +1,12 @@
+[package]
+name = "p333-ltdd"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "333 v2 substrate verification: Rust-native LTDD — assert the trace the substrate ACTUALLY emitted (read back from a store), not a return value. Bridges to ooptdd (Python) via a JSONL envelope."
+
+[dependencies]
+# Only serde_json: the LTDD envelope is plain structured data. No network, no libp2p — so the
+# receipt compiles fast and stays deterministic (the verification layer must not drag in the
+# substrate's heavy deps).
+serde_json = "1"

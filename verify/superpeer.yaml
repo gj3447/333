@@ -1,0 +1,12 @@
+# The Red artifact for the Super-Peer announce cycle: what we expect to OBSERVE, read back
+# from the store the Rust substrate emitted to. Written independent of the code; the store is
+# the judge, not the substrate's "ok". An external `ooptdd` (Python) gate evaluates this over a
+# trace emitted by `cargo run -p p333-ltdd --example emit_trace` — generator (Rust) ≠ verifier
+# (Python), across a language boundary.
+cid_env: OOPTDD_CID
+service: p333.substrate
+expect:
+  - {event: announce_requested, op: "==", count: 1}
+  - {event: packet_signed,      op: "==", count: 1}
+  - {event: dht_put_ok,         op: "==", count: 1}
+  - {event: resolve_ok,         op: ">=", count: 1}

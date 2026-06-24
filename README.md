@@ -25,6 +25,31 @@ docker run --rm \
 |-------|-------|--------|
 | `crates/identity` | substrate identity — Ed25519 (RFC 8032) DID == libp2p PeerId | **receipt #1 green** |
 | `crates/discovery` | substrate discovery — PKARR announce/resolve Super-Peer location by DID | **receipt #2 green** |
+| `crates/ltdd` | substrate **verification** — Rust-native LTDD: assert the trace the substrate *emitted* (read back from a store), not a return value; 3-valued (Present/Absent/Inconclusive); JSONL bridge to `ooptdd` | **receipt #3 green** |
+
+## Verification (LTDD)
+
+The PROM receipts already are LTDD: e.g. the discovery receipt asserts a **real DHT put+get**
+across two independent clients (`publisher ≠ resolver`), "not a serialize-then-read" — the
+side-effect actually happened, not a return value. `crates/ltdd` makes that a reusable
+primitive: a `Store` you `ship` events to and `query` back, and `verify_present(...) ->
+Present | Absent | Inconclusive` (`Inconclusive` = store unreachable, **never** a hard fail).
+
+It also **bridges out of Rust**. `Event::to_ooptdd_json` emits the exact envelope the
+[`ooptdd`](../ooptdd) (Python) reference verifier reads, so a trace this Rust substrate emitted
+can be judged by a gate in a *different language and process* — the strongest
+generator-≠-verifier separation a verdict can have:
+
+```sh
+cargo run -p p333-ltdd --example emit_trace > verify/trace.jsonl   # Rust substrate emits
+python verify/ooptdd_verify.py verify/trace.jsonl verify/superpeer.yaml  # Python ooptdd judges (GREEN/RED)
+```
+
+This is the path for the distributed/metering blocks (per the OSS survey: relay metering →
+OpenMeter → a credit-bucket gate): "did the relay *actually* meter N bytes and did the bucket
+*actually* debit?" is an arrival question. Production swaps the JSONL file for OTLP → a store;
+the gate is unchanged. **Crypto correctness stays a log-free zone** — Ed25519/RFC-8032 and
+DID==PeerId are asserted directly against test vectors (receipts #1/#2), never via trace arrival.
 
 ### Hard core
 - Identity is **Ed25519 (RFC 8032)**, never secp256k1/BIP-340. The curve-trap guard
