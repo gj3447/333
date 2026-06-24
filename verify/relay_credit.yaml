@@ -1,0 +1,15 @@
+# The Red artifact for a relay-metering session: read back from the store the substrate emitted
+# to, an external `ooptdd` (Python) gate asserts the billing actually happened — not the relay's
+# "forwarded ok". The load-bearing check is the CONSERVATION invariant: every metered cost was
+# actually debited (a free-riding relay that forwards without debiting breaks it -> RED).
+cid_env: OOPTDD_CID
+service: p333.relay
+expect:
+  - {event: relay_forwarded, op: ">=", count: 1}
+  - {event: credit_debited,  op: ">=", count: 1}
+  # conservation / no free-riding: total metered cost == total credit debited (queryable-causal tier)
+  - invariant:
+      left:  {reduce: sum, field: cost,   event: relay_forwarded}
+      right: {reduce: sum, field: amount, event: credit_debited}
+      op: "=="
+      tol: 0.0

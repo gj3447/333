@@ -35,8 +35,11 @@ os.environ.setdefault("OOPTDD_CID", events[0].get("cid") or events[0].get("cycle
 res = evaluate(backend, load_gate(gate_path))
 print(f"ooptdd verdict: ok={res['ok']}  evidence_tier={evidence_tier(res)!r}  "
       f"reachable={res['reachable']}")
+_KINDS = ("invariant", "metamorphic", "present", "absent", "must_order",
+          "external", "ratioMetric", "conforms", "heartbeat")
 for c in res["checks"]:
-    print(f"  {c.get('event', '?'):20} got={c.get('got')}  passed={c['passed']}")
+    label = c.get("event") or next((k for k in _KINDS if k in c), "check")
+    print(f"  {label:20} got={c.get('got')}  passed={c['passed']}")
 
 if not res["reachable"]:
     sys.exit(2)

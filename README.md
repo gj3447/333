@@ -26,6 +26,7 @@ docker run --rm \
 | `crates/identity` | substrate identity — Ed25519 (RFC 8032) DID == libp2p PeerId | **receipt #1 green** |
 | `crates/discovery` | substrate discovery — PKARR announce/resolve Super-Peer location by DID | **receipt #2 green** |
 | `crates/ltdd` | substrate **verification** — Rust-native LTDD: assert the trace the substrate *emitted* (read back from a store), not a return value; 3-valued (Present/Absent/Inconclusive); JSONL bridge to `ooptdd` | **receipt #3 green** |
+| `crates/metering` | relay metering → credit-bucket (step 2), LTDD-verified: metered bytes are *actually* debited and the bucket gates when empty; the **credit conservation invariant** catches a free-riding relay | **receipt #4 green** |
 
 ## Verification (LTDD)
 
@@ -60,6 +61,8 @@ DID==PeerId are asserted directly against test vectors (receipts #1/#2), never v
 ## Done / next (PROM step 0)
 - [x] receipt #1 — Ed25519 RFC-8032 conformance + DID==PeerId derivation + round-trip
 - [x] receipt #2 — PKARR publish/resolve over a local DHT testnet (cross-client put+get)
+- [x] receipt #3 — Rust-native LTDD verification primitive + cross-language `ooptdd` bridge
+- [x] receipt #4 — credit-bucket accounting + gate, LTDD-verified (conservation invariant catches free-riding)
 - [ ] `did:key` (W3C) interop decision (currently DID := PeerId base58)
 - [ ] step 1 — browser ephemeral-client reachability via Circuit-Relay-v2 / TURN
-- [ ] step 2 — coturn relay metering → Credit bucket gate
+- [ ] step 2 — coturn relay *transport* + OpenMeter/Stripe wiring (the metering→credit **accounting + gate** is done in `crates/metering`/receipt #4; transport integration remains)
