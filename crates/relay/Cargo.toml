@@ -7,7 +7,7 @@ description = "333 v2 substrate reachability: Circuit-Relay-v2 reservation + rel
 
 [dependencies]
 libp2p = { version = "0.56", features = [
-    "tokio", "tcp", "noise", "yamux",
+    "tokio", "tcp", "websocket", "dns", "noise", "yamux",
     "relay", "dcutr", "identify", "ping", "macros",
 ] }
 anyhow = "1"

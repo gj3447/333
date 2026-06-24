@@ -75,3 +75,53 @@ pub fn build_relay_client() -> anyhow::Result<(Swarm<RelayClient>, PeerId)> {
     let peer_id = *swarm.local_peer_id();
     Ok((swarm, peer_id))
 }
+
+/// Build a relay SERVER that ALSO speaks WebSocket, so a browser-class WS client can
+/// dial it (over `/ws`) and reserve a Circuit-Relay-v2 slot. This is the server-side
+/// half of browser reachability: the wasm relay-client (crates/relay-client-wasm) dials
+/// out over WebSocket; the relay must offer a WS listener for the reservation to land.
+/// Async because the websocket transport is constructed asynchronously.
+pub async fn build_relay_server_ws() -> anyhow::Result<(Swarm<RelayServer>, PeerId)> {
+    let swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_websocket(noise::Config::new, yamux::Config::default)
+        .await?
+        .with_behaviour(|kp| RelayServer {
+            relay: relay::Behaviour::new(kp.public().to_peer_id(), Default::default()),
+            identify: identify::Behaviour::new(identify::Config::new(
+                PROTOCOL.to_string(),
+                kp.public(),
+            )),
+            ping: ping::Behaviour::default(),
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    let peer_id = *swarm.local_peer_id();
+    Ok((swarm, peer_id))
+}
+
+/// Build a relay CLIENT that dials the relay over WebSocket (native stand-in for the
+/// browser wasm client, which uses websocket-websys). Same behaviour graph as the TCP
+/// client (relay-client + dcutr + identify + ping); the hop to the relay rides `/ws`.
+pub async fn build_relay_client_ws() -> anyhow::Result<(Swarm<RelayClient>, PeerId)> {
+    let swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_websocket(noise::Config::new, yamux::Config::default)
+        .await?
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|kp, relay_client| RelayClient {
+            relay_client,
+            identify: identify::Behaviour::new(identify::Config::new(
+                PROTOCOL.to_string(),
+                kp.public(),
+            )),
+            ping: ping::Behaviour::default(),
+            dcutr: dcutr::Behaviour::new(kp.public().to_peer_id()),
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    let peer_id = *swarm.local_peer_id();
+    Ok((swarm, peer_id))
+}
