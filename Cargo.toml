@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/identity", "crates/discovery", "crates/relay", "crates/ltdd", "crates/metering", "crates/crdt", "crates/replay", "crates/consensus", "crates/billing"]
+members = ["crates/identity", "crates/discovery", "crates/relay", "crates/relay-client-wasm", "crates/ltdd", "crates/metering", "crates/crdt", "crates/replay", "crates/consensus", "crates/billing"]
 
 [workspace.package]
 edition = "2021"
