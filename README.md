@@ -27,7 +27,7 @@ docker run --rm \
 | `crates/discovery` | substrate discovery — PKARR announce/resolve Super-Peer location by DID | **receipt #2 green** |
 | `crates/ltdd` | substrate **verification** — Rust-native LTDD: assert the trace the substrate *emitted* (read back from a store), not a return value; 3-valued (Present/Absent/Inconclusive); JSONL bridge to `ooptdd` | **receipt #3 green** |
 | `crates/metering` | relay metering → credit-bucket (step 2), LTDD-verified: metered bytes are *actually* debited and the bucket gates when empty; the **credit conservation invariant** catches a free-riding relay | **receipt #4 green** |
-| `crates/crdt` | consistency lane (Lane B), LTDD-verified: replicas that exchange state must **converge**; a replica that missed a sync is surfaced as `replica_diverged` (the `absent`/forbid check turns RED). Minimal G-Counter exercises the law; production adopts **yrs** | **receipt #5 green** |
+| `crates/crdt` | consistency lane (Lane B), LTDD-verified: replicas that exchange state must **converge**; a replica that missed a sync is surfaced as `replica_diverged` (the `absent`/forbid check turns RED). The same receipt runs against a minimal G-Counter **and the real `yrs` CRDT** (concurrent edits converge byte-identically) | **receipt #5 green** |
 
 ## Verification (LTDD)
 
@@ -66,6 +66,6 @@ DID==PeerId are asserted directly against test vectors (receipts #1/#2), never v
 - [x] receipt #4 — credit-bucket accounting + gate, LTDD-verified (conservation invariant catches free-riding)
 - [x] receipt #5 — Lane B consistency: CRDT convergence law, LTDD-verified (`absent` forbids `replica_diverged`)
 - [ ] `did:key` (W3C) interop decision (currently DID := PeerId base58)
-- [ ] Lane B — adopt **yrs** (Yjs/Rust) as the production CRDT behind the `crates/crdt` convergence receipt
+- [x] Lane B — **yrs** (Yjs/Rust) adopted behind the `crates/crdt` convergence receipt; the receipt holds against the real CRDT (concurrent edits converge byte-identically, judged by the same `ooptdd` gate)
 - [ ] step 1 — browser ephemeral-client reachability via Circuit-Relay-v2 / TURN
 - [ ] step 2 — coturn relay *transport* + OpenMeter/Stripe wiring (the metering→credit **accounting + gate** is done in `crates/metering`/receipt #4; transport integration remains)

@@ -8,6 +8,9 @@ description = "333 v2 substrate consistency lane (Lane B) — the CONVERGENCE-la
 [dependencies]
 # The verification primitive: structured-event emission + store + 3-valued arrival verdict.
 p333-ltdd = { path = "../ltdd" }
+# Lane B production CRDT (Yjs/Rust). The convergence receipt is run against the REAL CRDT, not
+# only the minimal G-Counter — the thorough completion of the lane.
+yrs = "0.23"
 
 [dev-dependencies]
 serde_json = "1"

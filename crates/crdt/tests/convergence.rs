@@ -9,7 +9,7 @@
 //! pass; a minimal G-Counter exercises it here.
 
 use p333_ltdd::{verify_present, MemoryStore, Store, Verdict};
-use p333_crdt::{gossip, record_states, GCounter};
+use p333_crdt::{gossip, record_convergence, record_states, yrs_text_converge, GCounter};
 
 #[test]
 fn merge_is_commutative_associative_idempotent() {
@@ -74,4 +74,66 @@ fn a_replica_that_missed_sync_is_recorded_as_diverged() {
     assert!(!only_a_gossiped, "replicas disagree (5 vs 3) -> not converged");
     assert_eq!(verify_present(&s, "doc-2", "replica_diverged", 1), Verdict::Present);
     assert_eq!(verify_present(&s, "doc-2", "converged", 1), Verdict::Absent);
+}
+
+// ── the SAME receipt, run against the REAL production CRDT (yrs / Lane B) ──────────
+
+#[test]
+fn yrs_replicas_converge_under_concurrent_edits() {
+    // three replicas each insert different text at position 0 concurrently (a real conflict),
+    // then full-mesh gossip their updates. yrs resolves the interleaving deterministically, so
+    // all replicas converge byte-identically — asserted via the SAME trace + gate as the G-Counter.
+    let mut s = MemoryStore::default();
+    let converged =
+        yrs_text_converge(&mut s, "ydoc-1", &[("a", "hello "), ("b", "world"), ("c", "!!!")]);
+    assert!(converged, "yrs replicas must converge under concurrent edits");
+
+    assert_eq!(verify_present(&s, "ydoc-1", "converged", 1), Verdict::Present);
+    assert_eq!(verify_present(&s, "ydoc-1", "replica_diverged", 1), Verdict::Absent);
+
+    let finals: Vec<String> = s
+        .query("ydoc-1")
+        .iter()
+        .filter(|e| e.event == "replica_final")
+        .map(|e| e.attrs.get("state").unwrap().as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(finals.len(), 3);
+    assert!(finals.windows(2).all(|w| w[0] == w[1]), "all three replicas byte-identical");
+    assert!(!finals[0].is_empty(), "and non-trivial (the edits actually merged)");
+}
+
+#[test]
+fn a_yrs_replica_that_missed_an_update_is_recorded_as_diverged() {
+    // model a dropped sync: `a` receives `b`'s update, but `b` never receives `a`'s -> they end
+    // at different states. The receipt catches it (a "merged ok" return value would not).
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+
+    let mut s = MemoryStore::default();
+    let a = Doc::new();
+    let b = Doc::new();
+    let ta = a.get_or_insert_text("doc");
+    let tb = b.get_or_insert_text("doc");
+    {
+        let mut txn = a.transact_mut();
+        ta.insert(&mut txn, 0, "hello ");
+    }
+    {
+        let mut txn = b.transact_mut();
+        tb.insert(&mut txn, 0, "world");
+    }
+    let ub = b.transact().encode_state_as_update_v1(&StateVector::default());
+    {
+        let mut txn = a.transact_mut();
+        txn.apply_update(Update::decode_v1(&ub).unwrap()).unwrap(); // a sees b
+    }
+    // b's apply of a's update is DROPPED -> b stays "world", a has both.
+    let sa = ta.get_string(&a.transact());
+    let sb = tb.get_string(&b.transact());
+    assert_ne!(sa, sb, "the dropped sync left them divergent");
+
+    let converged = record_convergence(&mut s, "ydoc-2", &[("a", sa), ("b", sb)]);
+    assert!(!converged);
+    assert_eq!(verify_present(&s, "ydoc-2", "replica_diverged", 1), Verdict::Present);
+    assert_eq!(verify_present(&s, "ydoc-2", "converged", 1), Verdict::Absent);
 }

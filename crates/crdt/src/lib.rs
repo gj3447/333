@@ -55,29 +55,70 @@ pub fn gossip(replicas: &mut [(&str, GCounter)]) {
     }
 }
 
-/// Record each replica's final value to the store and judge convergence. Emits `replica_final`
-/// per replica; `converged` iff they all agree; a `replica_diverged` per replica that doesn't.
-/// Returns whether they converged. The store — not this bool — is the receipt's judge.
-pub fn record_states(store: &mut impl Store, cid: &str, replicas: &[(&str, GCounter)]) -> bool {
-    let canonical = replicas.first().map(|(_, c)| c.value()).unwrap_or(0);
+/// Generic convergence recorder — CRDT-agnostic, so the SAME ooptdd gate judges a G-Counter or a
+/// yrs document. Emits `replica_final{state}` per replica; `converged` iff all states agree, else a
+/// `replica_diverged{state,expected}` per offender. The store — not this bool — is the judge.
+pub fn record_convergence(store: &mut impl Store, cid: &str, states: &[(&str, String)]) -> bool {
+    let canonical = states.first().map(|(_, s)| s.clone()).unwrap_or_default();
     let mut converged = true;
-    for (id, counter) in replicas {
-        let v = counter.value();
+    for (id, state) in states {
         store.ship(&[Event::new(cid, "replica_final")
             .with("replica", *id)
-            .with("value", v)]);
-        if v != canonical {
+            .with("state", state.clone())]);
+        if *state != canonical {
             converged = false;
             store.ship(&[Event::new(cid, "replica_diverged")
                 .with("replica", *id)
-                .with("value", v)
-                .with("expected", canonical)]);
+                .with("state", state.clone())
+                .with("expected", canonical.clone())]);
         }
     }
     if converged {
-        store.ship(&[Event::new(cid, "converged")
-            .with("value", canonical)
-            .with("replicas", replicas.len() as u64)]);
+        store.ship(&[Event::new(cid, "converged").with("replicas", states.len() as u64)]);
     }
     converged
+}
+
+/// Record G-Counter convergence by counter value — a thin wrapper over [`record_convergence`].
+pub fn record_states(store: &mut impl Store, cid: &str, replicas: &[(&str, GCounter)]) -> bool {
+    let states: Vec<(&str, String)> =
+        replicas.iter().map(|(id, c)| (*id, c.value().to_string())).collect();
+    record_convergence(store, cid, &states)
+}
+
+/// Drive `edits` (one `(replica_id, text)` per replica) as concurrent yrs `Text` inserts at
+/// position 0, full-mesh gossip every replica's update to every replica, then record convergence.
+/// yrs (Lane B's production CRDT) resolves the interleaving deterministically, so the replicas
+/// converge byte-identically — this runs the convergence receipt against the REAL CRDT, not only
+/// the minimal G-Counter.
+pub fn yrs_text_converge(store: &mut impl Store, cid: &str, edits: &[(&str, &str)]) -> bool {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+
+    let docs: Vec<Doc> = edits.iter().map(|_| Doc::new()).collect();
+    for (i, (_, text)) in edits.iter().enumerate() {
+        let t = docs[i].get_or_insert_text("doc");
+        let mut txn = docs[i].transact_mut();
+        t.insert(&mut txn, 0, text);
+    }
+    // full mesh: collect each replica's update, apply ALL to EVERY replica (idempotent re-applies ok)
+    let updates: Vec<Vec<u8>> = docs
+        .iter()
+        .map(|d| d.transact().encode_state_as_update_v1(&StateVector::default()))
+        .collect();
+    for d in &docs {
+        for u in &updates {
+            let mut txn = d.transact_mut();
+            txn.apply_update(Update::decode_v1(u).unwrap()).unwrap();
+        }
+    }
+    let states: Vec<(&str, String)> = edits
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| {
+            let t = docs[i].get_or_insert_text("doc");
+            (*id, t.get_string(&docs[i].transact()))
+        })
+        .collect();
+    record_convergence(store, cid, &states)
 }
