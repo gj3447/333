@@ -31,6 +31,7 @@ docker run --rm \
 | `crates/replay` | Lane C deterministic replay (rollback netcode), LTDD-verified: the **determinism law** — same inputs replay to the same state; a run-dependent step diverges and is caught (`absent` forbids `replay_diverged`). Production adopts **ggrs** | **receipt #6 green** |
 | `crates/consensus` | Lane A owned-object consistency (Sui-Lutris / FastPay **fast path**, single-writer — *not* the shared-object/consensus path), LTDD-verified: the **no-double-spend** safety law — an object version finalizes *exactly once* (`spend_finalized == 1`); an equivocating spend is rejected, and a double-finalize turns the count check RED. Production adopts a Sui-Lutris/FastPay engine | **receipt #7 green** |
 | `crates/billing` | **credits as owned objects** — composes Lane A + metering: a relay debit is a finalized owned-object spend (replay-safe, no double-debit) *and* equals the metered cost (conservation). The combined `ooptdd` gate (conservation `invariant` + finalized + no-replay) is GREEN at `queryable_causal`; a free-riding forward or a replayed debit turns it RED | **receipt #8 green** |
+| `crates/relay-billing` | **real-relay byte metering** — forwards a request-response payload over an *actual* Circuit-Relay-v2 connection (server = `crates/relay`) and meters + bills it end-to-end; the relayed delivery is proven by the ack, then the bytes become a finalized owned-object debit. Closes the metering↔relay wiring on the **real relay**, not the in-process `Loopback` | **green** |
 
 ## Verification (LTDD)
 
@@ -86,4 +87,4 @@ DID==PeerId are asserted directly against test vectors (receipts #1/#2), never v
 - [x] cross-language gate suite — `verify/run_gates.sh` asserts every `ooptdd` gate GREEN over a real trace **and** RED over an injected adversary (the forbid/`invariant` gates are proven to fire)
 - [x] Lane B — **yrs** (Yjs/Rust) adopted behind the `crates/crdt` convergence receipt; the receipt holds against the real CRDT (concurrent edits converge byte-identically, judged by the same `ooptdd` gate)
 - [ ] step 1 — browser ephemeral-client reachability via Circuit-Relay-v2 / TURN
-- [~] step 2 — metering is now wired behind a `Transport` trait + an in-process `Loopback` (end-to-end byte→credit, conservation holds); the real **libp2p Circuit-Relay-v2** transport + OpenMeter/Stripe wiring remain (the relay needs a public reservation address, out of the sandbox)
+- [x] step 2 (substrate side) — metering→credit billing wired to the **real Circuit-Relay-v2**: `crates/relay-billing` forwards a payload over an actual relayed connection and meters + bills it end-to-end, LTDD-verified (the in-process `Loopback` stays as the deterministic fixture). Remaining: the OpenMeter/Stripe billing backend (out of repo)
