@@ -1,0 +1,9 @@
+# Lane C determinism: replaying the same inputs must reach the same state on every run. Read back
+# from the store, an `ooptdd` gate asserts `deterministic` present and `replay_diverged` ABSENT
+# (the forbid primitive); a run that desynced emits `replay_diverged` and turns this RED.
+cid_env: OOPTDD_CID
+service: p333.replay
+expect:
+  - {event: replay_result, op: ">=", count: 2}
+  - {event: deterministic, op: ">=", count: 1}
+  - {absent: [{event: replay_diverged}]}

@@ -79,3 +79,49 @@ pub fn relay_forward(
         false
     }
 }
+
+/// A byte source the relay meters. The PRODUCTION impl is a libp2p Circuit-Relay-v2 stream; this
+/// in-process [`Loopback`] lets the metered byte→credit flow be receipted WITHOUT the network (the
+/// libp2p relay needs a public reservation address — out of scope in the sandbox, see crates/relay).
+pub trait Transport {
+    /// The next chunk of bytes to forward, or `None` when the stream is exhausted.
+    fn next_chunk(&mut self) -> Option<u64>;
+}
+
+/// An in-process transport replaying a fixed list of byte-chunk sizes.
+pub struct Loopback {
+    chunks: std::vec::IntoIter<u64>,
+}
+
+impl Loopback {
+    pub fn new(chunks: Vec<u64>) -> Self {
+        Self { chunks: chunks.into_iter() }
+    }
+}
+
+impl Transport for Loopback {
+    fn next_chunk(&mut self) -> Option<u64> {
+        self.chunks.next()
+    }
+}
+
+/// Wire a transport end-to-end to the credit gate: pull byte chunks and meter+bill each until the
+/// stream ends or the bucket gates. Returns how many chunks were forwarded before any gate. The
+/// same `relay_forward` accounting runs whether the bytes come from `Loopback` or a real libp2p relay.
+pub fn run_session(
+    store: &mut impl Store,
+    cid: &str,
+    transport: &mut impl Transport,
+    bucket: &mut CreditBucket,
+    rate_per_kib: u64,
+) -> usize {
+    let mut forwarded = 0;
+    while let Some(bytes) = transport.next_chunk() {
+        if relay_forward(store, cid, bucket, bytes, rate_per_kib) {
+            forwarded += 1;
+        } else {
+            break; // gated: the bucket can't pay -> stop the session
+        }
+    }
+    forwarded
+}
