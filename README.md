@@ -29,7 +29,7 @@ docker run --rm \
 | `crates/metering` | relay metering → credit-bucket (step 2), LTDD-verified: metered bytes are *actually* debited and the bucket gates when empty; the **credit conservation invariant** catches a free-riding relay | **receipt #4 green** |
 | `crates/crdt` | consistency lane (Lane B), LTDD-verified: replicas that exchange state must **converge**; a replica that missed a sync is surfaced as `replica_diverged` (the `absent`/forbid check turns RED). The same receipt runs against a minimal G-Counter **and the real `yrs` CRDT** (concurrent edits converge byte-identically) | **receipt #5 green** |
 | `crates/replay` | Lane C deterministic replay (rollback netcode), LTDD-verified: the **determinism law** — same inputs replay to the same state; a run-dependent step diverges and is caught (`absent` forbids `replay_diverged`). Production adopts **ggrs** | **receipt #6 green** |
-| `crates/consensus` | Lane A owned-object consistency (Sui-Lutris / FastPay), LTDD-verified: the **no-double-spend** safety law — an object version finalizes *exactly once* (`spend_finalized == 1`); an equivocating spend is rejected, and a double-finalize turns the count check RED. Production adopts a Sui-Lutris/FastPay engine | **receipt #7 green** |
+| `crates/consensus` | Lane A owned-object consistency (Sui-Lutris / FastPay **fast path**, single-writer — *not* the shared-object/consensus path), LTDD-verified: the **no-double-spend** safety law — an object version finalizes *exactly once* (`spend_finalized == 1`); an equivocating spend is rejected, and a double-finalize turns the count check RED. Production adopts a Sui-Lutris/FastPay engine | **receipt #7 green** |
 | `crates/billing` | **credits as owned objects** — composes Lane A + metering: a relay debit is a finalized owned-object spend (replay-safe, no double-debit) *and* equals the metered cost (conservation). The combined `ooptdd` gate (conservation `invariant` + finalized + no-replay) is GREEN at `queryable_causal`; a free-riding forward or a replayed debit turns it RED | **receipt #8 green** |
 
 ## Verification (LTDD)
@@ -42,13 +42,24 @@ Present | Absent | Inconclusive` (`Inconclusive` = store unreachable, **never** 
 
 It also **bridges out of Rust**. `Event::to_ooptdd_json` emits the exact envelope the
 [`ooptdd`](../ooptdd) (Python) reference verifier reads, so a trace this Rust substrate emitted
-can be judged by a gate in a *different language and process* — the strongest
-generator-≠-verifier separation a verdict can have:
+can be judged by a gate in a *different language and process* (generator ≠ verifier).
+
+Two distinct verdicts, honestly: the **cargo receipts** gate the build with Rust-native
+`verify_present()` / value-conservation asserts (stricter — exact `==` counts and balances). The
+**`ooptdd` gates** (`verify/*.yaml`) are the *independent cross-language* check, and they are
+**asserted, not just demonstrated**: `verify/run_gates.sh` runs every gate over a real Rust-emitted
+trace (must be GREEN, exit 0) **and** over an injected adversary (must be RED, exit 1), so the
+forbid/`invariant` gates are proven to fire — not merely shipped against their own green input.
 
 ```sh
-cargo run -p p333-ltdd --example emit_trace > verify/trace.jsonl   # Rust substrate emits
-python verify/ooptdd_verify.py verify/trace.jsonl verify/superpeer.yaml  # Python ooptdd judges (GREEN/RED)
+sh verify/run_gates.sh   # emits every trace (Docker) → judges with ooptdd → asserts GREEN green + RED red
 ```
+
+Honest scope: `run_gates.sh` is the cross-language gate suite (needs Docker + the `ooptdd`
+package); it is not wired into `cargo test` (that container has no Python). The conservation/
+correspondence invariants also guard against a future refactor that decouples the emits — on the
+current happy path a correct call can't violate them, which is exactly why the RED suite (a
+free-riding forward, a double-finalize, a desynced replica) is what proves the gate discriminates.
 
 This is the path for the distributed/metering blocks (per the OSS survey: relay metering →
 OpenMeter → a credit-bucket gate): "did the relay *actually* meter N bytes and did the bucket
@@ -72,6 +83,7 @@ DID==PeerId are asserted directly against test vectors (receipts #1/#2), never v
 - [x] receipt #7 — Lane A owned-object: no-double-spend safety, LTDD-verified (`spend_finalized == 1`)
 - [x] receipt #8 — credits-as-owned-objects billing: composes Lane A + metering (conservation + replay-safe debit)
 - [x] `did:key` (W3C) interop decision — **DID stays PeerId-canonical; `did:key:z6Mk…` is the export/interop form** (same Ed25519 key, round-trip KAT in `crates/identity`); a secp256k1 `did:key` is rejected (curve-trap)
+- [x] cross-language gate suite — `verify/run_gates.sh` asserts every `ooptdd` gate GREEN over a real trace **and** RED over an injected adversary (the forbid/`invariant` gates are proven to fire)
 - [x] Lane B — **yrs** (Yjs/Rust) adopted behind the `crates/crdt` convergence receipt; the receipt holds against the real CRDT (concurrent edits converge byte-identically, judged by the same `ooptdd` gate)
 - [ ] step 1 — browser ephemeral-client reachability via Circuit-Relay-v2 / TURN
 - [~] step 2 — metering is now wired behind a `Transport` trait + an in-process `Loopback` (end-to-end byte→credit, conservation holds); the real **libp2p Circuit-Relay-v2** transport + OpenMeter/Stripe wiring remain (the relay needs a public reservation address, out of the sandbox)

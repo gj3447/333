@@ -1,7 +1,10 @@
-# The COMBINED gate for credits-as-owned-objects billing: an external `ooptdd` gate asserts, read
-# back from the store, that the two composed lanes both hold. (1) conservation — every metered cost
-# was actually debited (no free-riding / no double-debit, either breaks the invariant). (2) each
-# debit is a finalized owned-object spend. (3) the happy path saw no replay (equivocation rejected).
+# The COMBINED gate for credits-as-owned-objects billing: read back from the store, an external
+# `ooptdd` gate asserts the two composed lanes both hold. Provenance: emitted by `crates/billing`
+# (service: p333.billing). Load-bearing checks:
+#  - conservation (sum): every metered cost was actually debited (no free-riding / double-debit).
+#  - correspondence (count): every forward → exactly one debit → exactly one finalized spend
+#    (kills a debit-without-finalize and a ghost double-finalize, which the sum alone misses).
+#  - the happy path saw no replay (equivocation rejected absent).
 cid_env: OOPTDD_CID
 service: p333.billing
 expect:
@@ -11,6 +14,16 @@ expect:
   - invariant:
       left:  {reduce: sum, field: cost,   event: relay_forwarded}
       right: {reduce: sum, field: amount, event: credit_debited}
+      op: "=="
+      tol: 0.0
+  - invariant:  # every forward debited exactly once
+      left:  {reduce: count, event: relay_forwarded}
+      right: {reduce: count, event: credit_debited}
+      op: "=="
+      tol: 0.0
+  - invariant:  # every debit is a finalized owned-object spend (no unfinalized debit, no ghost finalize)
+      left:  {reduce: count, event: credit_debited}
+      right: {reduce: count, event: spend_finalized}
       op: "=="
       tol: 0.0
   - {absent: [{event: equivocation_rejected}]}
