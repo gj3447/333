@@ -11,6 +11,8 @@ description = "333 v2 substrate identity: an Ed25519 (RFC 8032) DID that IS a li
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid"] }
 # RFC 8032 conformance oracle for the keygen+sign path.
 ed25519-dalek = "2"
+# base58btc for the W3C did:key multibase encoding (the same key, interoperable form).
+bs58 = "0.5"
 
 [dev-dependencies]
 hex = "0.4"

@@ -1,0 +1,16 @@
+# The COMBINED gate for credits-as-owned-objects billing: an external `ooptdd` gate asserts, read
+# back from the store, that the two composed lanes both hold. (1) conservation — every metered cost
+# was actually debited (no free-riding / no double-debit, either breaks the invariant). (2) each
+# debit is a finalized owned-object spend. (3) the happy path saw no replay (equivocation rejected).
+cid_env: OOPTDD_CID
+service: p333.billing
+expect:
+  - {event: relay_forwarded, op: ">=", count: 1}
+  - {event: credit_debited,  op: ">=", count: 1}
+  - {event: spend_finalized, op: ">=", count: 1}
+  - invariant:
+      left:  {reduce: sum, field: cost,   event: relay_forwarded}
+      right: {reduce: sum, field: amount, event: credit_debited}
+      op: "=="
+      tol: 0.0
+  - {absent: [{event: equivocation_rejected}]}

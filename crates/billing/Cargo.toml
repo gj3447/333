@@ -1,0 +1,11 @@
+[package]
+name = "p333-billing"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "333 v2 substrate — credits as OWNED OBJECTS: relay billing composing two lanes. A debit is a finalized owned-object spend (Lane A: replay-safe, no double-debit) AND the debited amount equals the metered cost (Lane B metering: conservation). LTDD-verified end to end."
+
+[dependencies]
+p333-ltdd = { path = "../ltdd" }
+p333-metering = { path = "../metering" }
+p333-consensus = { path = "../consensus" }

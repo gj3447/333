@@ -30,6 +30,7 @@ docker run --rm \
 | `crates/crdt` | consistency lane (Lane B), LTDD-verified: replicas that exchange state must **converge**; a replica that missed a sync is surfaced as `replica_diverged` (the `absent`/forbid check turns RED). The same receipt runs against a minimal G-Counter **and the real `yrs` CRDT** (concurrent edits converge byte-identically) | **receipt #5 green** |
 | `crates/replay` | Lane C deterministic replay (rollback netcode), LTDD-verified: the **determinism law** — same inputs replay to the same state; a run-dependent step diverges and is caught (`absent` forbids `replay_diverged`). Production adopts **ggrs** | **receipt #6 green** |
 | `crates/consensus` | Lane A owned-object consistency (Sui-Lutris / FastPay), LTDD-verified: the **no-double-spend** safety law — an object version finalizes *exactly once* (`spend_finalized == 1`); an equivocating spend is rejected, and a double-finalize turns the count check RED. Production adopts a Sui-Lutris/FastPay engine | **receipt #7 green** |
+| `crates/billing` | **credits as owned objects** — composes Lane A + metering: a relay debit is a finalized owned-object spend (replay-safe, no double-debit) *and* equals the metered cost (conservation). The combined `ooptdd` gate (conservation `invariant` + finalized + no-replay) is GREEN at `queryable_causal`; a free-riding forward or a replayed debit turns it RED | **receipt #8 green** |
 
 ## Verification (LTDD)
 
@@ -69,7 +70,8 @@ DID==PeerId are asserted directly against test vectors (receipts #1/#2), never v
 - [x] receipt #5 — Lane B consistency: CRDT convergence law, LTDD-verified (`absent` forbids `replica_diverged`)
 - [x] receipt #6 — Lane C deterministic replay: determinism law, LTDD-verified (run-dependent step caught)
 - [x] receipt #7 — Lane A owned-object: no-double-spend safety, LTDD-verified (`spend_finalized == 1`)
-- [ ] `did:key` (W3C) interop decision (currently DID := PeerId base58)
+- [x] receipt #8 — credits-as-owned-objects billing: composes Lane A + metering (conservation + replay-safe debit)
+- [x] `did:key` (W3C) interop decision — **DID stays PeerId-canonical; `did:key:z6Mk…` is the export/interop form** (same Ed25519 key, round-trip KAT in `crates/identity`); a secp256k1 `did:key` is rejected (curve-trap)
 - [x] Lane B — **yrs** (Yjs/Rust) adopted behind the `crates/crdt` convergence receipt; the receipt holds against the real CRDT (concurrent edits converge byte-identically, judged by the same `ooptdd` gate)
 - [ ] step 1 — browser ephemeral-client reachability via Circuit-Relay-v2 / TURN
 - [~] step 2 — metering is now wired behind a `Transport` trait + an in-process `Loopback` (end-to-end byte→credit, conservation holds); the real **libp2p Circuit-Relay-v2** transport + OpenMeter/Stripe wiring remain (the relay needs a public reservation address, out of the sandbox)
