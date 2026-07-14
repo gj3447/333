@@ -1,0 +1,70 @@
+{
+  "findingId": "rf-d20-crdt-causal-hlc-20260415",
+  "agentId": "D20",
+  "domain": "distributed-crdt",
+  "oneLineSummary": "Multi-agent concurrent KG writes need HLC+Or-Set CRDT to preserve causal order & reference integrity without data loss.",
+  "rootCause": "Lamport timestamps alone cannot detect concurrency; state-based merges lose edits (LWW collision). Multi-agent simultaneous reference writes → last-write-wins silently drops intermediate updates. KG Longinus binders (sourceId+sourcePath) lack causal tracking → dangling or stale references in merged states.",
+  "recommendation": "Adopt Hybrid Logical Clock (HLC) + Or-Set CRDT: (1) Replace Lamport with HLC (wall-ms + counter + node_id) for monotonic physical-time guarantees. (2) Wrap KG references as Or-Set entries (tag=(agent_id, seq)) → concurrent add+remove → add wins via tag identity. (3) On KG merge: apply Or-Set causal semantics (remove only observed tags) before state application. (4) Persist HLC state on each agent for recovery across sessions.",
+  "technicalDetails": {
+    "hlcComponent": "16 bytes: u64 wall_ms + u32 counter + u32 node_id. tick() increments counter; recv(remote) → max(local.counter, remote.counter)+1. Preserves causal ordering: if a→b (a send then recv), then hlc(a) < hlc(b).",
+    "orSetApplication": "Each KG reference triple (entity_id, sourceId, sourcePath) tagged as Or-Set entry. Tag = (agent_id, sequence). Concurrent edits: Agent A adds {ref1, tag_A_1} && Agent B removes {ref1, tag_A_1} → merge favors add (tag not yet tombstoned on B's side). Delta sync: only transmit new (value,tag) pairs and removal tags, not full state.",
+    "stateVectorPiggybacking": "SyncPayload includes per-agent max HLC seen. On receive: if remote.hlc > local.hlc for that agent, apply delta; else discard (already seen). Prevents out-of-order delivery bugs.",
+    "mergeSemantics": "State-based Or-Set: merge_delta(remote_delta) applies removes first (tombstone tags), then adds (skip if already tombstoned). Idempotent, commutative, associative. For KG: each MERGE operation in Neo4j → wrap in Or-Set semantics before APOC merge.",
+    "333SignalingIntegration": "WebRTC DataChannel carries postcard-encoded SyncPayload with HLC. Leader sends snapshot (full state + HLC vector). Peers apply deltas with causal checks. Late joiner catches up: snapshot + committed blocks (BFT view guarantees total order for consensus txns)."
+  },
+  "alternatives": [
+    {
+      "name": "Vector Clock",
+      "tradeoff": "Precise causality detection (O(n) storage per message). Overkill for LWW maps; better for detecting ALL concurrency but slower merge checks. Use if causal conflict detection critical.",
+      "when": "When you need to detect \"were A and B concurrent?\" for every pair. Kubernetes Optimistic Locking uses vector-like logic."
+    },
+    {
+      "name": "Last-Writer-Wins (LWW) without HLC",
+      "tradeoff": "Current 333 approach: Lamport timestamp + node_id tiebreak. Silent data loss if concurrent edits to same KG reference. Suitable for game state (blocks override each other) but NOT for KG integrity.",
+      "when": "Only if you can tolerate lost updates on collision. Not recommended for immutable Longinus references."
+    },
+    {
+      "name": "Operational Transform (OT)",
+      "tradeoff": "Complex transform functions for each data type. Works for text (Google Docs) but hard to generalize to KG triples.",
+      "when": "Real-time text collaboration. Not practical for structured KG data."
+    }
+  ],
+  "confidence": "HIGH",
+  "references": [
+    "Shapiro 2011: A Comprehensive Study of CRDT (state-based Or-Set definition, merge semantics)",
+    "Kulkarni 2014: Logical Physical Clocks and Consistent Snapshots in Distributed Systems (HLC invention, monotonicity proof)",
+    "Kleppmann 2017: Automerge: Real-time Collaborative Editing Without Operational Transformation (state vector + delta optimization)",
+    "Attiya 2016: Replicated Data Types for Geo-Replicated Transactional Systems (RGA ordered list CRDT)",
+    "333 Platform src: or_set.rs (Observed-Remove Set impl), lww_map.rs (LWW-Map with Lamport), sync.rs (delta batching, state vector), lamport.rs (current Lamport clock)"
+  ],
+  "provenance": "prometheus-connectivity-ref-20261015, D20 distributed-systems lens, 333-platform-crdt-integration research",
+  "expectedKGImpact": "Eliminates silent data loss on concurrent reference writes. Agents can merge KG snapshots without coordination → no dangling Longinus binders. 333 signaling distributes CRDT state safely over WebRTC with HLC causality. Enables multi-agent APT workflows (SA, SP, ST, SCW in parallel) with guaranteed reference consistency.",
+  "implementationPriority": "PHASE 1: Add HLC to 333-platform/src/hlc.rs (ready: CONTRACT_333_HLC exists). PHASE 2: Extend Or-Set to wrap KG (entity_id, sourceId, sourcePath) tuples. PHASE 3: Integrate HLC+Or-Set into KG MERGE operations (Cypher MERGE → wrap in Or-Set pre/post hooks). PHASE 4: End-to-end test: 3 agents write concurrent KG updates → verify zero data loss on merge.",
+  "riskMitigation": [
+    "Clock skew: HLC tolerates skew ≤ 1 second (wall_ms has 1ms precision, counter as tiebreak). If system clocks drift >1s, HLC logical counter still maintains causality.",
+    "Tombstone growth: Or-Set accumulates tombstones indefinitely. Mitigate via epoch-based GC (all peers acknowledge epoch → safe to GC) or time-based (>7 days old = remove). 333 already has gc_epoch() & gc_time() in or_set.rs.",
+    "Network partitions: HLC continues ticking on both sides independently. On reconnect, max(A.hlc, B.hlc)+1 resumes consensus. State vector + delta sync ensures no duplicate application.",
+    "Byzantine agents: HLC+Or-Set does NOT prevent Byzantine attacks (agent lies about HLC). Requires BFT consensus (HotStuff in 333) for commit finality. Use HLC for CRDT layer, BFT for ordering layer."
+  ],
+  "codeSample": {
+    "language": "Rust",
+    "description": "HLC tick + Or-Set reference sync",
+    "snippet": "// HLC tick on local write\nlet mut hlc = HLC::new(agent_id);\nhlc.tick();  // wall_ms synced with system clock, counter++\n\n// Or-Set wrap for KG reference\nlet ref_tag = Tag { node_id: agent_id, seq: hlc.counter };\nlet ref_entry = (entity_id, sourceId, sourcePath);\nor_set.add((ref_entry, ref_tag));\n\n// Delta: send (ref_entry, tag, hlc) to peer\nlet delta = ORSetDelta {\n    adds: vec![(ref_entry, ref_tag)],\n    state_vector: state_vec.clone(),  // max HLC per agent\n};\n\n// Peer merge\nlet payload = postcard::to_bytes(&delta)?;\nwebrtc_datachannel.send(payload);\n\n// On receive: Or-Set semantics\npeer_or_set.merge_delta(&incoming_delta);  // idempotent, commutative\npeer_hlc.recv(&incoming_hlc);  // clock advancement"
+  },
+  "kgBindings": [
+    "SPAN_333_CRDT_HLC (HLC definition, contract, tests)",
+    "CONTRACT_333_ORSet (Or-Set reference wrapping)",
+    "333_CRDT_CausalOrdering (vector clock baseline, extending to HLC)",
+    "PAPER_CRDT_Shapiro2011 (Or-Set formalism)",
+    "Kulkarni_HLC_2014 (HLC monotonicity proof)",
+    "lesson-333-modules-not-integrated (CRITICAL: modules exist but not P2P wired)"
+  ],
+  "nextSteps": [
+    "1. Verify HLC.rs compiled + 7 tests pass in 333-platform",
+    "2. Extend Or-Set<T> to Or-Set<(entity_id, sourceId, sourcePath)> in KG context",
+    "3. Cypher MERGE hook: wrap in Or-Set pre-check (is tag already tombstoned?) + post-sync (broadcast ref delta)",
+    "4. 333 signaling: attach HLC to every CRDT delta message (SyncPayload.state_vector)",
+    "5. End-to-end test: 3 peers, agent A adds ref1, agent B adds ref2, agent C merges both → ref1+ref2 both visible, no loss"
+  ],
+  "conclusion": "HLC + Or-Set CRDT is the proven approach for multi-agent distributed reference writes. 333 Platform already has Lamport + Or-Set code. Upgrade path: Lamport→HLC (add wall-ms), confirm SyncPayload piggybacks state vector, wrap KG references as Or-Set entries. This unblocks multi-agent APT workflows and 333 P2P consensus."
+}

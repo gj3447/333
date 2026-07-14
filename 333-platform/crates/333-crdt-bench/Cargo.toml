@@ -1,0 +1,30 @@
+[package]
+name = "triple-three-crdt-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Spike: Loro vs 333 custom CRDT bench — BFT keyring compatibility analysis"
+# KG: seed-rts-conflict-loro-vs-custom-crdt-2026-04-15
+# NOTE: triple-three lib has unconditional wasm-bindgen/web-sys deps (not cfg-gated),
+# so we cannot use it as a path dep for a native binary. CRDT types are inlined below.
+
+[[bin]]
+name = "crdt-bench"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+
+# Loro CRDT library — crates.io fetch required.
+# NAT hairpin may block fetch. If `cargo check` fails with "network error",
+# disable via --no-default-features (default does NOT include loro).
+[dependencies.loro]
+version = "1"
+optional = true
+
+[features]
+default = []
+# Enable when `loro` fetch succeeds from crates.io:
+#   cargo check -p triple-three-crdt-bench --features loro
+loro = ["dep:loro"]

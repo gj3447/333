@@ -1,0 +1,16 @@
+[package]
+name = "voxel_ref333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS reference voxel app — kernel that wires consensus333 (block placement settlement) + content333 (chunk blobs) + signaling333 (player join/leave) + token333/incentive333 (super-peer rewards). Proves the P2P OS stack can host a Minecraft-style app end-to-end via a vertical slice."
+
+# KG: SPAN_333_RefApp_Voxel, plan-333-p2p-os-synthesis-execution-2026-04-18, queue-p12-minecraft-wasm-app-2026-04-18
+
+[dependencies]
+identity333 = { path = "../333-identity" }
+content333 = { path = "../333-content" }
+consensus333 = { path = "../333-consensus" }
+signaling333 = { path = "../333-signaling" }
+token333 = { path = "../333-token" }
+thiserror = "1"

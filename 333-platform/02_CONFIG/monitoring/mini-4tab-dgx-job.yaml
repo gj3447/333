@@ -1,0 +1,49 @@
+---
+# KG: phase-post0-D-dgx-job-2026-04-14
+# DGX k8s Job — Mac 대신 dgx-worker Chrome에서 4-tab BFT test.
+# 이미지: ghcr.io/puppeteer/puppeteer (node + chromium + puppeteer pkg).
+# Mac host 192.168.0.101에 vite preview :4173 + socat :8333 (0.0.0.0 bind) 필요.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mini-4tab-dgx-code
+  namespace: apps
+data:
+  test.mjs: |
+    MINI_4TAB_DGX_CONTENT_PLACEHOLDER
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mini-4tab-dgx
+  namespace: apps
+spec:
+  backoffLimit: 0            # 실패 시 재시도 없음 (디버깅용)
+  ttlSecondsAfterFinished: 3600  # 1h 후 자동 삭제
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: dgx-worker
+      restartPolicy: Never
+      containers:
+        - name: puppeteer
+          image: ghcr.io/puppeteer/puppeteer:latest
+          command: ["node", "--no-warnings", "/tests/test.mjs"]
+          workingDir: /tmp
+          env:
+            - name: BASE_URL
+              value: "http://192.168.0.101:4173/333"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: code
+              mountPath: /tests
+      volumes:
+        - name: code
+          configMap:
+            name: mini-4tab-dgx-code

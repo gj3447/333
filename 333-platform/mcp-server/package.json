@@ -1,0 +1,18 @@
+{
+  "name": "triple-three-mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "333 Platform MCP server — exposes signaling status, TURN credentials, platform info as MCP tools/resources",
+  "bin": {
+    "333-mcp": "./index.mjs"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "test": "node smoke_test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  }
+}

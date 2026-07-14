@@ -1,0 +1,12 @@
+[package]
+name = "consensus333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS L11 Consensus — trait layer (ConsensusProtocol/SettlementOp/BlockFinality) + BFT-lite reference impl. Tendermint/Malachite/HotStuff backend is downstream."
+
+# KG: SPAN_333_L11_Consensus, plan-333-p2p-os-synthesis-execution-2026-04-18
+
+[dependencies]
+identity333 = { path = "../333-identity" }
+thiserror = "1"

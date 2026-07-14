@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicklasoverworlds/tauri-dev/2.x/.schema/config.schema.json",
+  "productName": "333 Platform",
+  "version": "0.1.0",
+  "identifier": "com.metahumotonic.333",
+  "build": {
+    "frontendDist": "../333-app/build",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "title": "333 Platform",
+    "windows": [
+      {
+        "title": "333 — Decentralized Apps",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  }
+}

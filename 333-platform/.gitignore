@@ -1,0 +1,7 @@
+/target
+/node_modules
+333-app/node_modules
+333-app/.svelte-kit
+tauri-app/src-tauri/target
+Cargo.lock
+signaling/node_modules

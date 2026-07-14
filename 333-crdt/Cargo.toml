@@ -1,0 +1,15 @@
+[package]
+name = "crdt333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS L5 State layer — CRDT library (clean-room port inspired by Garage util::crdt; CRDT math itself is standard)"
+
+# KG: SA_333_Platform, SPAN_333_CRDT_GaragePort, plan-333-three-way-hybrid-2026-04-17
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"

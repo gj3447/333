@@ -1,0 +1,83 @@
+# KG: seed-ggrs-bft-adapter-eval-2026-04-15 — workspace member added
+# KG: seed-rts-conflict-loro-vs-custom-crdt-2026-04-15 — crdt-bench spike added
+# KG: SPAN_333_Phase4_P2P_OS_MVP — p2p-os-mvp added (meta-val cycle #1)
+[workspace]
+members = [
+    ".",
+    "crates/333-ggrs-adapter",
+    "crates/333-crdt-bench",
+    "crates/333-p2p-os-mvp",
+]
+resolver = "2"
+
+[package]
+name = "triple-three"
+version = "0.1.0"
+edition = "2021"
+description = "333 Platform — P2P state sync with HLC, LWW-Map, and CRDT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+ed25519-compact = "2.2"
+# KG: lesson-333-wasm-memory-oob-2026-04-14 — Rust panic → readable console msg
+console_error_panic_hook = "0.1"
+postcard = { version = "1", features = ["alloc"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+# KG: seed-rts-determinism-fixed-point-state-hash-2026-04-15 — deterministic state hashing
+blake3 = { version = "1", default-features = false }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "console",
+  "RtcPeerConnection",
+  "RtcPeerConnectionIceEvent",
+  "RtcSessionDescription",
+  "RtcSessionDescriptionInit",
+  "RtcSdpType",
+  "RtcDataChannel",
+  "RtcDataChannelEvent",
+  "RtcDataChannelInit",
+  "RtcDataChannelState",
+  "RtcIceCandidate",
+  "RtcIceCandidateInit",
+  "RtcConfiguration",
+  "RtcIceServer",
+  "MessageEvent",
+  "IdbFactory",
+  "IdbDatabase",
+  "IdbObjectStore",
+  "IdbRequest",
+  "IdbTransaction",
+  "IdbTransactionMode",
+  "Window",
+  "DomStringList",
+  "Event",
+  "EventTarget",
+] }
+
+# KG: phase-0-allocator-swap-2026-04-14 — dlmalloc heap corruption 회피, wasm32 전용
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+lol_alloc = "0.4"
+
+[dev-dependencies]
+
+[package.metadata.wasm-pack.profile.release]
+# KG: sprint4E-remaining-wasm-autostart-2026-04-15 — pass bulk-memory + nontrapping-float flags
+# to wasm-pack's bundled wasm-opt so it handles memory.copy / i64.trunc_sat ops correctly.
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext"]
+
+[profile.release]
+# KG: sprint4E-remaining-wasm-autostart-2026-04-15 — size-optimized profile for 4-tab OOM fix
+# Restored from experiment (commit 4013086 was opt-level=1 + lto=false test).
+# Using "z" (size), fat LTO, single codegen-unit, panic=abort for minimal WASM binary.
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false

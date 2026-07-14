@@ -1,0 +1,84 @@
+/* KG: SPAN_333_FE_Shell — Cosmos Theme */
+:root {
+  --bg: #050810;
+  --bg-card: rgba(13, 27, 42, 0.6);
+  --border: rgba(107, 76, 153, 0.2);
+  --border-hover: #a78bfa;
+  --text: #e0e6f0;
+  --text-dim: #8892b0;
+  --text-muted: #4a5578;
+  --pink: #f472b6;
+  --purple: #a78bfa;
+  --cyan: #67e8f9;
+  --gold: #fbbf24;
+  --green: #34d399;
+  --red: #ef4444;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+a { color: var(--cyan); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.container { max-width: 960px; margin: 0 auto; padding: 1rem 1.5rem; }
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem;
+  transition: border-color 0.3s, transform 0.3s;
+}
+.card:hover { border-color: var(--border-hover); }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: var(--purple); color: var(--bg);
+  border: none; padding: 0.6rem 1.2rem;
+  border-radius: 8px; cursor: pointer;
+  font-weight: 600; font-size: 0.9rem;
+  transition: background 0.2s;
+}
+.btn:hover { background: var(--pink); }
+.btn:disabled { background: var(--text-muted); cursor: not-allowed; }
+.btn--outline {
+  background: transparent; color: var(--purple);
+  border: 1px solid var(--purple);
+}
+.btn--outline:hover { background: rgba(167, 139, 250, 0.1); }
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem; border-radius: 10px;
+  font-size: 0.7rem; font-weight: 600;
+}
+.badge--live { background: rgba(52, 211, 153, 0.15); color: var(--green); }
+.badge--soon { background: rgba(251, 191, 36, 0.15); color: var(--gold); }
+
+.stat-val { font-size: 1.5rem; font-weight: 800; color: var(--gold); }
+.stat-label { font-size: 0.65rem; color: var(--text-muted); text-transform: uppercase; }
+
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+.dot--green { background: var(--green); }
+.dot--red { background: var(--red); }
+.dot--yellow { background: var(--gold); }
+
+.grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+
+@media (max-width: 768px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+
+/* Starfield background */
+body::before {
+  content: ''; position: fixed; inset: 0; z-index: -1;
+  background: radial-gradient(ellipse at 30% 20%, rgba(167,139,250,0.08) 0%, transparent 60%),
+              radial-gradient(ellipse at 70% 80%, rgba(244,114,182,0.06) 0%, transparent 60%),
+              var(--bg);
+}

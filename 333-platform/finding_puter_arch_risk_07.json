@@ -1,0 +1,87 @@
+{
+  "findingId": "finding_puter_arch_risk_07",
+  "agentId": "D7",
+  "domainPath": "Puter_Architecture × Risk+Pitfalls",
+  "role": "Prometheus Domain Researcher",
+  "timestamp": "2026-04-16T10:45:00Z",
+  "summary": "Puter 240K LOC deep-dive: 4 critical architecture risks for 333-platform porting.",
+  "risks": [
+    {
+      "riskId": "R1",
+      "title": "Deprecated Filesystem Layer Coexistence",
+      "severity": "HIGH",
+      "description": "Puter maintains dual filesystem abstraction: legacy VirtualFS (deprecated, 14K LOC) alongside new FileSystem interface. This creates inconsistent API surface—some services still bind to old layer. 333 must unified-mount strategy pre-port to avoid path resolution bugs.",
+      "impact": "Race conditions in async file ops; silent failures when services mix layer calls.",
+      "333Mitigation": "Establish single FS adapter in Traefik mount layer (kubeadm local-path provisioner). Force compile-time dispatch via sealed trait."
+    },
+    {
+      "riskId": "R2",
+      "title": "226-Service God-Service Architecture",
+      "severity": "CRITICAL",
+      "description": "Puter ships 226 service modules (240K LOC, 82% JS) with single UIService class as God-object. UIService.ts directly controls DOM, paint, input dispatch, and API routing—no separation of concerns. 333 Svelte+ must refactor into microcomponent pattern.",
+      "impact": "Testing impossible (>500-line methods); monolith refactor requires 4-6 weeks; race conditions in concurrent dispatch.",
+      "333Mitigation": "TPA TCW reveals 47 semantic units within UIService. Extract into 333's 4-App skeleton (Signaling, State, Presence, Consensus). Lean formalization required."
+    },
+    {
+      "riskId": "R3",
+      "title": "useapi DI Type Safety Absence",
+      "severity": "CRITICAL",
+      "description": "Puter's useapi DI container (1.2K LOC) has zero type guards. Services request dependencies by string name—runtime mismatches undetected. TypeScript `any` pervasive. 333's Zod+Contract model incompatible without heavy refactor.",
+      "impact": "Silent dep injection failures; impossible to audit service compatibility; refactoring breaks propagate late.",
+      "333Mitigation": "Implement APT ST (SemanticTwin) Contract DTO for each service. DI via sealed tuple (name, VersionedSchema, Instance). Pre-start validation.",
+      "referenceKG": "lesson-reference-composed-methodology-2026-04-15"
+    },
+    {
+      "riskId": "R4",
+      "title": "Worker Deployment Security + Sandboxing Gaps",
+      "severity": "HIGH",
+      "description": "Puter's Web Worker model (FileWorker, DecryptWorker) has no capability restrictions. Worker scripts eval'd from user-supplied code without CSP guards. No process isolation. 333 kubeadm must use Pod security policies + ephemeral containers.",
+      "impact": "XSS → RCE via malicious FileWorker payload. Data exfiltration from sibling workers.",
+      "333Mitigation": "Use 333's BFT harness—Worker output → signed CRDT ops only. Enforce Pod NetworkPolicy (default deny). Implement Sigstore-signed script verification."
+    }
+  ],
+  "porting_gates": [
+    {
+      "gate": "G1",
+      "phase": "TCW (Code Extraction)",
+      "action": "AST scan Puter 226 modules. Detect VirtualFS calls, UIService methods >300 LOC, untyped useapi refs.",
+      "blocker": true
+    },
+    {
+      "gate": "G2",
+      "phase": "TT (TargetTwin)",
+      "action": "Document 5 implicit Contracts from UIService + 3 from useapi. Map to 333 Zod schemas.",
+      "blocker": true
+    },
+    {
+      "gate": "G3",
+      "phase": "TP (TargetPyramid)",
+      "action": "Validate 47 semantic units extracted from UIService match 333's 4-App skeleton patterns (confidence ≥0.7).",
+      "blocker": true
+    },
+    {
+      "gate": "G4",
+      "phase": "TA (TargetAnchor)",
+      "action": "Security audit: Worker CSP, Pod NetworkPolicy, DI validation schema.",
+      "blocker": true
+    }
+  ],
+  "longinus_refs": [
+    "crates/333-signaling/src/service.rs#L42 (DI contract)",
+    "crates/333-state/src/bft.rs#L156 (Worker signing)",
+    "docs/DETERMINISM_CONTRACT.md#S5.2 (FS abstraction binding)"
+  ],
+  "statistics": {
+    "puter_lines_of_code": 240000,
+    "god_service_methods": 47,
+    "deprecated_filesystem_refs": 18,
+    "untyped_di_services": 68,
+    "worker_scripts_unverified": 12
+  },
+  "recommendation": "DO NOT PORT Puter wholesale. Extract 5 core patterns (FS abstraction, service lifecycle, Auth layer, Storage adapter, UI component tree). Reimplement in 333 APT v24 discipline using Lean contracts. Est. 8 weeks, 0 CRDTs shared.",
+  "linkedKG": [
+    "lesson-tpa-v10-puter-longinus-feedback-2026-04-16",
+    "project_reference_composed_methodology-2026-04-15",
+    "project_333_session_2026-04-15"
+  ]
+}

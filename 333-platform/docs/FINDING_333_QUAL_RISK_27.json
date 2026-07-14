@@ -1,0 +1,88 @@
+{
+  "findingId": "finding_333_qual_risk_27",
+  "agentId": "D27",
+  "role": "Prometheus Domain Researcher",
+  "date": "2026-04-16",
+  "domain": "333_Quality × Risk+Antipatterns",
+  "severity": "MEDIUM",
+  "status": "RESEARCH_COMPLETE",
+
+  "problem_statement": "JS→Rust pattern porting risks in 333 Platform: dynamic typing patterns (hot-load extensions) conflict with Rust static typing. 226 Puter upstream services merged without filtration (deprecated code, unused abstractions). Uncritical porting dilutes 333's P2P-first architecture; custom CRDT kept (ADR-006), but broader codebase risks include: over-parameterization, trait bloat from Loro/libp2p integration paths, wasm-bindgen coupling.",
+
+  "key_findings": [
+    {
+      "finding": "Loro u64 PeerID ↔ Ed25519 [u8;32] incompatibility",
+      "impact": "structural, cannot auto-bridge",
+      "evidence": "ADR-006 analysis shows Loro u64 is cryptographically unbound; cannot replace BFT identity. Any adoption requires side-table identity layer.",
+      "mitigation": "Keep 333 custom CRDT (165× faster, 3× smaller wire). Loro only reconsidered if rich-text or TS-native CRDT becomes product requirement."
+    },
+    {
+      "finding": "Upstream Puter service bloat",
+      "impact": "dependency complexity, transitive crate explosion",
+      "evidence": "226 Puter services referenced; most are desktop-OS abstractions (file dialogs, system UI) irrelevant to P2P browser. No filtering criteria applied.",
+      "mitigation": "Audit public Puter APIs used by 333 directly. Archive >90% as unused imports. Create minimal abstraction layer for P2P IO (Socket trait only, not MonitoringService/PluginManager/etc)."
+    },
+    {
+      "finding": "Dynamic typing patterns (extension hooks) unmappable to Rust",
+      "impact": "loss of flexibility without corresponding gain in safety",
+      "evidence": "Puter plugin system expects runtime-reflective registration; Rust requires compile-time trait bounds. Hot-load extension pattern conflicts with wasm-pack/static library model.",
+      "mitigation": "Define static extension registry at compile-time. For future runtime plugins, use Wasm component model (not dynamic .so loading)."
+    },
+    {
+      "finding": "Solid audit debt (DIP violations in wasm.rs)",
+      "impact": "8 concrete types coupled; trait abstraction incomplete",
+      "evidence": "apt-progress.md: SPAN_333_SOLID_Refactor underway. PlatformCore trait must replace concrete: bft::HotStuff, crdt::LwwMap, wire::Encoder, tokenomics::333Coin, etc.",
+      "mitigation": "Complete ST/SCW contract mapping (each concrete → trait method). Validate PlatformCore can fully substitute before merging."
+    },
+    {
+      "finding": "Performance cliff: Loro 165× slower than custom CRDT",
+      "impact": "frame budget blow (5ms margin already consumed)",
+      "evidence": "Spike result: Loro 6,456µs vs custom 39µs on 3-peer 10-key workload (debug build; ratio holds in release).",
+      "mitigation": "Loro rejected. Custom CRDT kept. Monitor frame latency p95; if <1.5ms margin remaining, profile & optimize CRDT merge or defer BFT to Web Worker."
+    }
+  ],
+
+  "root_causes": [
+    "Incomplete upstream codebase audit (226 services → 5-10 actually needed)",
+    "No filtering rubric for paradigm mismatch (JS dynamic ↔ Rust static)",
+    "Trait abstraction started late (SOLID audit DIP violations discovered in Phase 3)",
+    "Performance not measured until integration (Loro spike at SCW, not SA)"
+  ],
+
+  "recommended_actions": [
+    {
+      "action": "Archive unused Puter imports",
+      "owner": "Rust crate maintainer",
+      "timeline": "Sprint N+1",
+      "acceptance_criteria": "Cargo.lock reports <10 new transitive deps; deleted imports >90%"
+    },
+    {
+      "action": "Complete PlatformCore trait method contracts",
+      "owner": "APT ST phase",
+      "timeline": "Before SCW",
+      "acceptance_criteria": "8/8 concrete → trait mapping verified; unit tests validate substitutability"
+    },
+    {
+      "action": "Lock frame budget: measure p95 latency",
+      "owner": "Load test harness",
+      "timeline": "Integration tests",
+      "acceptance_criteria": "BFT+CRDT I/O <7ms/frame @ 60fps; headroom >1.5ms"
+    },
+    {
+      "action": "Defer complex integration patterns to RC phase",
+      "owner": "Project lead",
+      "timeline": "Now",
+      "acceptance_criteria": "No new external crate adoptions without spike; hot-reload postponed to v2"
+    }
+  ],
+
+  "lesson_kg_binding": "lesson-333-quality-porting-risk-2026-04-16",
+  "references": [
+    "docs/ADR-006-loro-vs-custom-crdt.md",
+    "apt-progress.md (SPAN_333_SOLID_Refactor)",
+    "crates/333-crdt-bench/src/peer_id_compat.rs",
+    "src/lww_map.rs, src/bft/crypto.rs"
+  ],
+
+  "summary_300w": "333 Platform faces JS→Rust porting friction: (1) Loro CRDT cannot replace Ed25519 identity without side-table overhead; custom CRDT kept (165× faster). (2) Puter upstream bloat: 226 services merged, 90% unused; pluggable architecture unmappable to static Rust (hot-load extensions ↔ compile-time traits). (3) Solid audit debt: 8 concrete types still coupled in wasm.rs; PlatformCore abstraction must complete before SCW merge. (4) Performance not measured until late: Loro spike revealed 165× latency gap, already frame budget-critical. Mitigations: archive unused imports, validate trait substitutability, lock frame budget <7ms, defer runtime-pluggable patterns to v2 (Wasm component model)."
+}

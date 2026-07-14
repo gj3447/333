@@ -1,0 +1,12 @@
+[package]
+name = "content333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS L4 Content — SHA-256 content addressing (CID-like) inspired by Kubo BlockAPI"
+
+[dependencies]
+sha2 = "0.10"
+bs58 = "0.5"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

@@ -1,0 +1,287 @@
+// KG: sprint5C-editor-wasm-ui-2026-04-15
+// Editor page styles — dark code-editor look.
+// Inherits CSS vars from global app.css (--text, --border, --purple, etc.)
+
+.editor-page {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+// ── Header bar ──────────────────────────────────────────────────────────────
+.editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 10px;
+}
+
+.editor-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.header-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.peer-chip {
+  font-size: 0.72rem;
+  font-family: monospace;
+  padding: 0.2rem 0.55rem;
+  border-radius: 8px;
+  background: rgba(167, 139, 250, 0.12);
+  border: 1px solid rgba(167, 139, 250, 0.25);
+  color: #a78bfa;
+}
+
+.sync-time {
+  font-size: 0.7rem;
+  color: var(--text-muted, #888);
+}
+
+// ── WASM badge ────────────────────────────────────────────────────────────────
+.wasm-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.2rem 0.55rem;
+  border-radius: 10px;
+  border: 1px solid;
+
+  &.active {
+    color: #34d399;
+    border-color: rgba(52, 211, 153, 0.3);
+    background: rgba(52, 211, 153, 0.08);
+  }
+
+  &.mock {
+    color: #fbbf24;
+    border-color: rgba(251, 191, 36, 0.3);
+    background: rgba(251, 191, 36, 0.08);
+  }
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+// ── Section header ──────────────────────────────────────────────────────────
+.section-title {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted, #888);
+  margin: 0 0 0.4rem;
+}
+
+// ── Main layout (editor + sidebar) ─────────────────────────────────────────
+.editor-layout {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.editor-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.editor-sidebar {
+  width: 200px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+// ── Code editor area ────────────────────────────────────────────────────────
+.editor-wrap {
+  position: relative;
+}
+
+.code-editor {
+  width: 100%;
+  min-height: 380px;
+  padding: 1rem 1.1rem;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 10px;
+  color: #e8e8e8;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Courier New', monospace;
+  font-size: 0.88rem;
+  line-height: 1.65;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.2s;
+  box-sizing: border-box;
+  caret-color: #a78bfa;
+  tab-size: 2;
+  white-space: pre-wrap;
+  word-break: break-word;
+
+  &:focus {
+    border-color: rgba(167, 139, 250, 0.5);
+    box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.08);
+  }
+
+  &::placeholder {
+    color: var(--text-muted, #555);
+  }
+}
+
+.editor-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.72rem;
+  color: var(--text-muted, #888);
+  padding: 0 0.2rem;
+}
+
+.char-stat {
+  font-family: monospace;
+}
+
+// ── Status card ─────────────────────────────────────────────────────────────
+.card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  padding: 0.8rem;
+}
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.25rem 0;
+  font-size: 0.78rem;
+  border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.05));
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.status-label {
+  color: var(--text-muted, #888);
+}
+
+.status-value {
+  font-family: monospace;
+  color: var(--text, #e0e0e0);
+  font-size: 0.76rem;
+}
+
+// ── Remote peers ────────────────────────────────────────────────────────────
+.peer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.peer-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 7px;
+  font-size: 0.78rem;
+}
+
+.peer-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.peer-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.peer-name {
+  color: var(--text, #e0e0e0);
+  font-weight: 600;
+  font-size: 0.75rem;
+}
+
+.peer-cursor {
+  font-size: 0.68rem;
+  color: var(--text-muted, #888);
+  font-family: monospace;
+}
+
+// ── Debug log ───────────────────────────────────────────────────────────────
+.debug-log {
+  font-size: 0.72rem;
+  color: var(--text-muted, #888);
+  margin-top: 0.25rem;
+
+  summary {
+    cursor: pointer;
+    user-select: none;
+
+    &:hover {
+      color: var(--text, #e0e0e0);
+    }
+  }
+}
+
+.log-inner {
+  margin: 0.4rem 0 0;
+  max-height: 140px;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  line-height: 1.55;
+  font-family: monospace;
+  font-size: 0.7rem;
+}
+
+.op-entry {
+  padding: 0.15rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  color: var(--text-muted, #888);
+
+  &:last-child {
+    border-bottom: none;
+  }
+
+  .op-type-insert {
+    color: #34d399;
+    font-weight: 600;
+  }
+
+  .op-type-delete {
+    color: #f87171;
+    font-weight: 600;
+  }
+}

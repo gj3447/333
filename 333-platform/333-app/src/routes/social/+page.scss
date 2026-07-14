@@ -1,0 +1,351 @@
+// KG: sprint5A-social-wasm-ui-2026-04-15
+// Social page styles — Instagram/Twitter inspired dark theme.
+// Inherits CSS vars from global app.css (--text, --border, --purple, etc.)
+
+.social-page {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-width: 680px;
+  margin: 0 auto;
+}
+
+// ── Section header ──────────────────────────────────────────────────────────
+.section-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted, #888);
+  margin-bottom: 0.5rem;
+}
+
+// ── Card ────────────────────────────────────────────────────────────────────
+.card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 12px;
+  padding: 1.1rem 1.2rem;
+}
+
+// ── Profile section ─────────────────────────────────────────────────────────
+.profile-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.profile-label {
+  min-width: 52px;
+  font-size: 0.78rem;
+  color: var(--text-muted, #888);
+}
+
+.social-input {
+  flex: 1;
+  padding: 0.5rem 0.75rem;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  color: var(--text, #f0f0f0);
+  font-size: 0.88rem;
+  outline: none;
+  transition: border-color 0.2s;
+
+  &:focus {
+    border-color: var(--purple, #a78bfa);
+  }
+}
+
+.profile-stats {
+  display: flex;
+  gap: 1.25rem;
+  margin-top: 0.25rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.07));
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+  font-size: 0.8rem;
+}
+
+.stat-value {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text, #f0f0f0);
+}
+
+.stat-label {
+  font-size: 0.68rem;
+  color: var(--text-muted, #888);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+// ── Post composer ────────────────────────────────────────────────────────────
+.compose-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.compose-textarea {
+  width: 100%;
+  min-height: 88px;
+  padding: 0.7rem 0.85rem;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 10px;
+  color: var(--text, #f0f0f0);
+  font-size: 0.92rem;
+  line-height: 1.5;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.2s;
+  box-sizing: border-box;
+
+  &:focus {
+    border-color: var(--purple, #a78bfa);
+  }
+
+  &::placeholder {
+    color: var(--text-muted, #666);
+  }
+}
+
+.compose-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.char-count {
+  font-size: 0.75rem;
+  color: var(--text-muted, #888);
+}
+
+.btn {
+  padding: 0.45rem 1rem;
+  border: none;
+  border-radius: 20px;
+  font-size: 0.84rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+
+  &:active {
+    transform: scale(0.97);
+  }
+
+  &:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  &.btn-primary {
+    background: var(--purple, #a78bfa);
+    color: #fff;
+  }
+
+  &.btn-ghost {
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text, #f0f0f0);
+    border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  }
+}
+
+// ── Feed ─────────────────────────────────────────────────────────────────────
+.feed-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.feed-empty {
+  text-align: center;
+  color: var(--text-muted, #888);
+  font-size: 0.86rem;
+  padding: 1.5rem;
+}
+
+.post-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  transition: background 0.15s;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.055);
+  }
+}
+
+.post-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.post-author {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.author-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.author-name {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text, #f0f0f0);
+}
+
+.post-time {
+  font-size: 0.72rem;
+  color: var(--text-muted, #888);
+}
+
+.post-content {
+  font-size: 0.9rem;
+  line-height: 1.55;
+  color: var(--text, #e8e8e8);
+  word-break: break-word;
+}
+
+.post-id {
+  font-size: 0.68rem;
+  color: var(--text-muted, #666);
+  font-family: monospace;
+}
+
+// ── Follow list ───────────────────────────────────────────────────────────────
+.follow-section {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.follow-panel {
+  flex: 1;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.peer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.peer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0.7rem;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+  font-size: 0.82rem;
+}
+
+.peer-id {
+  font-family: monospace;
+  color: var(--text, #e0e0e0);
+}
+
+.btn-unfollow {
+  font-size: 0.72rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  color: #f87171;
+  cursor: pointer;
+  transition: background 0.15s;
+
+  &:hover {
+    background: rgba(239, 68, 68, 0.22);
+  }
+}
+
+.add-peer-row {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.3rem;
+}
+
+.peer-input {
+  flex: 1;
+  padding: 0.4rem 0.6rem;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  color: var(--text, #f0f0f0);
+  font-size: 0.82rem;
+  outline: none;
+
+  &:focus {
+    border-color: var(--purple, #a78bfa);
+  }
+}
+
+// ── WASM badge ────────────────────────────────────────────────────────────────
+.wasm-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.2rem 0.55rem;
+  border-radius: 10px;
+  border: 1px solid;
+
+  &.active {
+    color: #34d399;
+    border-color: rgba(52, 211, 153, 0.3);
+    background: rgba(52, 211, 153, 0.08);
+  }
+
+  &.mock {
+    color: #fbbf24;
+    border-color: rgba(251, 191, 36, 0.3);
+    background: rgba(251, 191, 36, 0.08);
+  }
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}

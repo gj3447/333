@@ -1,0 +1,13 @@
+[package]
+name = "storage_advanced333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS L6+ Storage Advanced — ECEncoder / ReplicationStrategy / EncryptedMetadata / OpfsBackend traits + reference impls. Composes on content333 + storage333."
+
+# KG: SPAN_333_L6plus_StorageAdvanced, plan-333-p2p-os-synthesis-execution-2026-04-18, queue-p8-storage-advanced-2026-04-18
+
+[dependencies]
+content333 = { path = "../333-content" }
+storage333 = { path = "../333-storage" }
+thiserror = "1"

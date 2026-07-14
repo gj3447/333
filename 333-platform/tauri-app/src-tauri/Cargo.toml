@@ -1,0 +1,22 @@
+# KG: SPAN_333_Tauri, SPAN_333_CLI_Binary, SPAN_333_CLI_FeatureFlag, SPAN_333_CLI_NativeTransport
+# KG: lesson-333-tauri-nested-workspace-2026-04-19 — declare empty [workspace] to escape parent
+[workspace]
+
+[package]
+name = "triple-three-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "333 Platform Desktop CLI — native P2P bridge"
+
+[[bin]]
+name = "triple-three-desktop"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# KG: CONTRACT_333_CLI_FeatureFlag — native-p2p gates transport binding
+default = []
+native-p2p = []  # stub native TCP transport (libp2p wiring deferred)

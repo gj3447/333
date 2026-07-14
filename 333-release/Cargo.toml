@@ -1,0 +1,13 @@
+[package]
+name = "release333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS L∞ Release — ReleaseManifest data model + ArtifactSigner (ed25519 via identity333) + ChecksumVerifier (SHA-256 via content333) + ProvenanceChain. Data layer underneath docs site / signed artifacts / CDN distribution."
+
+# KG: SPAN_333_Linf_Release, plan-333-p2p-os-synthesis-execution-2026-04-18, queue-p13-public-release-2026-04-18
+
+[dependencies]
+identity333 = { path = "../333-identity" }
+content333 = { path = "../333-content" }
+thiserror = "1"

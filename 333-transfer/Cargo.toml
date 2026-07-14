@@ -1,0 +1,17 @@
+[package]
+name = "transfer333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS — consensusless single-owner asset transfer (FastPay/QAAT/Linera single-user-microchain lineage). Owner-sequenced transfers over reliable causal broadcast; no global consensus for the common case."
+
+# KG: SA_333_Platform, consensus-prom16-333-no-blockchain-2026-07-12,
+#     vp-prom16-333-coin-transferable-vs-local-credit-2026-07-12,
+#     vp-prom16-333-coin-premint-vs-runtime-issuance-2026-07-12
+
+[dependencies]
+crdt333 = { path = "../333-crdt" }
+# Real Ed25519 authority signatures (RFC 8032) — per-identity AUTHENTICITY on top
+# of the quorum uniqueness the safety core already enforces. Deterministic signing
+# (no RNG dep needed); test keys are seeded.
+ed25519-dalek = "2"

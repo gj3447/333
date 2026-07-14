@@ -1,0 +1,72 @@
+# KG: DOCKER_COMPOSE_333_Test
+# Local CI testing: Start signaling, app, and run smoke tests in isolation
+# Usage: docker-compose -f docker-compose.test.yml up --abort-on-container-exit
+# Or: docker-compose -f docker-compose.test.yml run test
+
+version: '3.8'
+
+services:
+  signaling:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./signaling:/app:ro
+    ports:
+      - "8333:8333"
+    command: |
+      sh -c "npm install && node server.mjs 8333"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get({hostname: 'localhost', port: 8333, path: '/'}, (res) => process.exit(res.statusCode === 404 ? 0 : 1))"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+    environment:
+      - NODE_ENV=production
+    expose:
+      - "8333"
+
+  app:
+    image: node:20
+    working_dir: /app
+    volumes:
+      - ./333-app:/app
+    ports:
+      - "5173:5173"
+    command: |
+      sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      - NODE_ENV=development
+      - VITE_SIGNALING_URL=ws://signaling:8333
+    expose:
+      - "5173"
+    depends_on:
+      signaling:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5173"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  test:
+    image: node:20
+    working_dir: /app
+    volumes:
+      - ./:/app:ro
+      - ./tests:/app/tests:ro
+    command: |
+      sh -c "npm install --save-dev puppeteer-core wait-on && \
+             npx wait-on http://app:5173 ws://signaling:8333 --timeout 15000 && \
+             node tests/p2p-smoke.js ws://signaling:8333"
+    environment:
+      - APP_URL=http://app:5173/room
+      - PUPPETEER_SKIP_DOWNLOAD=true
+    depends_on:
+      app:
+        condition: service_healthy
+    profiles:
+      - test
+
+networks:
+  default:
+    name: p2p-test-net

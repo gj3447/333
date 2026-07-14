@@ -1,0 +1,14 @@
+[package]
+name = "wire333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS wire protocol — length-prefixed frames over TCP for Proposal/Vote/Envelope. Hand-rolled codec, no serde/tokio. Session runs two validators on localhost over real sockets for cross-process convergence tests."
+
+# KG: SPAN_333_Wire, queue-network-stress-cross-node-2026-04-18
+
+[dependencies]
+identity333 = { path = "../333-identity" }
+consensus333 = { path = "../333-consensus" }
+signaling333 = { path = "../333-signaling" }
+thiserror = "1"

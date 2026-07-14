@@ -1,0 +1,10 @@
+[package]
+name = "storage333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS L6 Storage — FilerStore trait + Decorator (SeaweedFS-inspired)"
+
+[dependencies]
+content333 = { path = "../333-content" }
+thiserror = "1"

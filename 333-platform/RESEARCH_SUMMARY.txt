@@ -1,0 +1,322 @@
+WEBRTC P2P E2E TESTING WITH PLAYWRIGHT — RESEARCH SUMMARY
+KG: lesson-webrtc-playwright-e2e-testing, TASK_333_E2E_WebRTC_Testing
+Date: 2026-04-13
+
+================================================================================
+7 KEY QUESTIONS ANSWERED
+================================================================================
+
+Q1: Can Playwright open two browser contexts that connect via WebRTC?
+A:  YES. Playwright natively supports multiple isolated contexts within one test.
+    Use separate contexts for true P2P simulation (not just pages).
+    Architecture: Browser → Context A (Peer1) + Context B (Peer2)
+    Source: Playwright docs on browser contexts
+
+Q2: How to handle ICE candidates and STUN in Playwright test environment?
+A:  THREE approaches (in order):
+    A) Real STUN servers (RECOMMENDED) — browser gathers candidates naturally
+    B) Override STUN for host-only (fastest, localhost-only)
+    C) Mock ICE entirely (not realistic, avoid)
+    
+    Recommendation: Use approach A (real STUN). Localhost works fine.
+    STUN latency ~50-100ms is negligible for P2P tests.
+
+Q3: Mock vs real signaling server — which approach?
+A:  ALWAYS use REAL signaling server (ws://localhost:8333).
+    Why: Your server is minimal (91 lines, pure relay).
+         Mocking adds complexity without benefit.
+         Cost: negligible (1-5ms localhost latency).
+
+Q4: Waiting strategies — how to wait for WebRTC connection?
+A:  THREE patterns:
+    A) DataChannel open (RECOMMENDED)
+       - dataChannel.readyState === 'open'
+       - Most reliable for CRDT/consensus
+    
+    B) Connection state
+       - peerConnection.connectionState === 'connected'
+       - Less reliable (DC not guaranteed open)
+    
+    C) ICE gathering complete (debugging only)
+       - iceGatheringState === 'complete'
+    
+    RECOMMENDED timeout: 15 seconds (ICE gathering can take 5-10s first run)
+
+Q5: Can Playwright intercept DataChannel messages?
+A:  PARTIAL. Playwright cannot directly inspect binary DataChannel data.
+    SOLUTION: Expose logging API from WASM
+    
+    In Rust: pub fn getReceivedMessages() -> Vec<String>
+    In test: window.__testHarness.getMessages()
+    
+    Alternative: Verify state changes (convergence) instead of messages
+    Not recommended: MockRTC library (adds dependency, overkill)
+
+Q6: Existing Playwright WebRTC examples or libraries?
+A:  Few official examples exist. Known libraries:
+    - MockRTC (mock peer + interception)
+    - WebRTC samples (reference implementations)
+    - Markaicode guide (CDP overrides for media/network)
+    
+    Recommendation for 333: Write custom test harness (100-200 lines)
+    - Simpler than MockRTC integration
+    - Specific to your use case (DataChannel only, no video/audio)
+
+Q7: Alternatives: Puppeteer vs Cypress vs manual testing?
+A:  PLAYWRIGHT WINS for P2P WebRTC.
+    
+    Comparison:
+    ┌─────────────┬────────────┬─────────┬────────┬────────┐
+    │ Capability  │ Playwright │ Puppeteer│ Cypress│ Manual │
+    ├─────────────┼────────────┼─────────┼────────┼────────┤
+    │ Multi-context│    ✓✓     │    ✓    │   ✗    │   N/A  │
+    │ Network ctrl│    ✓✓     │    ✓    │   ~    │   N/A  │
+    │ WebRTC      │    ✓✓     │    ✓    │   ~    │   ✓    │
+    │ Isolation   │    ✓✓     │    ~    │   ✓    │   N/A  │
+    │ Dev exp     │    ✓✓     │    ~    │   ✓✓   │   Poor │
+    └─────────────┴────────────┴─────────┴────────┴────────┘
+    
+    Why Playwright:
+    - Multi-context architecture natural for P2P
+    - CDP access for advanced debugging
+    - Test isolation via contexts
+    - Cross-browser support (Chrome, Firefox, Safari)
+
+================================================================================
+IMPLEMENTATION ROADMAP
+================================================================================
+
+PHASE 0: Setup (Today — 30 minutes)
+  [ ] npm install --save-dev @playwright/test
+  [ ] Create playwright.config.ts
+  [ ] Create directory: tests/e2e/{fixtures,helpers}
+  [ ] Start signaling server: node signaling/server.mjs
+  [ ] Start app: npm run dev (port 5173)
+
+PHASE 1: Foundation (Tomorrow — 2 hours)
+  [ ] Implement fixture with two contexts
+  [ ] Implement helpers (wait, send, verify)
+  [ ] First test: "two peers connect"
+  [ ] Debug with --ui flag
+  [ ] Add logging API to WASM if needed
+
+PHASE 2: CRDT (This week — 3 hours)
+  [ ] CRDT convergence test
+  [ ] Delta sync verification
+  [ ] Message ordering check
+
+PHASE 3: BFT (Next week — 4 hours)
+  [ ] 3+ peer consensus test
+  [ ] Voting protocol
+  [ ] Fault tolerance scenarios
+
+PHASE 4: Advanced (Optional)
+  [ ] Network throttling (latency/loss)
+  [ ] Cross-browser testing
+  [ ] Performance profiling
+
+================================================================================
+TEST SKELETON (Copy-Paste Ready)
+================================================================================
+
+Files to create (4 total):
+
+1. playwright.config.ts (50 lines)
+   - Test directory: tests/e2e
+   - Workers: 1 (important!)
+   - Timeout: 30s
+   - WebServer: npm run dev (port 5173)
+
+2. tests/e2e/fixtures/webrtc.fixture.ts (120 lines)
+   - Inject logging API into window
+   - Peer1 fixture (context + page)
+   - Peer2 fixture (context + page)
+
+3. tests/e2e/helpers/webrtc.ts (150 lines)
+   - waitForP2pConnection(peer1, peer2, timeout)
+   - sendMessage(peer, msg)
+   - waitForMessage(peer, pattern, timeout)
+   - getConnectionState(peer)
+
+4. tests/e2e/webrtc-p2p.spec.ts (200 lines)
+   - Test 1: "two peers connect"
+   - Test 2: "DataChannel message delivery"
+   - Test 3: "CRDT convergence"
+   - Test 4: "BFT consensus (3+ peers)"
+   - Test 5: "Reliability (message ordering)"
+
+Total: ~500 lines of code
+
+Full code with comments: WEBRTC_E2E_TESTING_RESEARCH.md
+
+================================================================================
+KEY DESIGN DECISIONS
+================================================================================
+
+Decision 1: Real signaling server (not mock)
+Rationale: Simple relay, trivial to run locally, avoids mock complexity
+
+Decision 2: Two separate browser contexts (not pages)
+Rationale: True network isolation, simulates real P2P scenario authentically
+
+Decision 3: Logging API in WASM (for message inspection)
+Rationale: Playwright cannot intercept DataChannel directly
+
+Decision 4: Wait for DataChannel open (not connection state)
+Rationale: More reliable indicator of readiness for CRDT/consensus
+
+Decision 5: Single worker (not parallel)
+Rationale: Shared signaling server (simple relay, not parallel-safe)
+
+Decision 6: 15 second timeout (for initial connection)
+Rationale: ICE gathering can take 5-10s on first run, STUN adds latency
+
+================================================================================
+ARCHITECTURE
+================================================================================
+
+Test Process:
+  Playwright Test Runner
+    ├─ Creates browser instance (Chrome)
+    │  ├─ Context A (Peer 1)
+    │  │  └─ Page 1 → localhost:5173
+    │  │     └─ WASM RTCPeerConnection
+    │  │        └─ DataChannel (ordered, reliable)
+    │  │
+    │  └─ Context B (Peer 2)
+    │     └─ Page 2 → localhost:5173
+    │        └─ WASM RTCPeerConnection
+    │           └─ DataChannel (ordered, reliable)
+    │
+    └─ Signaling Server (ws://localhost:8333)
+       └─ Room relay → SDP/ICE exchange
+
+Data Flow:
+  1. Peer1 creates RTCPeerConnection (offerer)
+  2. Peer1 creates offer SDP
+  3. Peer1 sends offer → signaling server → Peer2
+  4. Peer2 sets remote description (SDP from Peer1)
+  5. Peer2 creates answer SDP
+  6. Peer2 sends answer → signaling server → Peer1
+  7. Both collect ICE candidates via STUN
+  8. DataChannel established (ordered, reliable)
+  9. Messages exchanged (CRDT deltas, consensus votes)
+  10. Convergence verified (state matching)
+
+================================================================================
+KNOWN LIMITATIONS & WORKAROUNDS
+================================================================================
+
+Limitation 1: No direct DataChannel message inspection
+Workaround: Expose logging API from WASM (30 lines of code)
+Cost: Minimal (test-only code)
+Benefit: Can verify message content + ordering
+
+Limitation 2: No built-in packet loss simulation
+Workaround: Use page.route() with setTimeout
+Cost: More complex test code
+Benefit: Can test reliability/retry logic
+
+Limitation 3: No TURN server (only STUN)
+Impact: Localhost only; won't work through NAT
+Workaround: Use Playwright's network throttling for latency
+Future: Add TURN server if needed for real-world testing
+
+Limitation 4: No audio/video media
+Impact: DataChannel-only (your use case)
+Workaround: Use --use-fake-device-for-media-stream if added later
+Reference: Markaicode guide for media mocking
+
+================================================================================
+SOURCES CITED
+================================================================================
+
+Official Documentation:
+- Playwright Browser Contexts: playwright.dev/docs/browser-contexts
+- Playwright Network API: playwright.dev/docs/network
+- Playwright Best Practices: playwright.dev/docs/best-practices
+
+WebRTC Fundamentals:
+- WebRTC for the Curious: webrtcforthecurious.com/docs/02-signaling/
+- WebRTC.org Testing: webrtc.github.io/webrtc-org/testing/
+- MDN WebRTC Data Channels: developer.mozilla.org/...
+
+Advanced Topics:
+- Markaicode WebRTC Testing: markaicode.com/webrtc-testing-playwright-cdp-overrides/
+- MockRTC: github.com/httptoolkit/mockrtc
+- WebRTC Hacks: webrtchacks.com/datachannel-multiplayer-game/
+
+Tool Comparisons:
+- Playwright vs Cypress 2026: bugbug.io/blog/test-automation-tools/...
+- BrowserStack Tool Comparison: browserstack.com/guide/...
+
+================================================================================
+QUICK REFERENCE
+================================================================================
+
+Start services:
+  Terminal A: node signaling/server.mjs
+  Terminal B: npm run dev
+  Terminal C: npm run test:e2e
+
+Run tests:
+  npm run test:e2e              # Headless
+  npm run test:e2e:ui           # Interactive UI (recommended for P2P)
+  npm run test:e2e:debug        # With debugger
+
+Debug single test:
+  npm run test:e2e -- --grep "test name"
+
+Enable Playwright Inspector:
+  PWDEBUG=1 npm run test:e2e
+
+Key waiting pattern:
+  await peer2.waitForFunction(
+    () => window.peerConnection?.dataChannel?.readyState === 'open',
+    { timeout: 15000 }
+  );
+
+Key message verification:
+  const messages = await peer2.evaluate(() =>
+    window.__testHarness.getMessages()
+  );
+
+Key convergence check:
+  const [doc1, doc2] = await Promise.all([
+    peer1.evaluate(() => window.crdtDocument?.toString() || ''),
+    peer2.evaluate(() => window.crdtDocument?.toString() || ''),
+  ]);
+  expect(doc1).toBe(doc2);
+
+================================================================================
+DOCUMENTS CREATED
+================================================================================
+
+1. WEBRTC_E2E_TESTING_RESEARCH.md (1500 lines)
+   - Full research answers with examples
+   - Complete test skeleton with all code
+   - Implementation checklist
+   - Known limitations & future work
+
+2. WEBRTC_E2E_TESTING_QUICKSTART.md (400 lines)
+   - TL;DR answers table
+   - Copy-paste test patterns
+   - 4-file setup guide
+   - Debugging tips
+
+3. RESEARCH_SUMMARY.txt (this file)
+   - Executive summary
+   - Key decisions & rationale
+   - Quick reference guide
+
+================================================================================
+NEXT ACTION
+================================================================================
+
+READ: WEBRTC_E2E_TESTING_QUICKSTART.md (5 minutes)
+THEN: Copy skeleton files from WEBRTC_E2E_TESTING_RESEARCH.md
+RUN:  npm run test:e2e:ui (should see 2 peers connecting)
+
+Questions? Debug output in tests/e2e/ directory.
+
+================================================================================

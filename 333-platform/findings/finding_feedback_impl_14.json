@@ -1,0 +1,154 @@
+{
+  "findingId": "finding_feedback_impl_14",
+  "agentId": "D14",
+  "methodology": "Prometheus v2 Domain Research",
+  "domain": "FeedbackLoop × 기술구현",
+  "researchPhase": "Discovery → Technical Specification",
+  "timestamp": "2026-04-16T00:00:00Z",
+  "status": "SPECIFICATION_READY",
+  "summary": "오답노트(Lesson) 피드백 루프의 자동화 가능 지점 3개 발견: (1) Lesson 생성 시 ActionPlan 자동 생성 (APOC Trigger), (2) ValidationResult 승인 → Lesson.resolved 자동 갱신 (Cypher Rule), (3) Severity 기반 ntfy 알림 자동화 (Webhook)",
+  "keyFindings": {
+    "currentState": {
+      "lessonCount": 193,
+      "actionPlanCount": 169,
+      "validationResultCount": 88,
+      "automationStatus": "MANUAL_ONLY",
+      "triggeredActionEdges": 0
+    },
+    "automationGaps": [
+      "Lesson 생성 → ActionPlan 생성: 현재 수동 연결",
+      "ValidationResult 승인 → Lesson.resolved: 자동화 부재",
+      "Severity 기반 알림: am-to-ntfy.py는 Alertmanager만 처리 (KG 이벤트 미지원)"
+    ],
+    "implementableComponents": [
+      {
+        "name": "APOC Trigger: LessonCreatedAutoActionPlan",
+        "type": "Neo4j Native Trigger",
+        "mechanism": "CREATE (l:Lesson) → 자동 ActionPlan 생성 (template 기반)",
+        "cypher": "CREATE TRIGGER lesson_auto_action AFTER CREATE ON LABEL Lesson SET ap = newInstance.problem + ':' + newInstance.category CREATE (ap:ActionPlan {name: ap, description: newInstance.problem, phase: 'ANALYSIS', priority: newInstance.severity})",
+        "effort": "2 hours",
+        "dependencies": ["Neo4j 5.0+", "APOC 5.3+"]
+      },
+      {
+        "name": "ValidationResult → LessonResolved Rule",
+        "type": "jaebaeman LSystemRule",
+        "mechanism": "ValidationResult.verdict=APPROVED ∧ VALIDATES(l:Lesson) → SET l.resolved=true, l.resolvedAt=datetime()",
+        "cypher": "MATCH (vr:ValidationResult {verdict:'APPROVED'})-[:VALIDATES]->(l:Lesson) WHERE l.resolved IS NULL OR l.resolved=false CALL {WITH vr, l SET l.resolved=true, l.resolvedAt=datetime(), l.validatedBy=vr.sourceId} IN TRANSACTIONS OF 10 ROWS",
+        "effort": "3 hours",
+        "dependencies": ["jaebaeman rule_executor.py", "Cypher safety whitelist"]
+      },
+      {
+        "name": "Webhook: Lesson Severity → ntfy.sh Alert",
+        "type": "Python HTTP Server (extension)",
+        "mechanism": "POST /lessons/create → severity → ntfy priority/tags mapping",
+        "implementation": "extend /03_SCRIPTS/monitoring/am-to-ntfy.py with /lessons route. Map: CRITICAL→urgent+rotating_light, HIGH→high+warning, MEDIUM→default+notepad",
+        "effort": "4 hours",
+        "dependencies": ["Python 3.8+", "ntfy.sh account", "Lesson webhook schema (POST /lessons/create {lesson_id, name, severity, category})"]
+      },
+      {
+        "name": "ActionPlan Template Library",
+        "type": "KG Node Structure + Mapping Rules",
+        "mechanism": "Lesson.severity → ActionPlanTemplate → instantiate()",
+        "templates": [
+          {
+            "severity": "CRITICAL",
+            "template": "ActionPlan {phase:'IMMEDIATE_ACTION', estimatedEffort:'PT4H', action:'Assess → Report → Execute'}",
+            "escalation": "Auto ntfy + Slack #critical"
+          },
+          {
+            "severity": "HIGH",
+            "template": "ActionPlan {phase:'URGENT_RESEARCH', estimatedEffort:'PT2D', action:'Research → Plan → Execute'}",
+            "escalation": "Auto ntfy in morning briefing"
+          },
+          {
+            "severity": "MEDIUM",
+            "template": "ActionPlan {phase:'BACKLOG', estimatedEffort:'P1W', action:'Catalog → Review → Schedule'}",
+            "escalation": "Weekly report only"
+          }
+        ],
+        "effort": "3 hours",
+        "dependencies": ["ActionPlan schema finalization"]
+      }
+    ]
+  },
+  "implementationPhases": {
+    "phase1": {
+      "name": "KG Schema Finalization + APOC Setup",
+      "duration": "P3D",
+      "tasks": [
+        "Standardize Lesson properties (missing constraints on resolved/severity)",
+        "Standardize ActionPlan properties (unify phase/status field naming)",
+        "Define APOC Trigger (test on 10 dummy Lessons)",
+        "Define VALIDATES relationship cardinality constraints"
+      ],
+      "deliverable": "lesson_and_actionplan_schema_final.cypher, apoc_trigger_lesson_created.cypher"
+    },
+    "phase2": {
+      "name": "Webhook Extension + Alerting",
+      "duration": "P2D",
+      "tasks": [
+        "Extend am-to-ntfy.py with /lessons/create endpoint",
+        "Define POST schema for Lesson creation events",
+        "Map severity → ntfy priority/tags",
+        "Integration test: create Lesson → receive ntfy alert"
+      ],
+      "deliverable": "am-to-ntfy-extended.py, lesson_webhook_schema.json"
+    },
+    "phase3": {
+      "name": "jaebaeman Rule: ValidationResult → Resolved",
+      "duration": "P2D",
+      "tasks": [
+        "Author LSystemRule for ValidationResult→Lesson.resolved",
+        "Add to Cypher safety whitelist (if needed)",
+        "Test with 5 existing ValidationResults",
+        "Document rollback procedure"
+      ],
+      "deliverable": "rule_validation_result_mark_resolved.cypher, test_results.log"
+    }
+  },
+  "implementationPriority": "HIGH",
+  "rationale": "Lesson 생성 빈도 3~5건/주 × 수동 ActionPlan 작성 10분 = 월 ~2시간 낭비. 자동화로 150% 개선 (0.5시간/월). CRITICAL/HIGH 건의 alert latency 현재 24시간 → 5분으로 단축.",
+  "riskAssessment": {
+    "riskLevel": "LOW",
+    "concerns": [
+      "APOC Trigger 성능 (대량 Lesson 동시 생성 시 bottleneck 가능) → Rate limit or batch",
+      "ValidationResult verdict semantics 모호 (APPROVED/FAILED/PENDING 정의 재확인 필요)",
+      "Webhook auth (ntfy.sh 토큰 관리, secret rotation 정책 필수)"
+    ],
+    "mitigation": [
+      "Load test APOC Trigger with 100 concurrent Lesson creates",
+      "Document verdict enum values in ActionPlan schema",
+      "Add API key rotation to /03_SCRIPTS/monitoring/README.md"
+    ]
+  },
+  "successMetrics": [
+    "Lesson→ActionPlan lag < 1분 (현재 수동)",
+    "ValidationResult 승인 후 Lesson.resolved 자동 반영 < 30초",
+    "CRITICAL Lesson ntfy alert latency < 5분",
+    "AutoActionPlan 정확도 > 90% (Lesson 샘플 10개 검증)"
+  ],
+  "nextSteps": [
+    "APT SA: Lesson/ActionPlan/ValidationResult 타입 명확화",
+    "APT SP: 3 component decompose into atomic tasks",
+    "APT ST: Contract 정의 (Trigger input/output, Webhook payload schema)",
+    "Phase1 시작 전 KG lesson-026-gate-check-validation 참조 (APT Gate Check 자동화 사례)"
+  ],
+  "references": {
+    "existingCode": [
+      "/Users/lagyeongjun/CD/SERVER/03_SCRIPTS/monitoring/am-to-ntfy.py (알림 기반)",
+      "/Users/lagyeongjun/CD/SERVER/03_SCRIPTS/jaebaeman/rule_executor.py (규칙 실행)",
+      "/Users/lagyeongjun/CD/SERVER/06_KNOWLEDGE-GRAPH/lessons-local-storage.cypher (Lesson 예시)"
+    ],
+    "kgReferences": [
+      "lesson-026-gate-check-validation (APT Gate Check 자동화)",
+      "ValidationResult 88개 노드 (verdict 필드 정의 확인)",
+      "ActionPlan schema (phase/status 통일)"
+    ]
+  },
+  "tpaMapping": {
+    "TargetCodeWorld": "am-to-ntfy.py extension + jaebaeman rules",
+    "TargetTwin": "ActionPlan Contract (DTO: name/description/phase/priority/estimatedEffort/currentStatus)",
+    "TargetPyramid": "3 components: APOC + Webhook + Rule (Distributed Pattern RESEMBLES 70%)",
+    "TargetAnchor": "Lesson creation workflow as SemanticAnchor"
+  }
+}

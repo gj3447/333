@@ -1,0 +1,22 @@
+[package]
+name = "triple-three-ggrs-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "GGRS rollback-netcode adapter for 333 Platform — spike crate"
+# KG: seed-ggrs-bft-adapter-eval-2026-04-15
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+ggrs = "0.12"
+# KG: taliban-fix-C2-2026-04-15 — blake3 replaces FNV-64 for collision-resistant checksums
+blake3 = { version = "1", default-features = false }
+# ggrs = "0.10"  # NAT hairpin may block crates.io pull — uncomment after network check
+# tokio = { version = "1", features = ["sync"] }  # only needed for async socket wrapper
+
+[dev-dependencies]
+# ggrs = "0.10"  # same caveat
+
+[features]
+# Enable when ggrs fetch succeeds
+ggrs-real = []

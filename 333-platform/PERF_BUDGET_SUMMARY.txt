@@ -1,0 +1,147 @@
+================================================================================
+PERFORMANCE BUDGET: Browser P2P Game Platform (333 + Minecraft)
+================================================================================
+
+TARGET METRICS
+- 60 FPS (16.67ms/frame)
+- <100ms input latency (input→render)
+- <200ms P2P sync latency (peer→peer)
+
+================================================================================
+FRAME TIME BUDGET (16.67ms = 100%)
+================================================================================
+
+WASM Compute        5ms (30%)   | CRDT merge (1.5ms) + game logic (2.5ms) + GC (<1ms)
+Rendering           8ms (48%)   | WebGL state (5ms) + vert/frag (2ms) + draw calls
+Network I/O         2ms (12%)   | WebRTC send/recv (async, non-blocking)
+GC Pressure         1ms (6%)    | Incremental marking (amortized; actual spiky)
+System/Overhead  0.67ms (4%)   | Timer, event loop, V8 internals
+
+SPARE BUDGET     0.67ms (4%)   | Jitter tolerance only; NO safety margin
+
+================================================================================
+COMPONENT CPU DETAILS
+================================================================================
+
+CRDT MERGE (LWW-Map per frame)
+  Operation           │ Time      │ Scalability
+  ─────────────────────┼───────────┼─────────────────────────
+  Merge 50 deltas     │ 0.8ms     │ ~2500 ops/sec @ 20ms batch
+  State vector @ 8p   │ 0.2ms     │ O(peer_count)
+  Serialization 5KB   │ 0.5ms     │ 40μs/KB
+  Total per merge     │ 1.5ms     │ 1.2 merges/frame typical
+
+  ⚠️  At 8 merges/frame (8 peers, 100 blocks/sec) → 12ms OVER BUDGET
+      Mitigation: Parallel merge (Rayon/Web Worker) OR stream deltas
+
+BFT CONSENSUS (HotStuff: proof + QC)
+  Operation           │ 8 validators │ 50 validators
+  ─────────────────────┼──────────────┼────────────────
+  QC aggregation      │ 0.4ms        │ 2.5ms
+  Vote creation       │ 0.1ms        │ 0.1ms
+  Block hashing       │ 0.3ms        │ 0.3ms
+  Per-block overhead  │ 0.8ms        │ 2.9ms
+
+  ⚠️  Consensus runs ~1 block per 5-10 seconds (off-path)
+      Do NOT execute in main game loop; use Web Worker
+      Budget: 0ms/frame in frame time
+
+WEBRTC DATACHANNEL (P2P pipe)
+  Metric              │ Budget    │ Reality (LAN/Tailscale)
+  ─────────────────────┼───────────┼─────────────────────
+  Send enqueue        │ <0.5ms    │ V8 interop + Uint8Array
+  Recv dequeue        │ <0.5ms    │ Async callback from browser event loop
+  RTT (LAN)           │ <10ms     │ 2-5ms typical (headscale mesh)
+  Throughput @ 8p     │ 280KB/s   │ 32KB/batch = 8.75× capacity ✓
+
+================================================================================
+END-TO-END LATENCY BREAKDOWN
+================================================================================
+
+INPUT → RENDER PIPELINE
+  Input capture (2ms) → WASM compute (5ms) → Render (8ms) → Display (16ms)
+  = 31ms total
+  Headroom: 69ms for network propagation ✓ SAFE
+
+P2P SYNC LATENCY
+  Local delta (0.5ms) → Buffer (10-20ms) → Send (2ms)
+  + Peer recv (2ms) → CRDT merge (1.5ms) → Render (8ms)
+  = 24-35ms point-to-point
+
+  @ 6-8 peers gossip: 35 × log₂(8) ≈ 105ms
+  Budget: 200ms ✓ SAFE (95ms margin)
+
+================================================================================
+MEMORY BUDGET (Total: <225MB)
+================================================================================
+
+Layer                   │ Target  │ Typical │ Notes
+────────────────────────┼─────────┼─────────┼─────────────────────────
+WASM Linear Memory      │ <50MB   │ 32MB    │ Stack + CRDT state
+WASM Heap (Objects)     │ <20MB   │ 15MB    │ GC every ~500ms
+JavaScript Heap         │ <100MB  │ 60MB    │ DOM + Three.js scene
+WebGL Textures          │ <50MB   │ 40MB    │ 16K chunks × 256×256
+Network Buffers         │ <5MB    │ 2MB     │ Ring per peer
+─────────────────────────┼─────────┼─────────┼─────────────────────────
+Total                   │ <225MB  │ 147MB   │ 150MB safety margin
+
+GC PRESSURE: Incremental marking (V8). Strategy: object pool + arena allocator.
+
+================================================================================
+VALIDATION CHECKPOINTS
+================================================================================
+
+Critical Path Metrics (MUST MEASURE WITH PROFILER)
+
+1. Frame Latency
+   Target: 95th percentile <17ms
+   Detect: GC stalls, CRDT pathological merges
+
+2. CRDT Merge Time
+   Target: p95 <2ms (not 1.5ms average)
+   Detect: Unusually large delta batches
+
+3. Network Round-Trip
+   Target: p99 <100ms
+   Detect: WebRTC jitter, peer timeout
+
+4. Memory Growth
+   Target: <1MB/min drift
+   Detect: Heap leak (delta accumulation, event listeners)
+
+Test Scenario:
+  8 peers, 100 blocks/sec modified, 20ms batch interval
+  = 8 merge ops/frame
+  = 8 × 1.5ms = 12ms CRDT ✗ OVER BUDGET
+
+  Mitigation: Reduce to <4 merges/frame via parallel processing
+
+================================================================================
+QUICK REFERENCE: COMPONENT % OF FRAME
+================================================================================
+
+Component              │ ms   │ %     │ Headroom
+───────────────────────┼──────┼───────┼──────────
+WASM Compute           │ 5.0  │ 30%   │ 0.5ms
+Rendering              │ 8.0  │ 48%   │ 0.5ms
+Network I/O            │ 2.0  │ 12%   │ 0.5ms
+GC (amortized)         │ 1.0  │ 6%    │ spiky
+───────────────────────┼──────┼───────┼──────────
+TOTAL                  │ 16.0 │ 96%   │ 0.67ms
+
+RULE OF THUMB: 4% spare budget = JITTER ONLY.
+Any 60fps miss → optimize nearest 1-2% win before guessing:
+  • Reduce draw calls (batch WebGL)
+  • CRDT delta coalescing (merge smaller batches)
+  • BFT off-path (Web Worker)
+
+================================================================================
+KEY REFERENCES
+================================================================================
+See: PERFORMANCE_BUDGET_P2P_GAME.md (full analysis)
+     CRDT_SYNC_ARCHITECTURE.md (delta batching @ 20ms)
+     BFT_TRANSPORT_WEBRTC_DESIGN.md (consensus overhead)
+     apt-progress.md (integration checklist)
+
+# KG: PERF_BUDGET_P2P_GAME
+================================================================================

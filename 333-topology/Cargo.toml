@@ -1,0 +1,9 @@
+[package]
+name = "topology333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS L3 Topology — composite tree (Zone>Rack>Node>Volume) inspired by SeaweedFS"
+
+[dependencies]
+identity333 = { path = "../333-identity" }

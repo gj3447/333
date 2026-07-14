@@ -1,0 +1,112 @@
+# KG: WORKFLOW_333_P2P_CI
+# P2P Smoke Tests — Automated WebRTC + CRDT verification
+# Runs on push to main/develop and on pull requests
+# Tests: Signaling connection, peer discovery, DataChannel, CRDT replication
+
+name: P2P Smoke Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'signaling/**'
+      - '333-app/src/**'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/p2p-test.yml'
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  p2p-smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      matrix:
+        node-version: [18, 20]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: |
+            signaling/package-lock.json
+            333-app/package-lock.json
+
+      - name: Install signaling server
+        run: |
+          cd signaling
+          npm install
+          echo "Signaling server installed"
+
+      - name: Install app dependencies
+        run: |
+          cd 333-app
+          npm install
+          echo "App dependencies installed"
+
+      - name: Install test dependencies
+        run: |
+          npm install --save-dev puppeteer-core wait-on
+          echo "Test dependencies installed"
+
+      - name: Start signaling server
+        run: |
+          cd signaling
+          timeout 300 node server.mjs 8333 &
+          echo $! > /tmp/signaling.pid
+          sleep 1
+          echo "Signaling server started (PID: $(cat /tmp/signaling.pid))"
+
+      - name: Start app dev server
+        run: |
+          cd 333-app
+          timeout 300 npm run dev -- --host 0.0.0.0 &
+          echo $! > /tmp/app.pid
+          sleep 3
+          echo "App server started (PID: $(cat /tmp/app.pid))"
+
+      - name: Wait for services
+        run: |
+          npx wait-on http://localhost:5173 ws://localhost:8333 --timeout 15000
+          echo "Services are ready"
+
+      - name: Run P2P smoke test
+        run: |
+          node tests/p2p-smoke.js ws://localhost:8333
+        env:
+          APP_URL: http://localhost:5173/room
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f /tmp/signaling.pid ]; then kill $(cat /tmp/signaling.pid) || true; fi
+          if [ -f /tmp/app.pid ]; then kill $(cat /tmp/app.pid) || true; fi
+          sleep 1
+
+      - name: Report results
+        if: always()
+        run: |
+          echo "P2P smoke test completed"
+          echo "Node version: ${{ matrix.node-version }}"
+
+  status-check:
+    needs: p2p-smoke-test
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check test status
+        run: |
+          if [ "${{ needs.p2p-smoke-test.result }}" = "success" ]; then
+            echo "✓ All P2P tests passed"
+            exit 0
+          else
+            echo "❌ P2P tests failed"
+            exit 1
+          fi

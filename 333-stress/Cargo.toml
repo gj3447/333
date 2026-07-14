@@ -1,0 +1,30 @@
+[package]
+name = "stress333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS stress harness — concurrency / throughput / adversarial tests across the full 25-crate stack. Not for production; runs cargo test as integration, cargo run --release for throughput benches."
+
+# KG: SPAN_333_Stress_Harness, queue-stress-hard-2026-04-18
+
+[dependencies]
+identity333 = { path = "../333-identity" }
+crdt333 = { path = "../333-crdt" }
+content333 = { path = "../333-content" }
+consensus333 = { path = "../333-consensus" }
+mq333 = { path = "../333-mq" }
+signaling333 = { path = "../333-signaling" }
+token333 = { path = "../333-token" }
+incentive333 = { path = "../333-incentive" }
+reputation333 = { path = "../333-reputation" }
+orchestration333 = { path = "../333-orchestration" }
+storage_advanced333 = { path = "../333-storage-advanced" }
+voxel_ref333 = { path = "../333-voxel-ref" }
+release333 = { path = "../333-release" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "stress333-bench"
+path = "src/bin/bench.rs"

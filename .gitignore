@@ -1,0 +1,8 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Backups / editor
+*.bak
+*~
+.DS_Store

@@ -1,0 +1,16 @@
+crdt333 — 333 P2P OS L5 State layer
+=====================================
+
+This crate provides CRDT types (Crdt/AutoCrdt trait + Lww, LwwMap, Map,
+Bool, Deletable) for eventual-consistency state synchronization.
+
+Attribution
+-----------
+The API surface and type names are inspired by the `garage::util::crdt`
+module of Garage (https://git.deuxfleurs.fr/Deuxfleurs/garage, AGPL-3.0).
+The CRDT merge mathematics is textbook (see Shapiro et al., "Conflict-free
+Replicated Data Types", 2011) and not copyrightable.
+
+This crate was written clean-room based on the CRDT specification. It does
+not contain source code copied from Garage and is licensed under
+Apache-2.0 OR MIT.

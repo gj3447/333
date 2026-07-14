@@ -1,0 +1,12 @@
+[package]
+name = "token333"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "333 P2P OS L11+ Token — TokenLedger (balance/mint/burn/transfer) + StakePool (stake/slash) + epoch emission curve. AccountId = identity333::NodeId. Hook for consensus333 SettlementOp::Transfer."
+
+# KG: SPAN_333_L11plus_Token, plan-333-p2p-os-synthesis-execution-2026-04-18, queue-p10-testnet-token-2026-04-18
+
+[dependencies]
+identity333 = { path = "../333-identity" }
+thiserror = "1"

@@ -1,0 +1,65 @@
+// KG: SPAN_333_L13_Component, plan-333-p2p-os-synthesis-execution-2026-04-18
+// 333 P2P OS — identity WIT interface (WASM Component Model 0.3 RC syntax).
+//
+// Source: finding_333_synth_cmp_prt_d18 (identity-first componentization).
+// Deliberately narrow: keypair + NodeId + signature verification. CRDT state
+// stays internal to the identity component; only signed envelopes cross the
+// component boundary.
+
+package metahumotonic:identity@0.1.0;
+
+interface types {
+  // 32-byte Ed25519 public key = NodeId.
+  type node-id = list<u8>;
+  // 64-byte Ed25519 signature.
+  type signature = list<u8>;
+
+  record keyed-event {
+    author: node-id,
+    payload: list<u8>,
+    timestamp-ms: u64,
+  }
+
+  record envelope {
+    event: keyed-event,
+    sig: signature,
+  }
+
+  record signed-root {
+    root-hash: list<u8>,
+    author: node-id,
+    sig: signature,
+  }
+
+  variant verify-error {
+    invalid-public-key,
+    invalid-signature,
+    verification-failed,
+  }
+}
+
+interface signer {
+  use types.{keyed-event, envelope, signature};
+
+  // Sign an event with the caller's keypair; returns a signed envelope.
+  sign-event: func(event: keyed-event) -> envelope;
+
+  // Generic signing primitive over arbitrary bytes.
+  sign: func(msg: list<u8>) -> signature;
+}
+
+interface verifier {
+  use types.{envelope, signature, node-id, verify-error};
+
+  // Verify an envelope's signature against its author.
+  verify-envelope: func(env: envelope) -> result<_, verify-error>;
+
+  // Standalone signature verification.
+  verify: func(author: node-id, msg: list<u8>, sig: signature) -> result<_, verify-error>;
+}
+
+world identity-component {
+  export signer;
+  export verifier;
+  export types;
+}
