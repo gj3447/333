@@ -1,13 +1,19 @@
-// KG: transport-plan Steps 2–3 (2026-07-14)
+// KG: transport-plan Steps 2–3, 5–7 (2026-07-14)
 //
 // Narrow authority-net trait + deterministic in-memory full-mesh mailboxes.
 // Each peer owns its own mailbox; broadcasts fan out `AuthorityMsg` values.
-// No TCP/QUIC/WebRTC (Steps 4–8). Does NOT reinvent Certificate aggregation —
-// collectors call the existing `Certificate::assemble` / `verify`.
+// No TCP/QUIC/WebRTC (Step 8). No Plumtree (Step 4). Does NOT reinvent
+// Certificate aggregation — collectors call the existing
+// `Certificate::assemble` / `verify`.
+//
+// Steps 5–7 (on top of 1–3):
+//   5. Decoupled multi-round vote collection (`VoteCollector` / `collect_until_quorum`)
+//   6. Certificate dissemination to independent `MeshLedger` replicas
+//   7. Remote `Authority::confirm` from polled Cert messages
 //
 // Local mailbox map (not transport333::InMemoryMesh): that crate is unicast +
 // identity333::NodeId point-to-point. A transfer-local AuthorityId mesh keeps
-// Steps 1–3 self-contained without pulling parallel stacks.
+// the path self-contained without pulling parallel stacks.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -15,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use crate::authority::{
     Authority, AuthorityError, Certificate, Certified, Committee, Verified, Vote,
 };
-use crate::Transfer;
+use crate::{Ledger, Reject, Transfer};
 
 /// Messages that travel the authority mesh (orders, signed votes, certificates).
 #[derive(Debug, Clone)]
@@ -265,6 +271,303 @@ pub fn certify_via_mesh(
                 contested,
             },
         ),
+    }
+}
+
+// --- Step 5: decoupled multi-round collection --------------------------------
+
+/// Accumulates DISTINCT votes for one transfer from a collector mailbox.
+///
+/// A **round** is one drain of currently-available `Vote` messages (deterministic
+/// in-memory clock = the round counter). No wall-clock, no async runtime.
+/// Callers that stagger vote delivery between rounds use [`Self::poll_round`];
+/// [`Self::collect_until_quorum`] / free [`collect_until_quorum`] loop that drain.
+///
+/// Refusals / contested flags are recorded via [`Self::note_refusal`] when the
+/// caller observes `Authority::handle` outcomes (collection alone only sees votes).
+#[derive(Debug, Clone)]
+pub struct VoteCollector {
+    transfer: Transfer,
+    votes: Vec<Vote>,
+    seen: HashSet<String>,
+    refusals: usize,
+    contested: bool,
+}
+
+impl VoteCollector {
+    pub fn new(transfer: Transfer) -> Self {
+        Self {
+            transfer,
+            votes: Vec::new(),
+            seen: HashSet::new(),
+            refusals: 0,
+            contested: false,
+        }
+    }
+
+    pub fn transfer(&self) -> &Transfer {
+        &self.transfer
+    }
+
+    pub fn votes(&self) -> &[Vote] {
+        &self.votes
+    }
+
+    pub fn vote_count(&self) -> usize {
+        self.votes.len()
+    }
+
+    pub fn refusals(&self) -> usize {
+        self.refusals
+    }
+
+    pub fn contested(&self) -> bool {
+        self.contested
+    }
+
+    /// Record an authority `handle` refusal (Equivocation → contested).
+    pub fn note_refusal(&mut self, err: &AuthorityError) {
+        self.refusals += 1;
+        if matches!(err, AuthorityError::Equivocation { .. }) {
+            self.contested = true;
+        }
+    }
+
+    /// One round: drain currently-available Vote messages matching this transfer
+    /// (dedupe by authority id).
+    pub fn poll_round(&mut self, collector: &MeshEndpoint) {
+        for msg in collector.poll() {
+            if let AuthorityMsg::Vote(v) = msg {
+                if v.transfer == self.transfer && self.seen.insert(v.authority.clone()) {
+                    self.votes.push(v);
+                }
+            }
+        }
+    }
+
+    /// Try `Certificate::assemble` with votes collected so far.
+    pub fn try_assemble(&self, committee: &Committee) -> Option<Certificate> {
+        Certificate::assemble(self.transfer.clone(), self.votes.clone(), committee)
+    }
+
+    /// Failure snapshot matching `certify` / `certify_via_mesh` counters.
+    pub fn failed_status(&self) -> Certified {
+        Certified::Failed {
+            votes: self.votes.len(),
+            refusals: self.refusals,
+            contested: self.contested,
+        }
+    }
+
+    /// Poll up to `max_rounds` drains; assemble+verify on quorum, else Failed.
+    pub fn collect_until_quorum(
+        &mut self,
+        collector: &MeshEndpoint,
+        committee: &Committee,
+        max_rounds: usize,
+    ) -> (Option<Certificate>, Certified) {
+        for _ in 0..max_rounds {
+            self.poll_round(collector);
+            if let Some(cert) = self.try_assemble(committee) {
+                // assemble already ran is_valid; verify is the type-state mint path.
+                let _ = cert
+                    .verify(committee)
+                    .expect("assembled certificate verifies");
+                return (Some(cert), Certified::Ok);
+            }
+        }
+        (None, self.failed_status())
+    }
+}
+
+/// Free-function multi-round collection from `collector`'s mailbox.
+///
+/// Polls across up to `max_rounds` rounds (one drain each). Accumulates DISTINCT
+/// valid votes matching `transfer` until `committee.quorum()`, then
+/// `Certificate::assemble` + `verify`. Sub-quorum after `max_rounds` → Failed.
+///
+/// Does not observe authority refusals (no wire refuse message); for contested
+/// splits use [`VoteCollector::note_refusal`] then [`VoteCollector::collect_until_quorum`].
+pub fn collect_until_quorum(
+    collector: &MeshEndpoint,
+    transfer: &Transfer,
+    committee: &Committee,
+    max_rounds: usize,
+) -> (Option<Verified>, Certified) {
+    let mut coll = VoteCollector::new(transfer.clone());
+    match coll.collect_until_quorum(collector, committee, max_rounds) {
+        (Some(cert), Certified::Ok) => {
+            let verified = cert
+                .verify(committee)
+                .expect("assembled certificate verifies");
+            (Some(verified), Certified::Ok)
+        }
+        (_, status) => (None, status),
+    }
+}
+
+/// One authority-side round: each authority drains **its own** mailbox, runs
+/// existing `handle` on Orders, broadcasts Votes on success, and records
+/// refusals on the collector (for Failed counters / contested).
+pub fn authority_handle_round(
+    authorities: &mut [Authority],
+    auth_endpoints: &[MeshEndpoint],
+    collector: &mut VoteCollector,
+) {
+    assert_eq!(
+        authorities.len(),
+        auth_endpoints.len(),
+        "one endpoint per authority"
+    );
+    for (auth, ep) in authorities.iter_mut().zip(auth_endpoints.iter()) {
+        for msg in ep.poll() {
+            if let AuthorityMsg::Order(order) = msg {
+                match auth.handle(&order) {
+                    Ok(vote) => {
+                        let _ = ep.broadcast_vote(vote);
+                    }
+                    Err(err) => collector.note_refusal(&err),
+                }
+            }
+        }
+    }
+}
+
+// --- Step 6: certificate dissemination → independent ledgers -----------------
+
+/// A ledger replica with its own mesh mailbox and local balance state.
+/// Committee is supplied at verify/apply time (verifier-owned, never caller size).
+pub struct MeshLedger {
+    endpoint: MeshEndpoint,
+    ledger: Ledger,
+}
+
+impl MeshLedger {
+    pub fn new(endpoint: MeshEndpoint, ledger: Ledger) -> Self {
+        Self { endpoint, ledger }
+    }
+
+    pub fn id(&self) -> &str {
+        self.endpoint.id()
+    }
+
+    pub fn endpoint(&self) -> &MeshEndpoint {
+        &self.endpoint
+    }
+
+    pub fn ledger(&self) -> &Ledger {
+        &self.ledger
+    }
+
+    pub fn ledger_mut(&mut self) -> &mut Ledger {
+        &mut self.ledger
+    }
+
+    /// Poll this replica's mailbox; for each Cert, verify against the **local**
+    /// `committee` and `apply_verified` on success.
+    pub fn poll_and_apply(&mut self, committee: &Committee) -> Vec<Result<(), Reject>> {
+        let mut outcomes = Vec::new();
+        for msg in self.endpoint.poll() {
+            if let AuthorityMsg::Cert(c) = msg {
+                match c.verify(committee) {
+                    Some(v) => outcomes.push(self.ledger.apply_verified(&v)),
+                    None => outcomes.push(Err(Reject::NoCertificate)),
+                }
+            }
+        }
+        outcomes
+    }
+}
+
+/// Broadcast an assembled certificate and have each independent replica
+/// poll → verify (local committee) → `apply_verified` (local ledger).
+pub fn disseminate_certificate(
+    broadcaster: &MeshEndpoint,
+    cert: &Certificate,
+    committee: &Committee,
+    replicas: &mut [MeshLedger],
+) -> Result<Vec<Vec<Result<(), Reject>>>, NetError> {
+    broadcaster.broadcast_cert(cert.clone())?;
+    let mut all = Vec::with_capacity(replicas.len());
+    for r in replicas.iter_mut() {
+        all.push(r.poll_and_apply(committee));
+    }
+    Ok(all)
+}
+
+// --- Step 7: remote confirm over the mesh ------------------------------------
+
+/// Remote authorities drain their mailboxes for `Cert` messages, verify against
+/// the local committee, and call existing `Authority::confirm` (advances
+/// `next_expected`) — no shared in-process confirm loop.
+pub fn confirm_from_mesh(
+    authorities: &mut [Authority],
+    auth_endpoints: &[MeshEndpoint],
+    committee: &Committee,
+) {
+    assert_eq!(
+        authorities.len(),
+        auth_endpoints.len(),
+        "one endpoint per authority"
+    );
+    for (auth, ep) in authorities.iter_mut().zip(auth_endpoints.iter()) {
+        for msg in ep.poll() {
+            if let AuthorityMsg::Cert(c) = msg {
+                if let Some(v) = c.verify(committee) {
+                    auth.confirm(&v);
+                }
+            }
+        }
+    }
+}
+
+/// Multi-round certification path (Steps 5–7 composed, still no wall-clock):
+/// broadcast order → authority handle round → collect_until_quorum → on Ok,
+/// broadcast cert + remote confirm. Separates collection from single-pass
+/// [`certify_via_mesh`].
+pub fn certify_via_mesh_rounds(
+    t: &Transfer,
+    authorities: &mut [Authority],
+    auth_endpoints: &[MeshEndpoint],
+    client: &MeshEndpoint,
+    committee: &Committee,
+    max_rounds: usize,
+) -> (Option<Verified>, Option<Certificate>, Certified) {
+    assert_eq!(
+        authorities.len(),
+        auth_endpoints.len(),
+        "one endpoint per authority"
+    );
+
+    if client.broadcast_order(t.clone()).is_err() {
+        return (
+            None,
+            None,
+            Certified::Failed {
+                votes: 0,
+                refusals: 0,
+                contested: false,
+            },
+        );
+    }
+
+    let mut coll = VoteCollector::new(t.clone());
+    // Authorities process the order once (votes fan out into mailboxes).
+    authority_handle_round(authorities, auth_endpoints, &mut coll);
+
+    // Multi-round drain of the collector (votes may already be present; extra
+    // rounds are empty drains if nothing new arrives — deterministic stall).
+    let (cert, status) = coll.collect_until_quorum(client, committee, max_rounds);
+    match (cert, status) {
+        (Some(cert), Certified::Ok) => {
+            let verified = cert
+                .verify(committee)
+                .expect("assembled certificate verifies");
+            let _ = client.broadcast_cert(cert.clone());
+            confirm_from_mesh(authorities, auth_endpoints, committee);
+            (Some(verified), Some(cert), Certified::Ok)
+        }
+        (_, failed) => (None, None, failed),
     }
 }
 

@@ -51,8 +51,9 @@
 //     are deployed. The FastPay-style authority-quorum certificate layer AND a
 //     passing equivocation test — the two conditions PROM 16 required — are both
 //     now met (safety core + real Ed25519 votes, `authority.rs`). Wire codec +
-//     in-memory authority mesh (Steps 1–3) land in `wire` / `net`; real I/O and
-//     Plumtree remain follow-ups (Steps 4–8).
+//     in-memory authority mesh (Steps 1–3) and multi-round collect / multi-ledger
+//     disseminate / remote confirm (Steps 5–7) land in `wire` / `net`; real I/O
+//     and Plumtree remain follow-ups (Steps 4, 8).
 //   * premint vs runtime-issuance   -> PREMINT default; but the real boundary is
 //     single-minter vs multi-minter, NOT premint vs runtime (PROM Q2). A
 //     single-authority runtime mint (cf. Sui TreasuryCap) is still consensus
@@ -74,7 +75,9 @@ pub use authority::{
     Verified, Vote,
 };
 pub use net::{
-    certify_via_mesh, AuthorityMsg, AuthorityNet, InMemoryAuthorityMesh, MeshEndpoint, NetError,
+    authority_handle_round, certify_via_mesh, certify_via_mesh_rounds, collect_until_quorum,
+    confirm_from_mesh, disseminate_certificate, AuthorityMsg, AuthorityNet, InMemoryAuthorityMesh,
+    MeshEndpoint, MeshLedger, NetError, VoteCollector,
 };
 pub use wire::{
     decode_certificate, decode_transfer, decode_vote, encode_certificate, encode_transfer,
