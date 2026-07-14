@@ -1,0 +1,471 @@
+// KG: transport-plan Steps 2–3 (2026-07-14)
+//
+// Narrow authority-net trait + deterministic in-memory full-mesh mailboxes.
+// Each peer owns its own mailbox; broadcasts fan out `AuthorityMsg` values.
+// No TCP/QUIC/WebRTC (Steps 4–8). Does NOT reinvent Certificate aggregation —
+// collectors call the existing `Certificate::assemble` / `verify`.
+//
+// Local mailbox map (not transport333::InMemoryMesh): that crate is unicast +
+// identity333::NodeId point-to-point. A transfer-local AuthorityId mesh keeps
+// Steps 1–3 self-contained without pulling parallel stacks.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use crate::authority::{
+    Authority, AuthorityError, Certificate, Certified, Committee, Verified, Vote,
+};
+use crate::Transfer;
+
+/// Messages that travel the authority mesh (orders, signed votes, certificates).
+#[derive(Debug, Clone)]
+pub enum AuthorityMsg {
+    Order(Transfer),
+    Vote(Vote),
+    Cert(Certificate),
+}
+
+/// Transport / mesh failure for the in-memory authority network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetError {
+    /// Peer id is not registered on the mesh.
+    UnknownPeer(String),
+    /// Mesh has been marked closed / down.
+    Closed,
+}
+
+/// Object-safe broadcast + poll surface for committee authorities (and clients).
+///
+/// - `broadcast_order` — client → authorities (transfer intent)
+/// - `broadcast_vote`  — authority → mesh (signed vote)
+/// - `broadcast_cert`  — optional cert fan-out after assembly
+/// - `poll`            — drain this endpoint's inbox
+pub trait AuthorityNet: Send + Sync {
+    fn broadcast_order(&self, t: Transfer) -> Result<(), NetError>;
+    fn broadcast_vote(&self, v: Vote) -> Result<(), NetError>;
+    fn broadcast_cert(&self, c: Certificate) -> Result<(), NetError>;
+    fn poll(&self) -> Vec<AuthorityMsg>;
+}
+
+// --- in-memory full mesh -----------------------------------------------------
+
+#[derive(Default)]
+struct MeshState {
+    /// peer id → FIFO mailbox
+    mailboxes: HashMap<String, Vec<AuthorityMsg>>,
+    closed: bool,
+}
+
+/// Shared in-process authority mesh. Every joined peer has an isolated mailbox;
+/// broadcasts deliver a clone of the message into **every** mailbox.
+#[derive(Default)]
+pub struct InMemoryAuthorityMesh {
+    inner: Mutex<MeshState>,
+}
+
+impl InMemoryAuthorityMesh {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Register `peer` and return a handle bound to that id.
+    pub fn join(self: &Arc<Self>, peer: impl Into<String>) -> MeshEndpoint {
+        let id = peer.into();
+        {
+            let mut g = self.inner.lock().expect("mesh lock");
+            g.mailboxes.entry(id.clone()).or_default();
+        }
+        MeshEndpoint {
+            me: id,
+            mesh: Arc::clone(self),
+        }
+    }
+
+    pub fn participants(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("mesh lock")
+            .mailboxes
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Fault injection: reject further broadcasts / treat as down.
+    pub fn set_closed(&self, closed: bool) {
+        self.inner.lock().expect("mesh lock").closed = closed;
+    }
+
+    /// Directed inject into a single peer's mailbox (adversarial / partition tests).
+    /// Full-mesh honest path uses [`AuthorityNet::broadcast_order`] instead.
+    pub fn deliver_to(&self, peer: &str, msg: AuthorityMsg) -> Result<(), NetError> {
+        let mut g = self.inner.lock().expect("mesh lock");
+        if g.closed {
+            return Err(NetError::Closed);
+        }
+        let mb = g
+            .mailboxes
+            .get_mut(peer)
+            .ok_or_else(|| NetError::UnknownPeer(peer.to_owned()))?;
+        mb.push(msg);
+        Ok(())
+    }
+
+    fn fanout(&self, msg: AuthorityMsg) -> Result<(), NetError> {
+        let mut g = self.inner.lock().expect("mesh lock");
+        if g.closed {
+            return Err(NetError::Closed);
+        }
+        if g.mailboxes.is_empty() {
+            return Ok(());
+        }
+        for mb in g.mailboxes.values_mut() {
+            mb.push(msg.clone());
+        }
+        Ok(())
+    }
+
+    fn drain(&self, me: &str) -> Vec<AuthorityMsg> {
+        let mut g = self.inner.lock().expect("mesh lock");
+        g.mailboxes
+            .get_mut(me)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+}
+
+/// Per-peer handle implementing [`AuthorityNet`].
+#[derive(Clone)]
+pub struct MeshEndpoint {
+    me: String,
+    mesh: Arc<InMemoryAuthorityMesh>,
+}
+
+impl MeshEndpoint {
+    pub fn id(&self) -> &str {
+        &self.me
+    }
+}
+
+impl AuthorityNet for MeshEndpoint {
+    fn broadcast_order(&self, t: Transfer) -> Result<(), NetError> {
+        self.mesh.fanout(AuthorityMsg::Order(t))
+    }
+
+    fn broadcast_vote(&self, v: Vote) -> Result<(), NetError> {
+        self.mesh.fanout(AuthorityMsg::Vote(v))
+    }
+
+    fn broadcast_cert(&self, c: Certificate) -> Result<(), NetError> {
+        self.mesh.fanout(AuthorityMsg::Cert(c))
+    }
+
+    fn poll(&self) -> Vec<AuthorityMsg> {
+        self.mesh.drain(&self.me)
+    }
+}
+
+// --- mesh certification (Step 3) ---------------------------------------------
+
+/// One certification round over isolated mailboxes (no shared `certify` loop).
+///
+/// Flow:
+/// 1. `client` broadcasts the order into every peer mailbox.
+/// 2. Each authority drains **only its own** mailbox, runs existing `handle`,
+///    and broadcasts a `Vote` on success.
+/// 3. `client` (collector) drains its mailbox for votes and calls the existing
+///    `Certificate::assemble` once enough distinct votes arrive.
+/// 4. On success, cert is broadcast and each authority `confirm`s after polling.
+///
+/// Authorities are mutated only via messages that appeared in their mailbox;
+/// there is no `certify(&mut [Authority])` shared-slice pass.
+pub fn certify_via_mesh(
+    t: &Transfer,
+    authorities: &mut [Authority],
+    auth_endpoints: &[MeshEndpoint],
+    client: &MeshEndpoint,
+    committee: &Committee,
+) -> (Option<Verified>, Certified) {
+    assert_eq!(
+        authorities.len(),
+        auth_endpoints.len(),
+        "one endpoint per authority"
+    );
+
+    // 1. Client publishes the order to the mesh.
+    if client.broadcast_order(t.clone()).is_err() {
+        return (
+            None,
+            Certified::Failed {
+                votes: 0,
+                refusals: 0,
+                contested: false,
+            },
+        );
+    }
+
+    // 2. Each authority processes its own mailbox only.
+    let mut refusals = 0usize;
+    let mut contested = false;
+    for (auth, ep) in authorities.iter_mut().zip(auth_endpoints.iter()) {
+        for msg in ep.poll() {
+            if let AuthorityMsg::Order(order) = msg {
+                match auth.handle(&order) {
+                    Ok(vote) => {
+                        // Fan-out the signed vote; ignore mesh-down here (collector
+                        // will simply see fewer votes).
+                        let _ = ep.broadcast_vote(vote);
+                    }
+                    Err(AuthorityError::Equivocation { .. }) => {
+                        refusals += 1;
+                        contested = true;
+                    }
+                    Err(AuthorityError::OutOfOrder { .. }) => {
+                        refusals += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Collector drains votes from its mailbox (true transport path).
+    let mut votes: Vec<Vote> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for msg in client.poll() {
+        if let AuthorityMsg::Vote(v) = msg {
+            if v.transfer == *t && seen.insert(v.authority.clone()) {
+                votes.push(v);
+            }
+        }
+    }
+
+    match Certificate::assemble(t.clone(), votes.clone(), committee) {
+        Some(cert) => {
+            let verified = cert
+                .verify(committee)
+                .expect("assembled certificate verifies");
+            // 4. Disseminate cert; authorities confirm from their mailboxes.
+            let _ = client.broadcast_cert(cert);
+            for (auth, ep) in authorities.iter_mut().zip(auth_endpoints.iter()) {
+                for msg in ep.poll() {
+                    if let AuthorityMsg::Cert(c) = msg {
+                        if let Some(v) = c.verify(committee) {
+                            auth.confirm(&v);
+                        }
+                    }
+                }
+            }
+            (Some(verified), Certified::Ok)
+        }
+        None => (
+            None,
+            Certified::Failed {
+                votes: votes.len(),
+                refusals,
+                contested,
+            },
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authority::{Authority, Committee};
+    use crate::Ledger;
+    use ed25519_dalek::SigningKey;
+
+    fn tx(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
+        Transfer {
+            from: from.into(),
+            from_seq: seq,
+            to: to.into(),
+            amount,
+        }
+    }
+
+    fn key(i: u8) -> SigningKey {
+        SigningKey::from_bytes(&[i; 32])
+    }
+
+    fn setup_mesh(n: u8) -> (Committee, Vec<Authority>, Arc<InMemoryAuthorityMesh>, Vec<MeshEndpoint>, MeshEndpoint) {
+        let authorities: Vec<Authority> = (0..n)
+            .map(|i| Authority::new(format!("a{i}"), key(i)))
+            .collect();
+        let committee =
+            Committee::new(authorities.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
+        let mesh = InMemoryAuthorityMesh::new();
+        let endpoints: Vec<MeshEndpoint> = authorities
+            .iter()
+            .map(|a| mesh.join(a.id().clone()))
+            .collect();
+        let client = mesh.join("client");
+        (committee, authorities, mesh, endpoints, client)
+    }
+
+    #[test]
+    fn mock_mailbox_delivers_order_vote_cert() {
+        let mesh = InMemoryAuthorityMesh::new();
+        let a0 = mesh.join("a0");
+        let a1 = mesh.join("a1");
+        let t = tx("alice", 0, "bob", 1);
+
+        a0.broadcast_order(t.clone()).unwrap();
+        let m0 = a0.poll();
+        let m1 = a1.poll();
+        assert!(matches!(m0.as_slice(), [AuthorityMsg::Order(_)]));
+        assert!(matches!(m1.as_slice(), [AuthorityMsg::Order(_)]));
+        // Second poll is empty (drain).
+        assert!(a0.poll().is_empty());
+
+        // Vote fan-out after a synthetic vote.
+        let mut auth = Authority::new("a0", key(0));
+        let v = auth.handle(&t).unwrap();
+        a0.broadcast_vote(v).unwrap();
+        assert!(matches!(a1.poll().as_slice(), [AuthorityMsg::Vote(_)]));
+    }
+
+    #[test]
+    fn trait_object_safe_broadcast() {
+        let mesh = InMemoryAuthorityMesh::new();
+        let ep = mesh.join("x");
+        let net: &dyn AuthorityNet = &ep;
+        net.broadcast_order(tx("a", 0, "b", 1)).unwrap();
+        assert_eq!(net.poll().len(), 1);
+    }
+
+    #[test]
+    fn honest_transfer_certifies_over_mesh_without_shared_certify() {
+        let (committee, mut authorities, _mesh, endpoints, client) = setup_mesh(4);
+        assert_eq!(committee.quorum(), 3);
+
+        let t = tx("alice", 0, "bob", 30);
+        let (verified, status) =
+            certify_via_mesh(&t, &mut authorities, &endpoints, &client, &committee);
+        assert_eq!(status, Certified::Ok);
+        let verified = verified.expect("quorum over mailboxes");
+
+        let mut ledger = Ledger::genesis([("alice".to_string(), 100u128), ("bob".to_string(), 0u128)]);
+        ledger.apply_verified(&verified).unwrap();
+        assert_eq!(ledger.balance(&"bob".to_string()), 30);
+        assert_eq!(ledger.balance(&"alice".to_string()), 70);
+        assert_eq!(ledger.total_supply(), 100);
+    }
+
+    #[test]
+    fn mesh_equivocation_barred_after_confirm() {
+        // Port of tests/certified_transfer.rs Byzantine path onto mailboxes.
+        let (committee, mut authorities, _mesh, endpoints, client) = setup_mesh(4);
+        let mut ledger = Ledger::genesis([
+            ("alice".to_string(), 100u128),
+            ("bob".to_string(), 0u128),
+            ("carol".to_string(), 0u128),
+        ]);
+
+        let (v1, s1) = certify_via_mesh(
+            &tx("alice", 0, "bob", 100),
+            &mut authorities,
+            &endpoints,
+            &client,
+            &committee,
+        );
+        assert_eq!(s1, Certified::Ok);
+        ledger.apply_verified(&v1.unwrap()).unwrap();
+
+        // Reuse seq 0 for a different recipient: every authority is past seq 0.
+        let (v2, s2) = certify_via_mesh(
+            &tx("alice", 0, "carol", 100),
+            &mut authorities,
+            &endpoints,
+            &client,
+            &committee,
+        );
+        assert!(v2.is_none());
+        assert!(matches!(s2, Certified::Failed { .. }));
+        assert_eq!(ledger.balance(&"bob".to_string()), 100);
+        assert_eq!(ledger.balance(&"carol".to_string()), 0);
+        assert_eq!(ledger.total_supply(), 100);
+    }
+
+    #[test]
+    fn mesh_sequential_transfers_in_order_only() {
+        let (committee, mut authorities, _mesh, endpoints, client) = setup_mesh(4);
+        let mut ledger =
+            Ledger::genesis([("alice".to_string(), 100u128), ("bob".to_string(), 0u128)]);
+
+        for (seq, amt) in [(0u64, 40u128), (1, 25)] {
+            let (v, s) = certify_via_mesh(
+                &tx("alice", seq, "bob", amt),
+                &mut authorities,
+                &endpoints,
+                &client,
+                &committee,
+            );
+            assert_eq!(s, Certified::Ok, "seq {seq}");
+            ledger.apply_verified(&v.unwrap()).unwrap();
+        }
+        assert_eq!(ledger.balance(&"bob".to_string()), 65);
+
+        let (v3, s3) = certify_via_mesh(
+            &tx("alice", 3, "bob", 5),
+            &mut authorities,
+            &endpoints,
+            &client,
+            &committee,
+        );
+        assert!(v3.is_none());
+        assert!(matches!(
+            s3,
+            Certified::Failed {
+                contested: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mesh_equivocation_split_before_cert_is_contested() {
+        // Half the committee locks T1, half locks T2 via *directed* mailbox
+        // injection (not full-mesh order) to reproduce the in-process contested
+        // split; then a full-mesh certify of T1 fails as contested.
+        let (committee, mut authorities, mesh, endpoints, client) = setup_mesh(4);
+        let t1 = tx("alice", 0, "bob", 100);
+        let t2 = tx("alice", 0, "carol", 100);
+
+        // Direct-inject distinct orders into individual authority mailboxes.
+        mesh.deliver_to("a0", AuthorityMsg::Order(t1.clone())).unwrap();
+        mesh.deliver_to("a1", AuthorityMsg::Order(t1.clone())).unwrap();
+        mesh.deliver_to("a2", AuthorityMsg::Order(t2.clone())).unwrap();
+        mesh.deliver_to("a3", AuthorityMsg::Order(t2.clone())).unwrap();
+        for (auth, ep) in authorities.iter_mut().zip(endpoints.iter()) {
+            for msg in ep.poll() {
+                if let AuthorityMsg::Order(order) = msg {
+                    let _ = auth.handle(&order);
+                }
+            }
+        }
+
+        // Full-mesh certify T1: a0/a1 re-vote, a2/a3 Equivocation → < quorum.
+        let (v, r) = certify_via_mesh(&t1, &mut authorities, &endpoints, &client, &committee);
+        assert!(v.is_none());
+        assert_eq!(
+            r,
+            Certified::Failed {
+                votes: 2,
+                refusals: 2,
+                contested: true
+            }
+        );
+    }
+
+    #[test]
+    fn closed_mesh_rejects_broadcast() {
+        let mesh = InMemoryAuthorityMesh::new();
+        let ep = mesh.join("a0");
+        mesh.set_closed(true);
+        assert_eq!(
+            ep.broadcast_order(tx("a", 0, "b", 1)),
+            Err(NetError::Closed)
+        );
+    }
+}
