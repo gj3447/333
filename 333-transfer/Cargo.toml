@@ -11,6 +11,10 @@ description = "333 P2P OS — consensusless single-owner asset transfer (FastPay
 
 [dependencies]
 crdt333 = { path = "../333-crdt" }
+# Step 4: Plumtree epidemic (orphaned L12 crate — first real consumer).
+gossip333 = { path = "../333-gossip" }
+# NodeId bridge for gossip333 peer keys (32-byte ids; not transfer AuthorityId strings).
+identity333 = { path = "../333-identity" }
 # Real Ed25519 authority signatures (RFC 8032) — per-identity AUTHENTICITY on top
 # of the quorum uniqueness the safety core already enforces. Deterministic signing
 # (no RNG dep needed); test keys are seeded.
