@@ -1,0 +1,55 @@
+# ooptdd-loop spec — verify the REAL transfer333 multi-process node over TCP.
+# Each gate binds (Longinus) to an event literal that run_node_probe ships ONLY when the
+# behaviour is genuinely observed from live `node` child processes (4 authorities + submit).
+# A regressed node (no consensus / diverged ledgers / applied double-spend / accepted
+# skipped seq) -> the bound gate goes RED.
+#
+# Run:  cd CD/333 && <ooptdd-venv>/bin/ooptdd-loop run ooptdd/node_requirements.yaml --json
+name: transfer333-node-conformance
+
+target:
+  mode: in_process
+  callable: node_conformance_adapter:run_node_probe   # run_node_probe(backend, cid)
+  backend: memory
+  root: ooptdd
+
+requirements:
+  - id: REQ-CERTIFY-OVER-TCP
+    description: an honest transfer certifies across 4 separate TCP authority processes
+    gate:
+      - {event: node_certifies_over_tcp, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-node-conformance-20260714
+      source: node_conformance_adapter.py
+      symbol: run_node_probe
+      must_emit: node_certifies_over_tcp
+
+  - id: REQ-LEDGERS-CONVERGE
+    description: all 4 independent authority ledgers apply the SAME balances (alice=70,bob=30)
+    gate:
+      - {event: authority_ledgers_converge, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-node-conformance-20260714
+      source: node_conformance_adapter.py
+      symbol: run_node_probe
+      must_emit: authority_ledgers_converge
+
+  - id: REQ-DOUBLE-SPEND-REJECTED
+    description: a reused-seq spend gets no certificate AND leaves every ledger unchanged
+    gate:
+      - {event: double_spend_rejected, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-node-conformance-20260714
+      source: node_conformance_adapter.py
+      symbol: run_node_probe
+      must_emit: double_spend_rejected
+
+  - id: REQ-OUT-OF-ORDER-REJECTED
+    description: a skipped-seq spend gets no certificate (sequence ordering invariant holds)
+    gate:
+      - {event: out_of_order_rejected, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-node-conformance-20260714
+      source: node_conformance_adapter.py
+      symbol: run_node_probe
+      must_emit: out_of_order_rejected

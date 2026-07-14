@@ -50,8 +50,13 @@ pub struct TcpEndpoint {
 impl TcpAuthorityNet {
     /// Bind an ephemeral port on loopback and start the accept loop.
     pub fn bind(id: impl Into<String>) -> io::Result<Self> {
+        Self::bind_at(id, "127.0.0.1:0")
+    }
+
+    /// Bind a specific listen address (e.g. `127.0.0.1:PORT` for multi-process nodes).
+    pub fn bind_at(id: impl Into<String>, addr: impl std::net::ToSocketAddrs) -> io::Result<Self> {
         let id = id.into();
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
         // Short accept timeout so shutdown can join without hanging forever.
         let _ = listener.set_nonblocking(false);
@@ -91,6 +96,17 @@ impl TcpAuthorityNet {
         }
         let stream = connect_with_retry(addr)?;
         configure_stream(&stream)?;
+        // Read replies on the same TCP session (peer may write back without dialing us).
+        if let Ok(read_half) = stream.try_clone() {
+            if configure_stream(&read_half).is_ok() {
+                let handle = spawn_reader(Arc::clone(&self.inner), read_half);
+                self.inner
+                    .readers
+                    .lock()
+                    .expect("readers lock")
+                    .push(handle);
+            }
+        }
         self.inner
             .peers
             .lock()
@@ -99,9 +115,29 @@ impl TcpAuthorityNet {
         Ok(())
     }
 
-    /// Full-mesh dial: connect to every address except self.
+    /// Half-mesh dial: only dial peers with strictly greater `SocketAddr` than
+    /// self. Paired with accept-as-write + outbound readers, one TCP session per
+    /// pair carries both directions without double delivery (full bidirectional
+    /// dial + accept-as-write would fan out each broadcast twice).
     pub fn connect_all(&self, addrs: &[SocketAddr]) -> Result<(), NetError> {
         for &a in addrs {
+            if a == self.inner.addr {
+                continue;
+            }
+            if self.inner.addr < a {
+                self.connect_peer(a)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dial every address except self (client → authorities). Use when the peer
+    /// list is one-way (authorities do not dial the client back).
+    pub fn connect_each(&self, addrs: &[SocketAddr]) -> Result<(), NetError> {
+        for &a in addrs {
+            if a == self.inner.addr {
+                continue;
+            }
             self.connect_peer(a)?;
         }
         Ok(())
@@ -245,6 +281,35 @@ fn connect_with_retry(addr: SocketAddr) -> Result<TcpStream, NetError> {
     )))
 }
 
+fn spawn_reader(inner: Arc<TcpInner>, stream: TcpStream) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut stream = stream;
+        loop {
+            if inner.stop.load(Ordering::SeqCst) {
+                break;
+            }
+            match read_tcp_frame(&mut stream) {
+                Ok(msg) => {
+                    inner
+                        .inbox
+                        .lock()
+                        .expect("inbox lock")
+                        .push_back(msg);
+                }
+                Err(e) => {
+                    // Timeout: continue reading (allows stop check).
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut
+                    {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    })
+}
+
 fn spawn_listener(inner: Arc<TcpInner>, listener: TcpListener) -> JoinHandle<()> {
     // Accept timeout: use set_nonblocking + sleep, or SO_RCVTIMEO via
     // read timeout on a dual-purpose approach. On Unix we can set_read_timeout
@@ -259,33 +324,15 @@ fn spawn_listener(inner: Arc<TcpInner>, listener: TcpListener) -> JoinHandle<()>
                 break;
             }
             let _ = configure_stream(&stream);
-            let inbox = Arc::clone(&inner);
-            let handle = thread::spawn(move || {
-                let mut stream = stream;
-                loop {
-                    if inbox.stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match read_tcp_frame(&mut stream) {
-                        Ok(msg) => {
-                            inbox
-                                .inbox
-                                .lock()
-                                .expect("inbox lock")
-                                .push_back(msg);
-                        }
-                        Err(e) => {
-                            // Timeout: continue reading (allows stop check).
-                            if e.kind() == io::ErrorKind::WouldBlock
-                                || e.kind() == io::ErrorKind::TimedOut
-                            {
-                                continue;
-                            }
-                            break;
-                        }
-                    }
+            // Accepted streams are also write peers so a dialing client (or peer)
+            // receives our broadcasts without us knowing its listen addr in advance.
+            // Full-mesh connect_all may double-deliver; collectors dedupe by authority.
+            if let Ok(write_half) = stream.try_clone() {
+                if configure_stream(&write_half).is_ok() {
+                    inner.peers.lock().expect("peers lock").push(write_half);
                 }
-            });
+            }
+            let handle = spawn_reader(Arc::clone(&inner), stream);
             inner
                 .readers
                 .lock()
