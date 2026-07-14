@@ -52,9 +52,10 @@
 //     passing equivocation test — the two conditions PROM 16 required — are both
 //     now met (safety core + real Ed25519 votes, `authority.rs`). Wire codec +
 //     in-memory authority mesh (Steps 1–3), multi-round collect / multi-ledger
-//     disseminate / remote confirm (Steps 5–7), and real TCP behind the same
-//     `AuthorityNet` trait (Step 8, `tcp`) land in `wire` / `net` / `tcp`.
-//     Plumtree remains a follow-up (Step 4).
+//     disseminate / remote confirm (Steps 5–7), real TCP behind the same
+//     `AuthorityNet` trait (Step 8, `tcp`), and Plumtree epidemic over targeted
+//     delivery reusing `gossip333` (Step 4, `epidemic`) land in `wire` / `net` /
+//     `tcp` / `epidemic`.
 //   * premint vs runtime-issuance   -> PREMINT default; but the real boundary is
 //     single-minter vs multi-minter, NOT premint vs runtime (PROM Q2). A
 //     single-authority runtime mint (cf. Sui TreasuryCap) is still consensus
@@ -68,6 +69,7 @@ use std::collections::BTreeMap;
 use crdt333::{CausalBroadcast, CausalMsg, VectorClockBroadcaster};
 
 pub mod authority;
+pub mod epidemic;
 pub mod net;
 pub mod tcp;
 pub mod wire;
@@ -75,6 +77,10 @@ pub mod wire;
 pub use authority::{
     certify, quorum, signing_message, Authority, AuthorityError, Certificate, Certified, Committee,
     Verified, Vote,
+};
+pub use epidemic::{
+    mesh_all_eager, mesh_with_dropped_eager_edge, msg_id_of, peer_node_id, pump, EpidemicEndpoint,
+    EpidemicNetwork,
 };
 pub use net::{
     authority_handle_round, certify_via_mesh, certify_via_mesh_rounds,

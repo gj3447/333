@@ -1,8 +1,10 @@
-// KG: transport-plan Steps 2–3, 5–8 (2026-07-14)
+// KG: transport-plan Steps 2–3, 5–8 (2026-07-14); Step 4 hop metadata (2026-07-14)
 //
 // Narrow authority-net trait + deterministic in-memory full-mesh mailboxes.
 // Each peer owns its own mailbox; broadcasts fan out `AuthorityMsg` values.
-// Step 8: real TCP behind the same trait (`tcp` module). No Plumtree (Step 4).
+// Step 8: real TCP behind the same trait (`tcp` module).
+// Step 4: Plumtree epidemic lives in `epidemic` (reuses gossip333); hop-aware
+// `deliver_to_from` / `drain_with_hops` let epidemic drive targeted delivery.
 // Does NOT reinvent Certificate aggregation — collectors call the existing
 // `Certificate::assemble` / `verify`.
 //
@@ -12,11 +14,11 @@
 //   7. Remote `Authority::confirm` from polled Cert messages
 //
 // Steps 5–7 drivers are generic over `N: AuthorityNet` so one code path serves
-// both `MeshEndpoint` and `TcpEndpoint`.
+// both `MeshEndpoint` and `TcpEndpoint` (and Step 4 `EpidemicEndpoint`).
 //
 // Local mailbox map (not transport333::InMemoryMesh): that crate is unicast +
 // identity333::NodeId point-to-point. A transfer-local AuthorityId mesh keeps
-// the path self-contained without pulling parallel stacks.
+// the path self-contained without pulling parallel stacks for Steps 1–3/5–8.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -55,10 +57,17 @@ pub trait AuthorityNet: Send + Sync {
 
 // --- in-memory full mesh -----------------------------------------------------
 
+/// One mailbox entry: optional previous-hop peer id (Step 4 epidemic) + payload.
+#[derive(Debug, Clone)]
+struct MailEntry {
+    from: Option<String>,
+    msg: AuthorityMsg,
+}
+
 #[derive(Default)]
 struct MeshState {
     /// peer id → FIFO mailbox
-    mailboxes: HashMap<String, Vec<AuthorityMsg>>,
+    mailboxes: HashMap<String, Vec<MailEntry>>,
     closed: bool,
 }
 
@@ -105,6 +114,17 @@ impl InMemoryAuthorityMesh {
     /// Directed inject into a single peer's mailbox (adversarial / partition tests).
     /// Full-mesh honest path uses [`AuthorityNet::broadcast_order`] instead.
     pub fn deliver_to(&self, peer: &str, msg: AuthorityMsg) -> Result<(), NetError> {
+        self.deliver_to_from(peer, None, msg)
+    }
+
+    /// Targeted delivery with an explicit previous-hop id (Plumtree eager/control).
+    /// `from = None` matches plain [`Self::deliver_to`].
+    pub fn deliver_to_from(
+        &self,
+        peer: &str,
+        from: Option<&str>,
+        msg: AuthorityMsg,
+    ) -> Result<(), NetError> {
         let mut g = self.inner.lock().expect("mesh lock");
         if g.closed {
             return Err(NetError::Closed);
@@ -113,7 +133,10 @@ impl InMemoryAuthorityMesh {
             .mailboxes
             .get_mut(peer)
             .ok_or_else(|| NetError::UnknownPeer(peer.to_owned()))?;
-        mb.push(msg);
+        mb.push(MailEntry {
+            from: from.map(|s| s.to_owned()),
+            msg,
+        });
         Ok(())
     }
 
@@ -126,17 +149,31 @@ impl InMemoryAuthorityMesh {
             return Ok(());
         }
         for mb in g.mailboxes.values_mut() {
-            mb.push(msg.clone());
+            mb.push(MailEntry {
+                from: None,
+                msg: msg.clone(),
+            });
         }
         Ok(())
     }
 
     fn drain(&self, me: &str) -> Vec<AuthorityMsg> {
+        self.drain_with_hops(me)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    /// Drain mailbox preserving optional previous-hop ids (Step 4 epidemic).
+    pub fn drain_with_hops(&self, me: &str) -> Vec<(Option<String>, AuthorityMsg)> {
         let mut g = self.inner.lock().expect("mesh lock");
         g.mailboxes
             .get_mut(me)
             .map(std::mem::take)
             .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.from, e.msg))
+            .collect()
     }
 }
 
