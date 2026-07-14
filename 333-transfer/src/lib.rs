@@ -172,6 +172,14 @@ impl Ledger {
         self.accounts.get(id).map(|a| a.balance).unwrap_or(0)
     }
 
+    /// Snapshot of every account balance (node telemetry / harness JSON).
+    pub fn balances(&self) -> BTreeMap<AccountId, Amount> {
+        self.accounts
+            .iter()
+            .map(|(id, a)| (id.clone(), a.balance))
+            .collect()
+    }
+
     /// The owner's next acceptable sequence number — what a client must stamp on
     /// its next transfer.
     pub fn next_seq(&self, id: &AccountId) -> u64 {
