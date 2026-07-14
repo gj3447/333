@@ -1,10 +1,11 @@
-// KG: transport-plan Steps 1–3 (2026-07-14)
+// KG: transport-plan Steps 1–3, 8 (2026-07-14)
 //
 // Domain-separated, length-prefixed wire codec for authority-path messages.
 // Mirrors `signing_message` style (domain tag + u64 LE length prefixes) so
 // Transfer / Vote / Certificate can leave the process without reinventing QC.
 //
-// Real sockets are deferred (Steps 4–8); this module only owns the byte layout.
+// Step 8: `AuthorityMsg` framing = 1-byte tag + domain-tagged body. TCP uses
+// this payload under a u32-BE length prefix (see `tcp` module / 333-wire style).
 
 use ed25519_dalek::Signature;
 
@@ -15,6 +16,20 @@ const DOMAIN_TRANSFER: &[u8] = b"transfer333/wire-transfer/v1\0";
 const DOMAIN_VOTE: &[u8] = b"transfer333/wire-vote/v1\0";
 const DOMAIN_CERT: &[u8] = b"transfer333/wire-cert/v1\0";
 
+/// Wire tag for [`AuthorityMsg`] over TCP / framed streams.
+pub const TAG_ORDER: u8 = 0;
+pub const TAG_VOTE: u8 = 1;
+pub const TAG_CERT: u8 = 2;
+
+/// Messages that travel the authority mesh (orders, signed votes, certificates).
+/// Shared by the in-memory mesh and the TCP backend.
+#[derive(Debug, Clone)]
+pub enum AuthorityMsg {
+    Order(Transfer),
+    Vote(Vote),
+    Cert(Certificate),
+}
+
 /// Why a byte stream could not be decoded into an authority message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -22,6 +37,8 @@ pub enum WireError {
     BadDomain,
     BadUtf8,
     BadSignature,
+    /// Unknown `AuthorityMsg` tag (not Order/Vote/Cert).
+    UnknownTag(u8),
 }
 
 // --- low-level helpers -------------------------------------------------------
@@ -187,6 +204,51 @@ pub fn decode_certificate(bytes: &[u8]) -> Result<Certificate, WireError> {
     Ok(Certificate { transfer, votes })
 }
 
+// --- AuthorityMsg frame (1-byte tag + domain body) ---------------------------
+
+/// Encode an [`AuthorityMsg`] as `tag || domain-tagged-body`.
+/// TCP layers a u32 big-endian length prefix around this blob (see `tcp`).
+pub fn encode_authority_msg(msg: &AuthorityMsg) -> Vec<u8> {
+    match msg {
+        AuthorityMsg::Order(t) => {
+            let body = encode_transfer(t);
+            let mut out = Vec::with_capacity(1 + body.len());
+            out.push(TAG_ORDER);
+            out.extend_from_slice(&body);
+            out
+        }
+        AuthorityMsg::Vote(v) => {
+            let body = encode_vote(v);
+            let mut out = Vec::with_capacity(1 + body.len());
+            out.push(TAG_VOTE);
+            out.extend_from_slice(&body);
+            out
+        }
+        AuthorityMsg::Cert(c) => {
+            let body = encode_certificate(c);
+            let mut out = Vec::with_capacity(1 + body.len());
+            out.push(TAG_CERT);
+            out.extend_from_slice(&body);
+            out
+        }
+    }
+}
+
+/// Decode an [`AuthorityMsg`] frame (`tag || domain-tagged-body`).
+pub fn decode_authority_msg(bytes: &[u8]) -> Result<AuthorityMsg, WireError> {
+    if bytes.is_empty() {
+        return Err(WireError::Truncated);
+    }
+    let tag = bytes[0];
+    let body = &bytes[1..];
+    match tag {
+        TAG_ORDER => Ok(AuthorityMsg::Order(decode_transfer(body)?)),
+        TAG_VOTE => Ok(AuthorityMsg::Vote(decode_vote(body)?)),
+        TAG_CERT => Ok(AuthorityMsg::Cert(decode_certificate(body)?)),
+        other => Err(WireError::UnknownTag(other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +403,84 @@ mod tests {
         sk.verifying_key()
             .verify_strict(&signing_message(&t), &back.signature)
             .unwrap();
+    }
+
+    #[test]
+    fn authority_msg_frame_round_trip_order_vote_cert() {
+        let t = tx("alice", 0, "bob", 30);
+        let (committee, mut auth) = setup(4);
+
+        let order = AuthorityMsg::Order(t.clone());
+        let back = decode_authority_msg(&encode_authority_msg(&order)).unwrap();
+        match back {
+            AuthorityMsg::Order(got) => assert_eq!(got, t),
+            _ => panic!("expected Order"),
+        }
+
+        let vote = auth[0].handle(&t).unwrap();
+        let vote_msg = AuthorityMsg::Vote(vote.clone());
+        let back = decode_authority_msg(&encode_authority_msg(&vote_msg)).unwrap();
+        match back {
+            AuthorityMsg::Vote(got) => assert_eq!(got, vote),
+            _ => panic!("expected Vote"),
+        }
+
+        let votes: Vec<Vote> = auth
+            .iter_mut()
+            .take(3)
+            .map(|a| a.handle(&t).unwrap())
+            .collect();
+        let cert = Certificate::assemble(t, votes, &committee).unwrap();
+        let cert_msg = AuthorityMsg::Cert(cert.clone());
+        let back = decode_authority_msg(&encode_authority_msg(&cert_msg)).unwrap();
+        match back {
+            AuthorityMsg::Cert(got) => {
+                assert_eq!(got.transfer, cert.transfer);
+                assert_eq!(got.votes, cert.votes);
+                assert!(got.is_valid(&committee));
+            }
+            _ => panic!("expected Cert"),
+        }
+    }
+
+    #[test]
+    fn authority_msg_frame_tamper_fails_certificate_is_valid() {
+        // Same guarantee as in-memory: a flipped cert byte must not yield a valid QC.
+        let t = tx("alice", 0, "bob", 10);
+        let (committee, mut auth) = setup(4);
+        let votes: Vec<Vote> = auth
+            .iter_mut()
+            .take(3)
+            .map(|a| a.handle(&t).unwrap())
+            .collect();
+        let cert = Certificate::assemble(t, votes, &committee).unwrap();
+        assert!(cert.is_valid(&committee));
+
+        let mut bytes = encode_authority_msg(&AuthorityMsg::Cert(cert));
+        let idx = bytes.len() - 1;
+        bytes[idx] ^= 0x01;
+
+        match decode_authority_msg(&bytes) {
+            Ok(AuthorityMsg::Cert(tampered)) => {
+                assert!(
+                    !tampered.is_valid(&committee),
+                    "tampered AuthorityMsg::Cert must fail is_valid"
+                );
+            }
+            Ok(_) => panic!("expected Cert after tag-preserving tamper"),
+            Err(_) => {
+                // Decode-time failure is also acceptable.
+            }
+        }
+    }
+
+    #[test]
+    fn authority_msg_unknown_tag_rejected() {
+        let mut bytes = encode_authority_msg(&AuthorityMsg::Order(tx("a", 0, "b", 1)));
+        bytes[0] = 0xFF;
+        match decode_authority_msg(&bytes) {
+            Err(WireError::UnknownTag(0xFF)) => {}
+            other => panic!("expected UnknownTag(0xFF), got {other:?}"),
+        }
     }
 }

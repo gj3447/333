@@ -51,9 +51,10 @@
 //     are deployed. The FastPay-style authority-quorum certificate layer AND a
 //     passing equivocation test — the two conditions PROM 16 required — are both
 //     now met (safety core + real Ed25519 votes, `authority.rs`). Wire codec +
-//     in-memory authority mesh (Steps 1–3) and multi-round collect / multi-ledger
-//     disseminate / remote confirm (Steps 5–7) land in `wire` / `net`; real I/O
-//     and Plumtree remain follow-ups (Steps 4, 8).
+//     in-memory authority mesh (Steps 1–3), multi-round collect / multi-ledger
+//     disseminate / remote confirm (Steps 5–7), and real TCP behind the same
+//     `AuthorityNet` trait (Step 8, `tcp`) land in `wire` / `net` / `tcp`.
+//     Plumtree remains a follow-up (Step 4).
 //   * premint vs runtime-issuance   -> PREMINT default; but the real boundary is
 //     single-minter vs multi-minter, NOT premint vs runtime (PROM Q2). A
 //     single-authority runtime mint (cf. Sui TreasuryCap) is still consensus
@@ -68,6 +69,7 @@ use crdt333::{CausalBroadcast, CausalMsg, VectorClockBroadcaster};
 
 pub mod authority;
 pub mod net;
+pub mod tcp;
 pub mod wire;
 
 pub use authority::{
@@ -75,13 +77,15 @@ pub use authority::{
     Verified, Vote,
 };
 pub use net::{
-    authority_handle_round, certify_via_mesh, certify_via_mesh_rounds, collect_until_quorum,
-    confirm_from_mesh, disseminate_certificate, AuthorityMsg, AuthorityNet, InMemoryAuthorityMesh,
-    MeshEndpoint, MeshLedger, NetError, VoteCollector,
+    authority_handle_round, certify_via_mesh, certify_via_mesh_rounds,
+    certify_via_mesh_rounds_with_pause, collect_until_quorum, confirm_from_mesh,
+    disseminate_certificate, disseminate_certificate_with_pause, AuthorityMsg, AuthorityNet,
+    InMemoryAuthorityMesh, MeshEndpoint, MeshLedger, NetError, VoteCollector,
 };
+pub use tcp::{TcpAuthorityNet, TcpEndpoint};
 pub use wire::{
-    decode_certificate, decode_transfer, decode_vote, encode_certificate, encode_transfer,
-    encode_vote, WireError,
+    decode_authority_msg, decode_certificate, decode_transfer, decode_vote, encode_authority_msg,
+    encode_certificate, encode_transfer, encode_vote, WireError, TAG_CERT, TAG_ORDER, TAG_VOTE,
 };
 // Re-exported so callers can build authorities/committees (the public API takes
 // Ed25519 keys) and inspect vote signatures without a direct ed25519-dalek dep.

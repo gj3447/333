@@ -1,9 +1,9 @@
-// KG: transport-plan Steps 2–3, 5–7 (2026-07-14)
+// KG: transport-plan Steps 2–3, 5–8 (2026-07-14)
 //
 // Narrow authority-net trait + deterministic in-memory full-mesh mailboxes.
 // Each peer owns its own mailbox; broadcasts fan out `AuthorityMsg` values.
-// No TCP/QUIC/WebRTC (Step 8). No Plumtree (Step 4). Does NOT reinvent
-// Certificate aggregation — collectors call the existing
+// Step 8: real TCP behind the same trait (`tcp` module). No Plumtree (Step 4).
+// Does NOT reinvent Certificate aggregation — collectors call the existing
 // `Certificate::assemble` / `verify`.
 //
 // Steps 5–7 (on top of 1–3):
@@ -11,33 +11,33 @@
 //   6. Certificate dissemination to independent `MeshLedger` replicas
 //   7. Remote `Authority::confirm` from polled Cert messages
 //
+// Steps 5–7 drivers are generic over `N: AuthorityNet` so one code path serves
+// both `MeshEndpoint` and `TcpEndpoint`.
+//
 // Local mailbox map (not transport333::InMemoryMesh): that crate is unicast +
 // identity333::NodeId point-to-point. A transfer-local AuthorityId mesh keeps
 // the path self-contained without pulling parallel stacks.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::authority::{
     Authority, AuthorityError, Certificate, Certified, Committee, Verified, Vote,
 };
 use crate::{Ledger, Reject, Transfer};
 
-/// Messages that travel the authority mesh (orders, signed votes, certificates).
-#[derive(Debug, Clone)]
-pub enum AuthorityMsg {
-    Order(Transfer),
-    Vote(Vote),
-    Cert(Certificate),
-}
+pub use crate::wire::AuthorityMsg;
 
-/// Transport / mesh failure for the in-memory authority network.
+/// Transport / mesh failure for the authority network (in-memory or TCP).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetError {
     /// Peer id is not registered on the mesh.
     UnknownPeer(String),
     /// Mesh has been marked closed / down.
     Closed,
+    /// TCP / I/O failure (Step 8).
+    Io(String),
 }
 
 /// Object-safe broadcast + poll surface for committee authorities (and clients).
@@ -334,8 +334,8 @@ impl VoteCollector {
     }
 
     /// One round: drain currently-available Vote messages matching this transfer
-    /// (dedupe by authority id).
-    pub fn poll_round(&mut self, collector: &MeshEndpoint) {
+    /// (dedupe by authority id). Works for any [`AuthorityNet`] (in-mem or TCP).
+    pub fn poll_round<N: AuthorityNet + ?Sized>(&mut self, collector: &N) {
         for msg in collector.poll() {
             if let AuthorityMsg::Vote(v) = msg {
                 if v.transfer == self.transfer && self.seen.insert(v.authority.clone()) {
@@ -360,13 +360,16 @@ impl VoteCollector {
     }
 
     /// Poll up to `max_rounds` drains; assemble+verify on quorum, else Failed.
-    pub fn collect_until_quorum(
+    /// `pause` is `Duration::ZERO` for deterministic in-memory tests; TCP tests
+    /// may pass a short sleep to absorb socket/thread latency.
+    pub fn collect_until_quorum_with_pause<N: AuthorityNet + ?Sized>(
         &mut self,
-        collector: &MeshEndpoint,
+        collector: &N,
         committee: &Committee,
         max_rounds: usize,
+        pause: Duration,
     ) -> (Option<Certificate>, Certified) {
-        for _ in 0..max_rounds {
+        for r in 0..max_rounds {
             self.poll_round(collector);
             if let Some(cert) = self.try_assemble(committee) {
                 // assemble already ran is_valid; verify is the type-state mint path.
@@ -375,8 +378,21 @@ impl VoteCollector {
                     .expect("assembled certificate verifies");
                 return (Some(cert), Certified::Ok);
             }
+            if r + 1 < max_rounds && !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
         }
         (None, self.failed_status())
+    }
+
+    /// Poll up to `max_rounds` drains (no wall-clock pause).
+    pub fn collect_until_quorum<N: AuthorityNet + ?Sized>(
+        &mut self,
+        collector: &N,
+        committee: &Committee,
+        max_rounds: usize,
+    ) -> (Option<Certificate>, Certified) {
+        self.collect_until_quorum_with_pause(collector, committee, max_rounds, Duration::ZERO)
     }
 }
 
@@ -388,8 +404,8 @@ impl VoteCollector {
 ///
 /// Does not observe authority refusals (no wire refuse message); for contested
 /// splits use [`VoteCollector::note_refusal`] then [`VoteCollector::collect_until_quorum`].
-pub fn collect_until_quorum(
-    collector: &MeshEndpoint,
+pub fn collect_until_quorum<N: AuthorityNet + ?Sized>(
+    collector: &N,
     transfer: &Transfer,
     committee: &Committee,
     max_rounds: usize,
@@ -409,9 +425,9 @@ pub fn collect_until_quorum(
 /// One authority-side round: each authority drains **its own** mailbox, runs
 /// existing `handle` on Orders, broadcasts Votes on success, and records
 /// refusals on the collector (for Failed counters / contested).
-pub fn authority_handle_round(
+pub fn authority_handle_round<N: AuthorityNet>(
     authorities: &mut [Authority],
-    auth_endpoints: &[MeshEndpoint],
+    auth_endpoints: &[N],
     collector: &mut VoteCollector,
 ) {
     assert_eq!(
@@ -437,21 +453,18 @@ pub fn authority_handle_round(
 
 /// A ledger replica with its own mesh mailbox and local balance state.
 /// Committee is supplied at verify/apply time (verifier-owned, never caller size).
-pub struct MeshLedger {
-    endpoint: MeshEndpoint,
+/// Generic over the endpoint type so TCP ledgers reuse the same path.
+pub struct MeshLedger<N: AuthorityNet = MeshEndpoint> {
+    endpoint: N,
     ledger: Ledger,
 }
 
-impl MeshLedger {
-    pub fn new(endpoint: MeshEndpoint, ledger: Ledger) -> Self {
+impl<N: AuthorityNet> MeshLedger<N> {
+    pub fn new(endpoint: N, ledger: Ledger) -> Self {
         Self { endpoint, ledger }
     }
 
-    pub fn id(&self) -> &str {
-        self.endpoint.id()
-    }
-
-    pub fn endpoint(&self) -> &MeshEndpoint {
+    pub fn endpoint(&self) -> &N {
         &self.endpoint
     }
 
@@ -479,13 +492,19 @@ impl MeshLedger {
     }
 }
 
+impl MeshLedger<MeshEndpoint> {
+    pub fn id(&self) -> &str {
+        self.endpoint.id()
+    }
+}
+
 /// Broadcast an assembled certificate and have each independent replica
 /// poll → verify (local committee) → `apply_verified` (local ledger).
-pub fn disseminate_certificate(
-    broadcaster: &MeshEndpoint,
+pub fn disseminate_certificate<B: AuthorityNet + ?Sized, L: AuthorityNet>(
+    broadcaster: &B,
     cert: &Certificate,
     committee: &Committee,
-    replicas: &mut [MeshLedger],
+    replicas: &mut [MeshLedger<L>],
 ) -> Result<Vec<Vec<Result<(), Reject>>>, NetError> {
     broadcaster.broadcast_cert(cert.clone())?;
     let mut all = Vec::with_capacity(replicas.len());
@@ -495,14 +514,41 @@ pub fn disseminate_certificate(
     Ok(all)
 }
 
+/// Like [`disseminate_certificate`], but retries replica polls with an optional
+/// pause (TCP latency). In-memory tests use the non-pausing path.
+pub fn disseminate_certificate_with_pause<B: AuthorityNet + ?Sized, L: AuthorityNet>(
+    broadcaster: &B,
+    cert: &Certificate,
+    committee: &Committee,
+    replicas: &mut [MeshLedger<L>],
+    max_polls: usize,
+    pause: Duration,
+) -> Result<Vec<Vec<Result<(), Reject>>>, NetError> {
+    broadcaster.broadcast_cert(cert.clone())?;
+    let mut all = vec![Vec::new(); replicas.len()];
+    for p in 0..max_polls {
+        for (i, r) in replicas.iter_mut().enumerate() {
+            let batch = r.poll_and_apply(committee);
+            all[i].extend(batch);
+        }
+        if all.iter().all(|v| !v.is_empty()) {
+            break;
+        }
+        if p + 1 < max_polls && !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
+    Ok(all)
+}
+
 // --- Step 7: remote confirm over the mesh ------------------------------------
 
 /// Remote authorities drain their mailboxes for `Cert` messages, verify against
 /// the local committee, and call existing `Authority::confirm` (advances
 /// `next_expected`) — no shared in-process confirm loop.
-pub fn confirm_from_mesh(
+pub fn confirm_from_mesh<N: AuthorityNet>(
     authorities: &mut [Authority],
-    auth_endpoints: &[MeshEndpoint],
+    auth_endpoints: &[N],
     committee: &Committee,
 ) {
     assert_eq!(
@@ -521,17 +567,20 @@ pub fn confirm_from_mesh(
     }
 }
 
-/// Multi-round certification path (Steps 5–7 composed, still no wall-clock):
-/// broadcast order → authority handle round → collect_until_quorum → on Ok,
-/// broadcast cert + remote confirm. Separates collection from single-pass
-/// [`certify_via_mesh`].
-pub fn certify_via_mesh_rounds(
+/// Multi-round certification path (Steps 5–7 composed):
+/// broadcast order → authority handle + collect rounds → on Ok, broadcast cert
+/// + remote confirm. Generic over any [`AuthorityNet`].
+///
+/// `pause` is `Duration::ZERO` for deterministic in-memory tests; TCP tests
+/// pass a short sleep so orders/votes/certs can land in peer inboxes.
+pub fn certify_via_mesh_rounds_with_pause<N: AuthorityNet>(
     t: &Transfer,
     authorities: &mut [Authority],
-    auth_endpoints: &[MeshEndpoint],
-    client: &MeshEndpoint,
+    auth_endpoints: &[N],
+    client: &N,
     committee: &Committee,
     max_rounds: usize,
+    pause: Duration,
 ) -> (Option<Verified>, Option<Certificate>, Certified) {
     assert_eq!(
         authorities.len(),
@@ -552,23 +601,53 @@ pub fn certify_via_mesh_rounds(
     }
 
     let mut coll = VoteCollector::new(t.clone());
-    // Authorities process the order once (votes fan out into mailboxes).
-    authority_handle_round(authorities, auth_endpoints, &mut coll);
-
-    // Multi-round drain of the collector (votes may already be present; extra
-    // rounds are empty drains if nothing new arrives — deterministic stall).
-    let (cert, status) = coll.collect_until_quorum(client, committee, max_rounds);
-    match (cert, status) {
-        (Some(cert), Certified::Ok) => {
+    // Interleave authority handle + collector poll so TCP latency on Order
+    // delivery still reaches handle before we give up (in-mem: first round
+    // still sees the order immediately after broadcast).
+    for r in 0..max_rounds {
+        authority_handle_round(authorities, auth_endpoints, &mut coll);
+        coll.poll_round(client);
+        if let Some(cert) = coll.try_assemble(committee) {
             let verified = cert
                 .verify(committee)
                 .expect("assembled certificate verifies");
             let _ = client.broadcast_cert(cert.clone());
-            confirm_from_mesh(authorities, auth_endpoints, committee);
-            (Some(verified), Some(cert), Certified::Ok)
+            // Confirm may need a few polls under TCP; empty drains are no-ops
+            // for in-memory once the cert is already consumed.
+            for c in 0..max_rounds {
+                confirm_from_mesh(authorities, auth_endpoints, committee);
+                if c + 1 < max_rounds && !pause.is_zero() {
+                    std::thread::sleep(pause);
+                }
+            }
+            return (Some(verified), Some(cert), Certified::Ok);
         }
-        (_, failed) => (None, None, failed),
+        if r + 1 < max_rounds && !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
     }
+    (None, None, coll.failed_status())
+}
+
+/// Multi-round certification path (Steps 5–7, no wall-clock pause).
+/// Separates collection from single-pass [`certify_via_mesh`].
+pub fn certify_via_mesh_rounds<N: AuthorityNet>(
+    t: &Transfer,
+    authorities: &mut [Authority],
+    auth_endpoints: &[N],
+    client: &N,
+    committee: &Committee,
+    max_rounds: usize,
+) -> (Option<Verified>, Option<Certificate>, Certified) {
+    certify_via_mesh_rounds_with_pause(
+        t,
+        authorities,
+        auth_endpoints,
+        client,
+        committee,
+        max_rounds,
+        Duration::ZERO,
+    )
 }
 
 #[cfg(test)]
