@@ -119,6 +119,12 @@ pub trait Instance {
 }
 
 /// L10-right: CoW snapshot capture/restore (finding_333_synth_hyp_sota_d0).
+///
+/// `restore` is a lifecycle mutation and answers to the `Instance` state
+/// machine: it may not move the instance along an edge the machine forbids.
+/// Stopped is absorbing, so restoring a Running-era snapshot onto a Stopped
+/// instance returns InvalidTransition rather than resurrecting it. Restoring
+/// onto the same state is permitted and rewinds usage only.
 pub trait Snapshot {
     fn snapshot(&self, id: &InstanceId) -> Result<SnapshotId, HyperError>;
     fn restore(&self, id: &InstanceId, snap: &SnapshotId) -> Result<(), HyperError>;
@@ -173,6 +179,16 @@ fn valid_transition(from: State, to: State) -> bool {
             | (Running, Stopped)
             | (Paused, Stopped)
     )
+}
+
+/// Restore replays a snapshot's captured lifecycle state onto a live slot, so it
+/// is a state mutation and must answer to the same guard as `transition` — a
+/// snapshot taken while Running must not be able to resurrect a Stopped
+/// instance. Identity is admitted because restoring usage without moving the
+/// lifecycle is not a transition at all; it keeps Stopped absorbing rather than
+/// making restore-onto-terminal a special case.
+fn valid_restore(from: State, to: State) -> bool {
+    from == to || valid_transition(from, to)
 }
 
 impl VmManager for InMemoryHypervisor {
@@ -256,6 +272,13 @@ impl Snapshot for InMemoryHypervisor {
             .get(snap)
             .copied()
             .ok_or_else(|| HyperError::SnapshotNotFound(snap.clone()))?;
+        // Reject before touching either field: a refused restore must leave the
+        // slot exactly as it was, not half-applied with rolled-back usage.
+        // Reject before touching either field: a refused restore must leave the
+        // slot exactly as it was, not half-applied with rolled-back usage.
+        if !valid_restore(slot.state, state) {
+            return Err(HyperError::InvalidTransition { from: slot.state, to: state });
+        }
         slot.state = state;
         slot.usage = usage;
         Ok(())
@@ -272,47 +295,58 @@ impl Snapshot for InMemoryHypervisor {
     }
 }
 
+/// Quota arithmetic against a slot the caller already holds the lock for.
+/// Split out of `check` so `record` can admit and apply a delta under one
+/// guard: re-entering the public `check` would drop the lock in between and let
+/// a racing recorder spend the headroom this one just measured.
+fn check_slot(slot: &Slot, delta: Usage) -> Result<(), HyperError> {
+    let q = &slot.manifest.quota;
+    let next_mem = slot.usage.memory_bytes.saturating_add(delta.memory_bytes);
+    let next_cpu = slot.usage.cpu_ms.saturating_add(delta.cpu_ms);
+    let next_fuel = slot.usage.fuel_consumed.saturating_add(delta.fuel_consumed);
+    if next_mem > q.max_memory_bytes {
+        return Err(HyperError::QuotaExceeded {
+            resource: "memory",
+            used: next_mem,
+            limit: q.max_memory_bytes,
+        });
+    }
+    if next_cpu > q.max_cpu_ms {
+        return Err(HyperError::QuotaExceeded {
+            resource: "cpu_ms",
+            used: next_cpu,
+            limit: q.max_cpu_ms,
+        });
+    }
+    if next_fuel > q.max_fuel {
+        return Err(HyperError::QuotaExceeded {
+            resource: "fuel",
+            used: next_fuel,
+            limit: q.max_fuel,
+        });
+    }
+    Ok(())
+}
+
 impl QuotaEnforcer for InMemoryHypervisor {
     fn usage(&self, id: &InstanceId) -> Result<Usage, HyperError> {
         let g = self.inner.lock().unwrap();
         g.slots.get(id).map(|s| s.usage).ok_or(HyperError::UnknownInstance)
     }
 
+    /// Advisory only: the verdict is stale the moment the lock drops. Callers
+    /// that intend to spend the headroom must use `record`, which decides and
+    /// applies atomically.
     fn check(&self, id: &InstanceId, delta: Usage) -> Result<(), HyperError> {
         let g = self.inner.lock().unwrap();
         let slot = g.slots.get(id).ok_or(HyperError::UnknownInstance)?;
-        let q = &slot.manifest.quota;
-        let next_mem = slot.usage.memory_bytes.saturating_add(delta.memory_bytes);
-        let next_cpu = slot.usage.cpu_ms.saturating_add(delta.cpu_ms);
-        let next_fuel = slot.usage.fuel_consumed.saturating_add(delta.fuel_consumed);
-        if next_mem > q.max_memory_bytes {
-            return Err(HyperError::QuotaExceeded {
-                resource: "memory",
-                used: next_mem,
-                limit: q.max_memory_bytes,
-            });
-        }
-        if next_cpu > q.max_cpu_ms {
-            return Err(HyperError::QuotaExceeded {
-                resource: "cpu_ms",
-                used: next_cpu,
-                limit: q.max_cpu_ms,
-            });
-        }
-        if next_fuel > q.max_fuel {
-            return Err(HyperError::QuotaExceeded {
-                resource: "fuel",
-                used: next_fuel,
-                limit: q.max_fuel,
-            });
-        }
-        Ok(())
+        check_slot(slot, delta)
     }
 
     fn record(&self, id: &InstanceId, delta: Usage) -> Result<(), HyperError> {
-        self.check(id, delta)?;
         let mut g = self.inner.lock().unwrap();
         let slot = g.slots.get_mut(id).ok_or(HyperError::UnknownInstance)?;
+        check_slot(slot, delta)?;
         slot.usage.memory_bytes = slot.usage.memory_bytes.saturating_add(delta.memory_bytes);
         slot.usage.cpu_ms = slot.usage.cpu_ms.saturating_add(delta.cpu_ms);
         slot.usage.fuel_consumed = slot.usage.fuel_consumed.saturating_add(delta.fuel_consumed);

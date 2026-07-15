@@ -42,6 +42,8 @@ pub enum OrchError {
     Terminal { wf: WorkflowId, step: StepId, state: StepState },
     #[error("workflow {wf} is already terminal ({state:?}); cannot re-execute")]
     WorkflowTerminal { wf: WorkflowId, state: WorkflowState },
+    #[error("workflow {wf}: illegal state transition {from:?} -> {to:?}")]
+    WorkflowTransition { wf: WorkflowId, from: WorkflowState, to: WorkflowState },
     #[error("compensation failed at step {0}: {1}")]
     CompensateFailed(StepId, String),
     #[error("step execution failed: {0}")]
@@ -123,6 +125,28 @@ impl WorkflowState {
             self,
             WorkflowState::Succeeded | WorkflowState::Failed | WorkflowState::Compensated
         )
+    }
+
+    /// Legal workflow transitions — the workflow-level mirror of
+    /// `StepState::can_transition_to`. `is_terminal` alone was an insufficient
+    /// guard: `Compensating` is *non*-terminal, so a rollback that failed left
+    /// the workflow re-drivable and a retry rewrote it back to `Running`,
+    /// erasing the fact that committed effects were still outstanding.
+    /// Rolling *backward* out of `Compensating` is therefore illegal — a
+    /// half-compensated saga is repaired by finishing the rollback
+    /// (`resume_compensation`), never by restarting the forward path.
+    /// Idempotent same-state re-assertions are allowed.
+    pub fn can_transition_to(self, next: WorkflowState) -> bool {
+        use WorkflowState::*;
+        self == next
+            || matches!(
+                (self, next),
+                (Running, Succeeded)
+                    | (Running, Failed)
+                    | (Running, Compensating)
+                    | (Compensating, Compensated)
+                    | (Compensating, Failed)
+            )
     }
 }
 
@@ -298,7 +322,13 @@ pub struct SagaCoordinator {
     journal: Arc<dyn Journal>,
     bus: Arc<dyn PubSub>,
     state: Mutex<CoordinatorState>,
+    compensation_attempts: u32,
 }
+
+/// Retries per compensating action before a rollback halts. Saga compensations
+/// are idempotent, so re-attempting is safe; the bound exists because a
+/// genuinely broken compensator must surface to an operator, not spin forever.
+pub const DEFAULT_COMPENSATION_ATTEMPTS: u32 = 3;
 
 #[derive(Default)]
 struct CoordinatorState {
@@ -317,7 +347,14 @@ impl SagaCoordinator {
             journal,
             bus,
             state: Mutex::new(CoordinatorState::default()),
+            compensation_attempts: DEFAULT_COMPENSATION_ATTEMPTS,
         }
+    }
+
+    /// Clamped to at least 1: zero attempts would silently mark steps
+    /// compensated without ever invoking the compensator.
+    pub fn set_compensation_attempts(&mut self, n: u32) {
+        self.compensation_attempts = n.max(1);
     }
 
     pub fn register_executor(&mut self, exec: Arc<dyn StepExecutor>) {
@@ -384,10 +421,41 @@ impl SagaCoordinator {
         Ok(ev)
     }
 
-    fn set_wf_state(&self, wf: &WorkflowId, s: WorkflowState) {
-        if let Ok(mut g) = self.state.lock() {
-            g.wf_state.insert(wf.clone(), s);
+    /// Sole workflow-state mutation site — the workflow-level analogue of
+    /// `record`. Every write goes through the transition table so no caller can
+    /// smuggle in an illegal edge.
+    fn set_wf_state(&self, wf: &WorkflowId, s: WorkflowState) -> Result<(), OrchError> {
+        let mut g = self.state.lock().map_err(|e| OrchError::Journal(e.to_string()))?;
+        if let Some(&current) = g.wf_state.get(wf) {
+            if !current.can_transition_to(s) {
+                return Err(OrchError::WorkflowTransition {
+                    wf: wf.clone(),
+                    from: current,
+                    to: s,
+                });
+            }
         }
+        g.wf_state.insert(wf.clone(), s);
+        Ok(())
+    }
+
+    /// Finish a rollback that halted mid-way (compensation retries exhausted).
+    /// Without this a saga stuck in `Compensating` would be a dead end: the
+    /// forward path is barred by the FSM and nothing else could discharge the
+    /// outstanding committed effects. Already-`Compensated` steps are skipped,
+    /// so resuming is safe to call repeatedly.
+    pub fn resume_compensation(&self, wf: &Workflow) -> Result<WorkflowState, OrchError> {
+        let current = self.workflow_state(wf.id());
+        if current != WorkflowState::Compensating {
+            return Err(OrchError::WorkflowTransition {
+                wf: wf.id().clone(),
+                from: current,
+                to: WorkflowState::Compensated,
+            });
+        }
+        self.compensate_committed(wf)?;
+        self.set_wf_state(wf.id(), WorkflowState::Compensated)?;
+        Ok(WorkflowState::Compensated)
     }
 
     fn compensate_committed(&self, wf: &Workflow) -> Result<(), OrchError> {
@@ -401,6 +469,17 @@ impl SagaCoordinator {
             .unwrap_or_default();
         // Reverse order: undo most recent first (Garcia-Molina saga semantics).
         for step_id in order.into_iter().rev() {
+            let already_done = self
+                .state
+                .lock()
+                .map_err(|e| OrchError::Journal(e.to_string()))?
+                .step_state
+                .get(&(wf.id().clone(), step_id.clone()))
+                .copied()
+                == Some(StepState::Compensated);
+            if already_done {
+                continue;
+            }
             let spec = wf
                 .step(&step_id)
                 .ok_or_else(|| OrchError::UnknownStep(wf.id().clone(), step_id.clone()))?;
@@ -417,9 +496,35 @@ impl SagaCoordinator {
                 .get(&spec.kind)
                 .cloned()
                 .ok_or_else(|| OrchError::NoExecutor(spec.kind.clone()))?;
-            comp.compensate(wf.id(), spec, &output).map_err(|e| {
-                OrchError::CompensateFailed(step_id.clone(), e.to_string())
-            })?;
+
+            // Garcia-Molina & Salem 1987: compensations are idempotent and are
+            // retried until they succeed. A single attempt turned any transient
+            // fault into a permanently half-rolled-back saga. Bounded, not
+            // unbounded, and with no backoff — this core is deterministic and
+            // owns no clock, so a caller wanting timed retries drives
+            // `resume_compensation` from its own scheduler.
+            let mut last_err: Option<OrchError> = None;
+            let mut compensated = false;
+            for _ in 0..self.compensation_attempts {
+                match comp.compensate(wf.id(), spec, &output) {
+                    Ok(()) => {
+                        compensated = true;
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            if !compensated {
+                // Halt rather than skip ahead: reverse order is a saga safety
+                // property. Compensating an earlier step while this one's effect
+                // still stands would undo the wrong prefix. The workflow is left
+                // in `Compensating` — the honest state — and the FSM now keeps it
+                // there until `resume_compensation` discharges the remainder.
+                return Err(OrchError::CompensateFailed(
+                    step_id.clone(),
+                    last_err.map(|e| e.to_string()).unwrap_or_default(),
+                ));
+            }
             self.record(wf.id(), &step_id, StepState::Compensated, vec![])?;
         }
         Ok(())
@@ -435,7 +540,10 @@ impl WorkflowTrait for SagaCoordinator {
         if current.is_terminal() {
             return Err(OrchError::WorkflowTerminal { wf: wf.id().clone(), state: current });
         }
-        self.set_wf_state(wf.id(), WorkflowState::Running);
+        // Non-terminal is not the same as re-drivable: `Compensating` fails the
+        // transition table below, so a half-rolled-back saga is rejected here
+        // instead of being reset to `Running`.
+        self.set_wf_state(wf.id(), WorkflowState::Running)?;
         // Initialize every step as Pending in the journal so replay is complete.
         for s in wf.steps() {
             self.record(wf.id(), &s.id, StepState::Pending, vec![])?;
@@ -477,9 +585,9 @@ impl WorkflowTrait for SagaCoordinator {
                 }
                 Err(e) => {
                     self.record(wf.id(), &step.id, StepState::Failed, e.to_string().into_bytes())?;
-                    self.set_wf_state(wf.id(), WorkflowState::Compensating);
+                    self.set_wf_state(wf.id(), WorkflowState::Compensating)?;
                     self.compensate_committed(wf)?;
-                    self.set_wf_state(wf.id(), WorkflowState::Compensated);
+                    self.set_wf_state(wf.id(), WorkflowState::Compensated)?;
                     return Ok(WorkflowState::Compensated);
                 }
             }
@@ -487,10 +595,10 @@ impl WorkflowTrait for SagaCoordinator {
 
         // Check all steps reached Committed (otherwise we have a deadlock/cycle).
         if committed.len() != wf.steps().len() {
-            self.set_wf_state(wf.id(), WorkflowState::Failed);
+            self.set_wf_state(wf.id(), WorkflowState::Failed)?;
             return Ok(WorkflowState::Failed);
         }
-        self.set_wf_state(wf.id(), WorkflowState::Succeeded);
+        self.set_wf_state(wf.id(), WorkflowState::Succeeded)?;
         Ok(WorkflowState::Succeeded)
     }
 
@@ -589,6 +697,160 @@ mod tests {
             self.log.lock().unwrap().push(step.id.clone());
             Ok(())
         }
+    }
+
+    /// Compensator that fails on a chosen step and records every attempt, so
+    /// tests can assert the halt point, the retry count, and (after `heal`) that
+    /// a resumed rollback skips what already succeeded.
+    struct FailComp {
+        fail_on: Mutex<String>,
+        attempts: Mutex<Vec<StepId>>,
+    }
+    impl FailComp {
+        fn new(fail_on: &str) -> Self {
+            Self { fail_on: Mutex::new(fail_on.into()), attempts: Mutex::new(Vec::new()) }
+        }
+        fn heal(&self) {
+            self.fail_on.lock().unwrap().clear();
+        }
+        fn tries(&self, step: &str) -> usize {
+            self.attempts.lock().unwrap().iter().filter(|s| *s == step).count()
+        }
+    }
+    impl CompensatingAction for FailComp {
+        fn kind(&self) -> &str {
+            "flaky"
+        }
+        fn compensate(
+            &self,
+            _wf: &WorkflowId,
+            step: &StepSpec,
+            _out: &[u8],
+        ) -> Result<(), OrchError> {
+            self.attempts.lock().unwrap().push(step.id.clone());
+            if *self.fail_on.lock().unwrap() == step.id {
+                Err(OrchError::Exec(format!("compensation boom at {}", step.id)))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// a,b commit; c fails; rollback halts on the chosen step's compensator.
+    fn halted_rollback(id: &str, comp_fails_on: &str) -> (SagaCoordinator, Workflow, Arc<FailComp>) {
+        let wf = Workflow::new(linear(id, &["a", "b", "c"], "flaky")).unwrap();
+        let (mut c, _) = coordinator();
+        c.register_executor(Arc::new(FailExec { fail_on: "c".into() }));
+        let comp = Arc::new(FailComp::new(comp_fails_on));
+        c.register_compensator(comp.clone());
+        (c, wf, comp)
+    }
+
+    #[test]
+    fn workflow_state_transition_table_rejects_illegal_edges() {
+        use WorkflowState::*;
+        // legal edges
+        assert!(Running.can_transition_to(Succeeded));
+        assert!(Running.can_transition_to(Failed));
+        assert!(Running.can_transition_to(Compensating));
+        assert!(Compensating.can_transition_to(Compensated));
+        assert!(Compensating.can_transition_to(Failed));
+        assert!(Running.can_transition_to(Running)); // idempotent re-assert
+        // illegal edges
+        assert!(!Compensating.can_transition_to(Running)); // O1: the pollution edge
+        assert!(!Succeeded.can_transition_to(Running)); // terminal overwrite
+        assert!(!Compensated.can_transition_to(Running));
+        assert!(!Failed.can_transition_to(Running));
+        assert!(!Succeeded.can_transition_to(Compensating));
+        assert!(!Running.can_transition_to(Compensated)); // phase skip
+    }
+
+    #[test]
+    fn compensating_workflow_cannot_be_redriven_forward() {
+        // O1: `Compensating` is non-terminal, so the is_terminal guard alone let
+        // a retry reset a half-rolled-back saga to Running.
+        let (c, wf, _comp) = halted_rollback("wfo1", "b");
+        let err = c.execute(&wf).unwrap_err();
+        assert!(matches!(err, OrchError::CompensateFailed(ref s, _) if s == "b"), "got {err:?}");
+        assert_eq!(c.workflow_state(&"wfo1".into()), WorkflowState::Compensating);
+
+        let err = c.execute(&wf).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchError::WorkflowTransition {
+                    from: WorkflowState::Compensating,
+                    to: WorkflowState::Running,
+                    ..
+                }
+            ),
+            "re-execute of a half-compensated workflow must be rejected, got {err:?}"
+        );
+        assert_eq!(c.workflow_state(&"wfo1".into()), WorkflowState::Compensating);
+        // The outstanding committed effect is still visible as Committed.
+        assert_eq!(c.step_state(&"wfo1".into(), &"a".into()).unwrap(), StepState::Committed);
+    }
+
+    #[test]
+    fn compensation_is_retried_to_the_bound_then_halts_without_skipping_ahead() {
+        // O2: one attempt turned a transient compensator fault into a permanent
+        // half-rollback. Retries are bounded; the halt must not skip to `a`.
+        let (c, wf, comp) = halted_rollback("wfo2", "b");
+        let err = c.execute(&wf).unwrap_err();
+        assert!(matches!(err, OrchError::CompensateFailed(..)), "got {err:?}");
+        assert_eq!(comp.tries("b"), DEFAULT_COMPENSATION_ATTEMPTS as usize);
+        assert_eq!(comp.tries("a"), 0, "reverse order is a saga safety property; must not skip ahead");
+    }
+
+    #[test]
+    fn compensation_attempt_bound_is_configurable_and_clamped() {
+        let (mut c, wf, comp) = halted_rollback("wfo3", "b");
+        c.set_compensation_attempts(5);
+        let _ = c.execute(&wf);
+        assert_eq!(comp.tries("b"), 5);
+
+        // 0 would mark steps Compensated without ever calling the compensator.
+        let (mut c, wf, comp) = halted_rollback("wfo4", "b");
+        c.set_compensation_attempts(0);
+        let _ = c.execute(&wf);
+        assert_eq!(comp.tries("b"), 1);
+    }
+
+    #[test]
+    fn resume_compensation_finishes_a_halted_rollback_and_skips_done_steps() {
+        // Rollback order is [b, a]: b compensates, a's compensator is broken.
+        let (c, wf, comp) = halted_rollback("wfr", "a");
+        assert!(c.execute(&wf).is_err());
+        assert_eq!(c.workflow_state(&"wfr".into()), WorkflowState::Compensating);
+        assert_eq!(comp.tries("b"), 1);
+        assert_eq!(comp.tries("a"), DEFAULT_COMPENSATION_ATTEMPTS as usize);
+
+        comp.heal();
+        assert_eq!(c.resume_compensation(&wf).unwrap(), WorkflowState::Compensated);
+        assert_eq!(c.workflow_state(&"wfr".into()), WorkflowState::Compensated);
+        assert_eq!(c.step_state(&"wfr".into(), &"a".into()).unwrap(), StepState::Compensated);
+        assert_eq!(comp.tries("b"), 1, "already-Compensated step must not be compensated twice");
+    }
+
+    #[test]
+    fn resume_compensation_rejected_unless_compensating() {
+        let def = linear("wfrr", &["a"], "ok");
+        let wf = Workflow::new(def).unwrap();
+        let (mut c, _) = coordinator();
+        c.register_executor(Arc::new(OkExec::default()));
+        c.register_compensator(Arc::new(RecComp::default()));
+
+        // Running (never started) — nothing to roll back.
+        assert!(matches!(
+            c.resume_compensation(&wf).unwrap_err(),
+            OrchError::WorkflowTransition { from: WorkflowState::Running, .. }
+        ));
+
+        c.execute(&wf).unwrap();
+        assert!(matches!(
+            c.resume_compensation(&wf).unwrap_err(),
+            OrchError::WorkflowTransition { from: WorkflowState::Succeeded, .. }
+        ));
     }
 
     fn linear(id: &str, steps: &[&str], kind: &str) -> WorkflowDef {

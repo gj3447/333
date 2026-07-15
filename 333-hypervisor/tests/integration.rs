@@ -68,6 +68,131 @@ fn unlimited_quota_never_trips() {
         .unwrap();
 }
 
+// Stopped is absorbing. A snapshot captured while Running is a live handle to a
+// Running state, and restore must not smuggle it past the lifecycle guard.
+#[test]
+fn restore_cannot_resurrect_stopped_instance() {
+    let h = InMemoryHypervisor::new();
+    let id: InstanceId = "zombie".into();
+    h.create(id.clone(), manifest(10_000, 10_000, 10_000)).unwrap();
+    h.start(&id).unwrap();
+    let snap = h.snapshot(&id).unwrap();
+    h.stop(&id).unwrap();
+
+    let err = h.restore(&id, &snap).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            HyperError::InvalidTransition { from: State::Stopped, to: State::Running }
+        ),
+        "expected InvalidTransition(Stopped -> Running), got {:?}",
+        err
+    );
+    assert_eq!(h.get_state(&id).unwrap(), State::Stopped);
+}
+
+// A refused restore must not half-apply: usage is rolled back only if the
+// lifecycle move is admitted.
+#[test]
+fn refused_restore_leaves_usage_untouched() {
+    let h = InMemoryHypervisor::new();
+    let id: InstanceId = "x".into();
+    h.create(id.clone(), manifest(10_000, 10_000, 10_000)).unwrap();
+    h.start(&id).unwrap();
+    h.record(&id, Usage { memory_bytes: 100, cpu_ms: 1, fuel_consumed: 10 }).unwrap();
+    let snap = h.snapshot(&id).unwrap();
+    h.stop(&id).unwrap();
+    h.record(&id, Usage { memory_bytes: 500, cpu_ms: 5, fuel_consumed: 50 }).unwrap();
+
+    h.restore(&id, &snap).unwrap_err();
+    let u = h.usage(&id).unwrap();
+    assert_eq!(u.memory_bytes, 600, "usage must survive a refused restore");
+    assert_eq!(u.cpu_ms, 6);
+    assert_eq!(u.fuel_consumed, 60);
+}
+
+// Restoring onto the same lifecycle state is not a transition — it rewinds
+// usage and must stay legal, including on a terminal instance.
+#[test]
+fn restore_onto_same_state_is_permitted() {
+    let h = InMemoryHypervisor::new();
+    let id: InstanceId = "x".into();
+    h.create(id.clone(), manifest(10_000, 10_000, 10_000)).unwrap();
+    h.start(&id).unwrap();
+    h.record(&id, Usage { memory_bytes: 100, cpu_ms: 0, fuel_consumed: 0 }).unwrap();
+    let running_snap = h.snapshot(&id).unwrap();
+    h.record(&id, Usage { memory_bytes: 900, cpu_ms: 0, fuel_consumed: 0 }).unwrap();
+    h.restore(&id, &running_snap).unwrap();
+    assert_eq!(h.get_state(&id).unwrap(), State::Running);
+    assert_eq!(h.usage(&id).unwrap().memory_bytes, 100);
+
+    h.stop(&id).unwrap();
+    let stopped_snap = h.snapshot(&id).unwrap();
+    h.restore(&id, &stopped_snap).unwrap();
+    assert_eq!(h.get_state(&id).unwrap(), State::Stopped);
+}
+
+// Restore is guarded, not frozen: legal edges still go through.
+#[test]
+fn restore_along_legal_edge_still_works() {
+    let h = InMemoryHypervisor::new();
+    let id: InstanceId = "x".into();
+    h.create(id.clone(), manifest(10_000, 10_000, 10_000)).unwrap();
+    h.start(&id).unwrap();
+    let snap = h.snapshot(&id).unwrap();
+    h.pause(&id).unwrap();
+    h.restore(&id, &snap).unwrap(); // Paused -> Running is a legal edge
+    assert_eq!(h.get_state(&id).unwrap(), State::Running);
+}
+
+// record() admits and applies under one lock. Eight threads racing for headroom
+// that only fits five of them must not overshoot the limit.
+#[test]
+fn concurrent_record_never_exceeds_quota() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const THREADS: usize = 8;
+    const DELTA: u64 = 200;
+    const LIMIT: u64 = 1_000;
+
+    // Repeated because a TOCTOU window is a race, not a certainty: the
+    // pre-fix code needed a handful of trials to lose it.
+    for trial in 0..2_000 {
+        let h = Arc::new(InMemoryHypervisor::new());
+        let id: InstanceId = "x".into();
+        h.create(id.clone(), manifest(LIMIT, u64::MAX, u64::MAX)).unwrap();
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = vec![];
+        for _ in 0..THREADS {
+            let h2 = h.clone();
+            let b2 = barrier.clone();
+            let id2 = id.clone();
+            handles.push(thread::spawn(move || {
+                b2.wait();
+                h2.record(&id2, Usage { memory_bytes: DELTA, cpu_ms: 0, fuel_consumed: 0 })
+                    .is_ok()
+            }));
+        }
+        let admitted = handles
+            .into_iter()
+            .fold(0u64, |acc, j| acc + u64::from(j.join().unwrap()));
+
+        let used = h.usage(&id).unwrap().memory_bytes;
+        assert!(
+            used <= LIMIT,
+            "trial {}: usage {} exceeded quota {}",
+            trial,
+            used,
+            LIMIT
+        );
+        // Every admitted record is accounted for; no lost updates either.
+        assert_eq!(used, admitted * DELTA, "trial {}: usage/admission mismatch", trial);
+        assert_eq!(admitted, LIMIT / DELTA, "trial {}: headroom under-used", trial);
+    }
+}
+
 #[test]
 fn concurrent_create_destroy_via_clone() {
     use std::sync::Arc;

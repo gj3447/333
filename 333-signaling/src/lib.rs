@@ -153,8 +153,28 @@ pub struct ScoreParams {
     pub app_specific_weight: f64,
     /// Generic behaviour penalty (e.g. flood, protocol abuse).
     pub behaviour_weight: f64,
-    /// Peers scoring below this threshold are banned until they decay above it.
+    /// Peers scoring below this threshold are banned until their counters decay
+    /// back above it. Recovery requires the embedder to drive [`PeerScorer::decay`];
+    /// without it a ban is permanent, because the `publish` ban gate denies a
+    /// banned peer any chance to earn positive score back.
     pub ban_threshold: f64,
+
+    // -- Decay factors (GossipSub v1.1 `*Decay`) -----------------------------
+    // Per-second multipliers applied by `PeerScorer::decay`. A counter c after
+    // dt seconds is `c * factor.powf(dt)`. Factor 1.0 disables decay for that
+    // counter; < 1.0 decays it toward zero. `time_in_mesh` and `app_specific`
+    // are deliberately absent: GossipSub's P1 accrues while a peer stays in the
+    // mesh, and P5 is owned by the application, not by this clock.
+    pub first_delivery_decay: f64,
+    pub mesh_delivery_decay: f64,
+    pub mesh_failure_decay: f64,
+    /// Slower than the positive counters — misbehaviour must outlive good deeds,
+    /// or an attacker alternates spam and honest traffic to sit at threshold.
+    pub invalid_msg_decay: f64,
+    pub behaviour_decay: f64,
+    /// Counters with magnitude below this snap to exactly 0, so a decayed peer
+    /// reaches a clean state instead of an infinite asymptotic tail.
+    pub decay_to_zero: f64,
 }
 
 impl Default for ScoreParams {
@@ -171,6 +191,12 @@ impl Default for ScoreParams {
             app_specific_weight: 1.0,
             behaviour_weight: -2.0,
             ban_threshold: -50.0,
+            first_delivery_decay: 0.99,
+            mesh_delivery_decay: 0.99,
+            mesh_failure_decay: 0.99,
+            invalid_msg_decay: 0.995,
+            behaviour_decay: 0.995,
+            decay_to_zero: 0.01,
         }
     }
 }
@@ -212,8 +238,39 @@ impl PeerScorer {
         self.mutate(peer, |s| s.invalid_messages += 1.0);
     }
 
+    /// Accrue time-in-mesh for one peer. Time is supplied by the caller, never
+    /// read from a clock, so a simulation and a live node score identically.
+    ///
+    /// This does not decay: an embedder advancing time runs `decay(dt)` once for
+    /// the whole mesh and `tick(peer, dt)` only for peers currently in it.
     pub fn tick(&self, peer: &NodeId, dt_seconds: f64) {
         self.mutate(peer, |s| s.time_in_mesh += dt_seconds);
+    }
+
+    /// Decay every peer's decaying counters by `dt_seconds` (GossipSub v1.1
+    /// `refreshScores`). This is the only path by which a banned peer regains
+    /// standing, since the `publish` ban gate denies it any way to earn score.
+    ///
+    /// Caller-driven like [`tick`](Self::tick) — a deterministic core owns no
+    /// clock. Reachable from the trait surface via `SignalingMesh::scorer()`.
+    ///
+    /// Continuous in `dt`: `decay(a)` then `decay(b)` equals `decay(a + b)` up to
+    /// float rounding, so scores do not depend on how finely the embedder ticks.
+    /// Non-positive `dt` is a no-op — a negative exponent would *inflate*
+    /// penalties back into existence.
+    pub fn decay(&self, dt_seconds: f64) {
+        if !(dt_seconds > 0.0) {
+            return;
+        }
+        let p = &self.params;
+        let mut g = self.stats.lock().unwrap();
+        for s in g.values_mut() {
+            decay_counter(&mut s.first_deliveries, p.first_delivery_decay, dt_seconds, p.decay_to_zero);
+            decay_counter(&mut s.mesh_deliveries, p.mesh_delivery_decay, dt_seconds, p.decay_to_zero);
+            decay_counter(&mut s.mesh_failures, p.mesh_failure_decay, dt_seconds, p.decay_to_zero);
+            decay_counter(&mut s.invalid_messages, p.invalid_msg_decay, dt_seconds, p.decay_to_zero);
+            decay_counter(&mut s.behaviour_penalty, p.behaviour_decay, dt_seconds, p.decay_to_zero);
+        }
     }
 
     pub fn set_app_specific(&self, peer: &NodeId, v: f64) {
@@ -250,6 +307,15 @@ impl PeerScorer {
         let mut g = self.stats.lock().unwrap();
         let s = g.entry(peer.clone()).or_default();
         f(s);
+    }
+}
+
+/// Counters are stored as unsigned magnitudes (negativity lives in the weights),
+/// so `abs` guards only against an app writing a negative value directly.
+fn decay_counter(c: &mut f64, factor: f64, dt_seconds: f64, decay_to_zero: f64) {
+    *c *= factor.powf(dt_seconds);
+    if c.abs() < decay_to_zero {
+        *c = 0.0;
     }
 }
 
@@ -540,6 +606,139 @@ mod tests {
         assert_eq!(mesh.drain(&Topic::Offer).len(), 1);
         assert_eq!(mesh.drain(&Topic::Answer).len(), 1);
         assert_eq!(mesh.drain(&Topic::Ice).len(), 1);
+    }
+
+    // -- Decay / ban recovery (S1) -------------------------------------------
+
+    /// The defect this crate shipped with: 10 invalid messages → score -100, and
+    /// no amount of time brought it back, because time_in_mesh caps at +10.
+    #[test]
+    fn banned_peer_recovers_once_decay_is_driven() {
+        let (a, b) = two_nodes();
+        let mesh = mesh_for(&a);
+        mesh.subscribe(Topic::Offer).unwrap();
+        for _ in 0..10 {
+            mesh.scorer().observe_invalid(&b.node_id());
+        }
+        assert!(mesh.scorer().is_banned(&b.node_id()));
+
+        // 0.995^t on 10 invalid msgs crosses the -50 threshold at t ≈ 138s.
+        mesh.scorer().decay(200.0);
+
+        assert!(
+            !mesh.scorer().is_banned(&b.node_id()),
+            "score {} should have decayed above ban_threshold",
+            mesh.scorer().score(&b.node_id())
+        );
+        let env = Envelope::sign(&b, Topic::Offer, None, b"x".to_vec(), 1);
+        mesh.publish(env).expect("recovered peer may publish again");
+        assert_eq!(mesh.drain(&Topic::Offer).len(), 1);
+    }
+
+    /// Decay must not unban instantly, or the invalid-message penalty is theatre.
+    #[test]
+    fn decay_keeps_peer_banned_while_penalty_is_fresh() {
+        let scorer = PeerScorer::new(ScoreParams::default());
+        let (_, b) = two_nodes();
+        for _ in 0..10 {
+            scorer.observe_invalid(&b.node_id());
+        }
+        scorer.decay(10.0);
+        assert!(scorer.is_banned(&b.node_id()));
+    }
+
+    #[test]
+    fn decay_is_continuous_in_dt() {
+        let (_, b) = two_nodes();
+        let fine = PeerScorer::new(ScoreParams::default());
+        let coarse = PeerScorer::new(ScoreParams::default());
+        for s in [&fine, &coarse] {
+            for _ in 0..10 {
+                s.observe_invalid(&b.node_id());
+            }
+        }
+        for _ in 0..60 {
+            fine.decay(1.0);
+        }
+        coarse.decay(60.0);
+        // Tolerance, not equality: powf rounding differs across step counts.
+        assert!((fine.score(&b.node_id()) - coarse.score(&b.node_id())).abs() < 1e-6);
+    }
+
+    #[test]
+    fn decay_snaps_to_zero_and_clears_ban_completely() {
+        let scorer = PeerScorer::new(ScoreParams::default());
+        let (_, b) = two_nodes();
+        for _ in 0..10 {
+            scorer.observe_invalid(&b.node_id());
+        }
+        scorer.decay(10_000.0);
+        let s = scorer.snapshot().get(&b.node_id()).copied().unwrap();
+        assert_eq!(s.invalid_messages, 0.0, "decay_to_zero must snap, not asymptote");
+        assert_eq!(scorer.score(&b.node_id()), 0.0);
+    }
+
+    #[test]
+    fn decay_ignores_non_positive_dt() {
+        let scorer = PeerScorer::new(ScoreParams::default());
+        let (_, b) = two_nodes();
+        scorer.observe_invalid(&b.node_id());
+        let before = scorer.score(&b.node_id());
+        scorer.decay(0.0);
+        scorer.decay(-1000.0);
+        // A negative exponent would inflate the penalty instead of decaying it.
+        assert_eq!(scorer.score(&b.node_id()), before);
+    }
+
+    #[test]
+    fn decay_does_not_touch_time_in_mesh_or_app_specific() {
+        let scorer = PeerScorer::new(ScoreParams::default());
+        let (_, b) = two_nodes();
+        scorer.tick(&b.node_id(), 500.0);
+        scorer.set_app_specific(&b.node_id(), -7.0);
+        scorer.decay(10_000.0);
+        let s = scorer.snapshot().get(&b.node_id()).copied().unwrap();
+        assert_eq!(s.time_in_mesh, 500.0, "P1 accrues while in mesh; clock must not erase it");
+        assert_eq!(s.app_specific, -7.0, "P5 belongs to the app, not to decay");
+    }
+
+    /// An app-set score is not a decaying counter, so an app-driven ban stays
+    /// put until the app itself lifts it. Pinning this so nobody "fixes" it.
+    #[test]
+    fn app_specific_ban_survives_decay() {
+        let scorer = PeerScorer::new(ScoreParams::default());
+        let (_, b) = two_nodes();
+        scorer.set_app_specific(&b.node_id(), -1000.0);
+        scorer.decay(1e6);
+        assert!(scorer.is_banned(&b.node_id()));
+    }
+
+    #[test]
+    fn decay_applies_to_every_peer_not_just_one() {
+        let scorer = PeerScorer::new(ScoreParams::default());
+        let (x, y) = two_nodes();
+        for kp in [&x, &y] {
+            for _ in 0..10 {
+                scorer.observe_invalid(&kp.node_id());
+            }
+        }
+        scorer.decay(200.0);
+        assert!(!scorer.is_banned(&x.node_id()));
+        assert!(!scorer.is_banned(&y.node_id()));
+    }
+
+    #[test]
+    fn decay_erodes_positive_counters_too() {
+        let scorer = PeerScorer::new(ScoreParams::default());
+        let (_, b) = two_nodes();
+        for _ in 0..20 {
+            scorer.observe_first_delivery(&b.node_id());
+        }
+        let before = scorer.score(&b.node_id());
+        scorer.decay(100.0);
+        let after = scorer.score(&b.node_id());
+        // Reputation is earned continuously, not banked forever.
+        assert!(after < before && after > 0.0, "before {before}, after {after}");
     }
 
     #[test]
