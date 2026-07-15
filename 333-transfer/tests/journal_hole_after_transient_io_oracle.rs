@@ -96,6 +96,13 @@ impl FlakyJournal {
 }
 
 impl Journal for FlakyJournal {
+    /// This fake models a flaky *device*, not a mis-pointed journal, so the claim
+    /// always succeeds. Deliberately does not touch `calls`: binding is not an
+    /// append, and counting it here would shift which append `fail_on` hits.
+    /// # KG: fix-333-journal-identity-binding-2026-07-15
+    fn bind(&mut self, _identity: &[u8; 32]) -> Result<(), JournalError> {
+        Ok(())
+    }
     fn append(&mut self, record: &JournalRecord) -> Result<(), JournalError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n == self.fail_on {

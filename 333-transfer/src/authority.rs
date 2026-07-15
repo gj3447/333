@@ -334,6 +334,37 @@ fn slot(transfer: &Transfer) -> (AccountId, u64) {
     (transfer.from.clone(), transfer.from_seq)
 }
 
+/// What a journal is claimed by: this authority, this committee, this genesis.
+///
+/// A journal records decisions, not balances, so recovery is only meaningful
+/// against the three inputs it was written under. Binding all three closes two
+/// distinct config mistakes that recovery cannot otherwise notice:
+///
+/// * Wrong file — an authority pointed at a peer's journal adopts that peer's
+///   locks *and loses its own*, so it re-votes a slot it already voted on. An
+///   honest operator reproduces Byzantine equivocation with a path typo.
+/// * Wrong genesis — replay re-drives `Ledger::apply` from whatever the caller
+///   passed, so a mismatched genesis silently mints balances.
+///
+/// `balances()` is a `BTreeMap`, so the fold is deterministic. Lengths are
+/// prefixed to keep the digest unambiguous: without them `("ab", "c")` and
+/// `("a", "bc")` would hash alike.
+/// # KG: fix-333-journal-identity-binding-2026-07-15
+fn journal_identity(id: &AuthorityId, committee: &CommitteeId, ledger: &Ledger) -> [u8; 32] {
+    let mut d = Sha256::new();
+    d.update(b"transfer333/journal-identity/v1\0");
+    d.update((id.len() as u32).to_be_bytes());
+    d.update(id.as_bytes());
+    d.update(committee.as_bytes());
+    for (account, balance) in ledger.balances() {
+        d.update((account.len() as u32).to_be_bytes());
+        d.update(account.as_bytes());
+        d.update(balance.to_be_bytes());
+        d.update(ledger.next_seq(&account).to_be_bytes());
+    }
+    d.finalize().into()
+}
+
 /// Independent authority state.
 ///
 /// The ledger is the single source of truth for balance and next sequence. A
@@ -387,16 +418,28 @@ impl Authority {
         ledger: Ledger,
         journal: impl Journal + 'static,
     ) -> Self {
+        let id = id.into();
+        let mut journal: Box<dyn Journal> = Box::new(journal);
+        // Claim the journal, or refuse to use it. This constructor cannot return
+        // an error without churning ~19 call sites, so a rejected claim produces a
+        // *poisoned* authority instead: constructed, but refusing to vote or
+        // confirm. Fail-stop either way — what must never happen is writing our
+        // decisions into a log that is not ours. `recover` is the production path
+        // and does surface the error; see its `bind` call.
+        // # KG: fix-333-journal-identity-binding-2026-07-15
+        let poisoned = journal
+            .bind(&journal_identity(&id, &committee_id, &ledger))
+            .is_err();
         Self {
-            id: id.into(),
+            id,
             signing,
             policy,
             committee_id,
             ledger,
             locked: HashMap::new(),
             confirmed: HashMap::new(),
-            journal: Box::new(journal),
-            poisoned: false,
+            journal,
+            poisoned,
         }
     }
 
@@ -415,6 +458,15 @@ impl Authority {
         genesis: Ledger,
         journal: impl Journal + 'static,
     ) -> Result<Self, JournalError> {
+        let id = id.into();
+        let mut journal = journal;
+        // Before replay, not after: replay is what adopts the log's locks and
+        // re-drives the ledger, so a journal written by a different authority, a
+        // re-rostered committee, or against a different genesis must be rejected
+        // while it can still be rejected. `with_journal` below binds the same
+        // identity again, which is idempotent.
+        // # KG: fix-333-journal-identity-binding-2026-07-15
+        journal.bind(&journal_identity(&id, &committee_id, &genesis))?;
         let records = journal.replay()?;
         let mut me = Self::with_journal(id, signing, policy, committee_id, genesis, journal);
         for record in &records {

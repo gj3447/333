@@ -48,7 +48,15 @@ use sha2::{Digest, Sha256};
 use crate::owner::SignedTransfer;
 use crate::wire::{decode_transfer, encode_transfer, WireError};
 
-const JOURNAL_MAGIC: &[u8] = b"transfer333/journal/v3\0";
+const JOURNAL_MAGIC: &[u8] = b"transfer333/journal/v4\0";
+
+/// Header layout: `JOURNAL_MAGIC || identity(32)`.
+///
+/// The identity block is written by the first `bind` rather than by `open`,
+/// because `open` does not know who is opening. A file that stops after the
+/// magic is a journal created but never claimed — a fresh log, not a corrupt one.
+/// # KG: fix-333-journal-identity-binding-2026-07-15
+const IDENTITY_LEN: usize = 32;
 
 /// Tag 0 is reserved and never written.
 ///
@@ -149,6 +157,22 @@ impl From<WireError> for JournalError {
 /// An implementation that buffers without a durability barrier silently
 /// reintroduces the equivocation bug this module exists to close.
 pub trait Journal: fmt::Debug + Send {
+    /// Claim this journal for one authority identity, or verify an existing claim.
+    ///
+    /// Callers must invoke this before `append` or `replay`; `Authority` does it
+    /// in `with_journal`/`recover`. A fresh journal records the identity; an
+    /// existing one must match it or the open fails.
+    ///
+    /// Without this a journal is anonymous, and an anonymous journal is unsafe:
+    /// pointed at another authority's file an authority adopts that authority's
+    /// locks *and loses its own*, so it will happily re-vote a slot it already
+    /// voted on — the very equivocation this module exists to prevent, arrived at
+    /// by a config mistake instead of a crash. A mismatched genesis is worse
+    /// still: replay re-drives `Ledger::apply` from whatever the caller supplied,
+    /// so the wrong genesis silently mints balances.
+    /// # KG: fix-333-journal-identity-binding-2026-07-15
+    fn bind(&mut self, identity: &[u8; 32]) -> Result<(), JournalError>;
+
     fn append(&mut self, record: &JournalRecord) -> Result<(), JournalError>;
     /// Every record ever appended, in append order.
     fn replay(&self) -> Result<Vec<JournalRecord>, JournalError>;
@@ -361,6 +385,11 @@ impl NullJournal {
 }
 
 impl Journal for NullJournal {
+    /// Nothing is retained, so there is no file for a different authority to
+    /// adopt and nothing to check.
+    fn bind(&mut self, _identity: &[u8; 32]) -> Result<(), JournalError> {
+        Ok(())
+    }
     fn append(&mut self, _record: &JournalRecord) -> Result<(), JournalError> {
         Ok(())
     }
@@ -378,6 +407,7 @@ impl Journal for NullJournal {
 #[derive(Debug, Default, Clone)]
 pub struct MemJournal {
     records: Vec<JournalRecord>,
+    identity: Option<[u8; 32]>,
 }
 
 impl MemJournal {
@@ -393,6 +423,21 @@ impl MemJournal {
 }
 
 impl Journal for MemJournal {
+    /// In-process only, so it cannot be handed to a different authority by a path
+    /// mistake — but it is still checked, so tests exercise the same rule the
+    /// file journal enforces.
+    fn bind(&mut self, identity: &[u8; 32]) -> Result<(), JournalError> {
+        match self.identity {
+            None => {
+                self.identity = Some(*identity);
+                Ok(())
+            }
+            Some(existing) if existing == *identity => Ok(()),
+            Some(_) => Err(JournalError::Corrupt(
+                "journal belongs to a different authority, committee or genesis".into(),
+            )),
+        }
+    }
     fn append(&mut self, record: &JournalRecord) -> Result<(), JournalError> {
         self.records.push(record.clone());
         Ok(())
@@ -422,6 +467,8 @@ mod file {
     pub struct FileJournal {
         path: PathBuf,
         file: File,
+        /// Set by `bind`; needed so `compact` can rewrite the header intact.
+        identity: Option<[u8; 32]>,
     }
 
     impl FileJournal {
@@ -444,7 +491,7 @@ mod file {
                 file.sync_data()
                     .map_err(|e| JournalError::Io(format!("sync magic: {e}")))?;
             }
-            Ok(Self { path, file })
+            Ok(Self { path, file, identity: None })
         }
 
         pub fn path(&self) -> &Path {
@@ -472,11 +519,61 @@ mod file {
             if all.len() < JOURNAL_MAGIC.len() || &all[..JOURNAL_MAGIC.len()] != JOURNAL_MAGIC {
                 return Err(JournalError::Corrupt("bad magic".into()));
             }
-            Ok(all[JOURNAL_MAGIC.len()..].to_vec())
+            // Records start after the identity block. A file that stops inside or
+            // before it was created but never claimed, so it holds no records.
+            let start = JOURNAL_MAGIC.len() + IDENTITY_LEN;
+            if all.len() < start {
+                return Ok(Vec::new());
+            }
+            Ok(all[start..].to_vec())
+        }
+
+        /// The identity this file is claimed by, or `None` if only the magic is
+        /// present (created, never bound). `Err` if the block is half-written —
+        /// a torn identity cannot be compared, so it must not be guessed.
+        fn read_identity(&self) -> Result<Option<[u8; 32]>, JournalError> {
+            let mut f = File::open(&self.path)
+                .map_err(|e| JournalError::Io(format!("read {}: {e}", self.path.display())))?;
+            let mut all = Vec::new();
+            f.read_to_end(&mut all)
+                .map_err(|e| JournalError::Io(format!("read_to_end: {e}")))?;
+            let start = JOURNAL_MAGIC.len();
+            match all.len() {
+                n if n == start => Ok(None),
+                n if n >= start + IDENTITY_LEN => {
+                    let mut id = [0u8; IDENTITY_LEN];
+                    id.copy_from_slice(&all[start..start + IDENTITY_LEN]);
+                    Ok(Some(id))
+                }
+                _ => Err(JournalError::Corrupt("torn identity block".into())),
+            }
         }
     }
 
     impl Journal for FileJournal {
+        fn bind(&mut self, identity: &[u8; 32]) -> Result<(), JournalError> {
+            match self.read_identity()? {
+                Some(existing) if existing == *identity => {}
+                Some(_) => {
+                    return Err(JournalError::Corrupt(
+                        "journal belongs to a different authority, committee or genesis".into(),
+                    ))
+                }
+                None => {
+                    // Fresh file: claim it. Durable before any record follows, so a
+                    // crash cannot leave records under an unrecorded identity.
+                    self.file
+                        .write_all(identity)
+                        .map_err(|e| JournalError::Io(format!("write identity: {e}")))?;
+                    self.file
+                        .sync_data()
+                        .map_err(|e| JournalError::Io(format!("sync identity: {e}")))?;
+                }
+            }
+            self.identity = Some(*identity);
+            Ok(())
+        }
+
         fn append(&mut self, record: &JournalRecord) -> Result<(), JournalError> {
             let frame = encode_record(record);
             self.file
@@ -517,6 +614,13 @@ mod file {
                     .map_err(|e| JournalError::Io(format!("open tmp: {e}")))?;
                 f.write_all(JOURNAL_MAGIC)
                     .map_err(|e| JournalError::Io(format!("tmp magic: {e}")))?;
+                // The compacted file must carry the same claim, or the next open
+                // would see an unclaimed journal and adopt whoever asked first.
+                let id = self
+                    .identity
+                    .ok_or_else(|| JournalError::Corrupt("compact before bind".into()))?;
+                f.write_all(&id)
+                    .map_err(|e| JournalError::Io(format!("tmp identity: {e}")))?;
                 f.write_all(&encode_record(&JournalRecord::Snapshot(snapshot.clone())))
                     .map_err(|e| JournalError::Io(format!("tmp snapshot: {e}")))?;
                 f.sync_all()
