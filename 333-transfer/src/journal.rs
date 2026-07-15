@@ -510,6 +510,26 @@ mod file {
                 .append(true)
                 .open(&path)
                 .map_err(|e| JournalError::Io(format!("open {}: {e}", path.display())))?;
+            // Exclusive, and non-blocking on purpose.
+            //
+            // `Authority.locked` is per-process and is only ever read back at
+            // `recover`. Two live holders of one log therefore each believe the
+            // slot is free and both sign it — the equivocation this module exists
+            // to prevent, without even needing a crash. A rolling update that
+            // overlaps two pods on one volume, or `Restart=always` firing while
+            // the old process still drains, is enough.
+            //
+            // Non-blocking because a second holder is a configuration error, not
+            // a queue to join: waiting would only postpone the collision. The
+            // lock lives as long as `file` and the kernel drops it when the
+            // process dies, so a genuine restart is never locked out by its own
+            // corpse.
+            //
+            // Advisory: this binds processes that go through `open`, which is
+            // every path in this crate. It is not a defence against a hostile
+            // writer, and flock semantics on network filesystems (NFS) are not
+            // something to rely on.
+            Self::claim(&file, &path)?;
             if existed {
                 Self::check_magic(&path)?;
             } else {
@@ -561,6 +581,24 @@ mod file {
                 .sync_all()
                 .map_err(|e| JournalError::Io(format!("sync truncation: {e}")))?;
             Ok(())
+        }
+
+        /// Take the exclusive lock, or say who has it.
+        ///
+        /// The lock lives on the *inode*, not the path, so every handle that
+        /// becomes "the journal" must go through here — `open` for a fresh one
+        /// and `compact` for the one it renames into place. Miss either and the
+        /// log is silently unheld from that moment.
+        fn claim(file: &File, path: &Path) -> Result<(), JournalError> {
+            file.try_lock().map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => JournalError::Io(format!(
+                    "journal {} is already held by a live process",
+                    path.display()
+                )),
+                std::fs::TryLockError::Error(e) => {
+                    JournalError::Io(format!("lock {}: {e}", path.display()))
+                }
+            })
         }
 
         pub fn path(&self) -> &Path {
@@ -706,12 +744,19 @@ mod file {
                 }
             }
             // The old handle points at the unlinked inode; reopen for appends.
-            self.file = OpenOptions::new()
+            let reopened = OpenOptions::new()
                 .create(true)
                 .read(true)
                 .append(true)
                 .open(&self.path)
                 .map_err(|e| JournalError::Io(format!("reopen after compact: {e}")))?;
+            // The lock died with the unlinked inode. Retake it on the new one, or
+            // this holder goes on believing it is exclusive while nothing stops a
+            // second process from opening the log and voting the same slots.
+            // Dropping `self.file` only after the new claim succeeds keeps the
+            // path continuously held, so no second holder can slip into the gap.
+            Self::claim(&reopened, &self.path)?;
+            self.file = reopened;
             Ok(())
         }
     }
