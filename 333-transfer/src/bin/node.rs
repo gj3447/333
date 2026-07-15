@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use transfer333::{
     Authority, AuthorityError, AuthorityMsg, AuthorityNet, Certified, Committee, ConfirmError,
-    ConfirmOutcome, Ledger, NetworkId, OwnerAuthError, OwnerRegistry, SignedTransfer, SigningKey,
+    ConfirmOutcome, FileJournal, Ledger, NetworkId, OwnerAuthError, OwnerRegistry, SignedTransfer,
+    SigningKey,
     TcpAuthorityNet, Transfer, TransferPolicy, VerifyingKey, VoteCollector,
 };
 use zeroize::Zeroizing;
@@ -48,7 +49,7 @@ fn main() -> ExitCode {
 fn usage() {
     eprintln!(
         "usage:
-  node authority --id <a0> (--key-file <hex-key-file> | --dev-seed <0>) --network-id <deployment> --owner-roster alice=<pubhex>,bob=<pubhex> --listen <127.0.0.1:PORT> --peers <addr,addr,...> --committee a0=<pubhex>,a1=<pubhex>,... [--genesis alice=100,bob=0] [--rounds-idle-exit <n>]
+  node authority --id <a0> (--key-file <hex-key-file> | --dev-seed <0>) --network-id <deployment> --owner-roster alice=<pubhex>,bob=<pubhex> --listen <127.0.0.1:PORT> --peers <addr,addr,...> --committee a0=<pubhex>,a1=<pubhex>,... [--genesis alice=100,bob=0] [--journal <path>] [--rounds-idle-exit <n>]
   node submit (--key-file <hex-key-file> | --dev-seed <42>) --network-id <deployment> --owner-roster alice=<pubhex>,bob=<pubhex> --listen <127.0.0.1:PORT> --peers <authority_addrs,...> --committee a0=<pubhex>,... --transfer <alice:0:bob:30> [--max-rounds 200] [--pause-ms 10]
 
 `--dev-seed` is deterministic debug-build scaffolding only and is rejected by
@@ -332,13 +333,31 @@ fn run_authority(args: &[String]) -> Result<(), String> {
         None => None,
     };
 
-    let mut auth = Authority::new(
-        id.clone(),
-        signing_key,
-        policy,
-        committee.id(),
-        ledger,
-    );
+    // Durability is opt-in at the process boundary. With `--journal` the
+    // authority always goes through `recover`: a fresh file replays an empty log,
+    // which is exactly a first boot, so one code path covers both cases.
+    //
+    // Without it the node keeps the historical in-memory behaviour, in which a
+    // restart forgets every lock and an honest crash spends one unit of the
+    // Byzantine budget (audit-333-fsm-vs-borg-k8s-2026-07-15). That is a
+    // debug/ephemeral configuration, and the node says so on stderr rather than
+    // letting an operator assume otherwise.
+    let mut auth = match flags.get("journal") {
+        Some(path) => {
+            let journal = FileJournal::open(path)
+                .map_err(|e| format!("--journal {path}: {e}"))?;
+            Authority::recover(id.clone(), signing_key, policy, committee.id(), ledger, journal)
+                .map_err(|e| format!("journal recovery failed: {e}"))?
+        }
+        None => {
+            eprintln!(
+                "warning: no --journal; locks are in-memory only. A restart will \
+                 forget them and this authority may sign a conflicting order for a \
+                 slot it already voted on. Do not use for a durable deployment."
+            );
+            Authority::new(id.clone(), signing_key, policy, committee.id(), ledger)
+        }
+    };
     // Public key must match committee entry for this id.
     if let Some(expected) = committee.key_of(&id) {
         if auth.verifying_key() != *expected {
@@ -463,6 +482,28 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                             escape_json(&account)
                         ));
                     }
+                    // Durability fault: this authority can no longer prove it has
+                    // not already signed a conflicting order for some slot, so it
+                    // must stop rather than keep voting. Fail-stop is the whole
+                    // point of the journal (see journal.rs).
+                    Err(AuthorityError::JournalFailed { reason }) => {
+                        emit(&format!(
+                            "{{\"event\":\"durability_failed\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"{}\"}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id),
+                            escape_json(&reason)
+                        ));
+                        return Err(format!("durability failure, fail-stop: {reason}"));
+                    }
+                    Err(AuthorityError::Poisoned) => {
+                        emit(&format!(
+                            "{{\"event\":\"poisoned\",\"order_id\":\"{}\",\"authority\":\"{}\"}}",
+                            order_id_hex(&t),
+                            escape_json(&id)
+                        ));
+                        return Err("authority poisoned by an earlier durability failure".to_string());
+                    }
                     Err(AuthorityError::ZeroAmount) => {
                         emit(&format!(
                             "{{\"event\":\"state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"zero_amount\"}}",
@@ -527,6 +568,7 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                                     ConfirmError::WrongPolicy { .. } => "wrong_policy",
                                     ConfirmError::OwnerAuth(_) => "owner_auth",
                                     ConfirmError::State(_) => "state",
+                                    ConfirmError::Journal(_) => "durability",
                                 };
                                 emit(&format!(
                                     "{{\"event\":\"cert_state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"{}\"}}",

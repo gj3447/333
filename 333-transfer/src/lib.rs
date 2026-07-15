@@ -72,6 +72,7 @@ use crdt333::{CausalBroadcast, CausalMsg, VectorClockBroadcaster};
 
 pub mod authority;
 pub mod epidemic;
+pub mod journal;
 pub mod net;
 pub mod owner;
 pub mod tcp;
@@ -86,6 +87,9 @@ pub use epidemic::{
     mesh_all_eager, mesh_with_dropped_eager_edge, msg_id_of, peer_node_id, pump, EpidemicEndpoint,
     EpidemicNetwork,
 };
+pub use journal::{Journal, JournalError, JournalRecord, MemJournal, NullJournal};
+#[cfg(not(target_arch = "wasm32"))]
+pub use journal::FileJournal;
 pub use net::{
     authority_handle_round, certify_via_mesh, certify_via_mesh_rounds,
     certify_via_mesh_rounds_with_pause, collect_until_quorum, confirm_from_mesh,

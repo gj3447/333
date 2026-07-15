@@ -13,6 +13,7 @@ use std::fmt;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+use crate::journal::{Journal, JournalError, JournalRecord, NullJournal};
 use crate::owner::{
     put_network_transfer_body, NetworkId, OwnerAuthError, PolicyId, SignedTransfer,
     TransferPolicy,
@@ -321,6 +322,12 @@ pub enum AuthorityError {
         have: u128,
         credit: u128,
     },
+    /// A durability barrier failed; the authority has fail-stopped.
+    JournalFailed { reason: String },
+    /// A prior durability failure fail-stopped this authority. It will not vote
+    /// again: its in-memory locks are no longer backed by stable storage, so it
+    /// cannot prove it has not already signed a conflicting order for a slot.
+    Poisoned,
 }
 
 fn slot(transfer: &Transfer) -> (AccountId, u64) {
@@ -332,6 +339,11 @@ fn slot(transfer: &Transfer) -> (AccountId, u64) {
 /// The ledger is the single source of truth for balance and next sequence. A
 /// separate speculative sequence counter is deliberately absent: confirmation
 /// advances only through an atomic [`Ledger::apply`].
+///
+/// Slot decisions are backed by a [`Journal`]. The default is [`NullJournal`],
+/// which keeps the historical non-durable behaviour; [`Authority::with_journal`]
+/// and [`Authority::recover`] opt into durability. See `journal.rs` for why an
+/// in-memory lock table turns an honest restart into Byzantine equivocation.
 #[derive(Debug)]
 pub struct Authority {
     id: AuthorityId,
@@ -341,18 +353,39 @@ pub struct Authority {
     ledger: Ledger,
     locked: HashMap<(AccountId, u64), SignedTransfer>,
     confirmed: HashMap<(AccountId, u64), [u8; 32]>,
+    journal: Box<dyn Journal>,
+    /// Set once a journal append fails. In-memory state is then no longer backed
+    /// by stable storage, so the authority refuses to vote or confirm rather than
+    /// silently serving from state it cannot recover. Fail-stop, not fail-open.
+    poisoned: bool,
 }
 
 impl Authority {
     /// Construct from the deployment's canonical genesis ledger and committee
     /// id. Callers build the public [`Committee`] first, then instantiate each
     /// authority with `committee.id()` and an identical canonical genesis.
+    ///
+    /// Uses a [`NullJournal`]: locks are **not** durable and a restart forgets
+    /// them. Use [`Authority::with_journal`] for any deployment that can restart.
     pub fn new(
         id: impl Into<AuthorityId>,
         signing: SigningKey,
         policy: TransferPolicy,
         committee_id: CommitteeId,
         ledger: Ledger,
+    ) -> Self {
+        Self::with_journal(id, signing, policy, committee_id, ledger, NullJournal::new())
+    }
+
+    /// Construct with an explicit durability port. The journal is assumed empty;
+    /// to rebuild from an existing log use [`Authority::recover`].
+    pub fn with_journal(
+        id: impl Into<AuthorityId>,
+        signing: SigningKey,
+        policy: TransferPolicy,
+        committee_id: CommitteeId,
+        ledger: Ledger,
+        journal: impl Journal + 'static,
     ) -> Self {
         Self {
             id: id.into(),
@@ -362,7 +395,61 @@ impl Authority {
             ledger,
             locked: HashMap::new(),
             confirmed: HashMap::new(),
+            journal: Box::new(journal),
+            poisoned: false,
         }
+    }
+
+    /// Rebuild authority state by folding the journal over the canonical genesis
+    /// ledger. `ledger` must be the same genesis the authority originally started
+    /// from — the log carries decisions, not balances.
+    ///
+    /// Replay is a pure fold in append order: `Locked` installs a lock,
+    /// `Confirmed` re-drives `Ledger::apply` and clears the lock. `apply` is
+    /// deterministic, so a record that applied once applies again.
+    pub fn recover(
+        id: impl Into<AuthorityId>,
+        signing: SigningKey,
+        policy: TransferPolicy,
+        committee_id: CommitteeId,
+        genesis: Ledger,
+        journal: impl Journal + 'static,
+    ) -> Result<Self, JournalError> {
+        let records = journal.replay()?;
+        let mut me = Self::with_journal(id, signing, policy, committee_id, genesis, journal);
+        for record in &records {
+            match record {
+                JournalRecord::Locked(order) => {
+                    me.locked.insert(slot(&order.transfer), order.clone());
+                }
+                JournalRecord::Confirmed(order) => {
+                    let s = slot(&order.transfer);
+                    me.ledger.apply(&order.transfer).map_err(|e| {
+                        JournalError::Corrupt(format!(
+                            "replay: confirmed record for {s:?} does not apply: {e:?}"
+                        ))
+                    })?;
+                    me.confirmed.insert(s.clone(), order.order_id());
+                    me.locked.remove(&s);
+                }
+            }
+        }
+        Ok(me)
+    }
+
+    /// True once a durability failure has fail-stopped this authority.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Append and fail-stop on error. Returns the raw [`JournalError`]; callers
+    /// wrap it in their own error type.
+    fn journal_append(&mut self, record: &JournalRecord) -> Result<(), JournalError> {
+        if let Err(e) = self.journal.append(record) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> &AuthorityId {
@@ -401,13 +488,24 @@ impl Authority {
 
     /// Validate and vote using a deterministic guard order:
     ///
-    /// 1. owner proof; 2. pending/idempotence/equivocation; 3. sender exists;
-    /// 4. amount is positive; 5. complete ledger preflight, including sequence
-    /// and balance arithmetic; 6. install the lock and sign.
+    /// 1. not poisoned; 2. owner proof; 3. pending/idempotence/equivocation;
+    /// 4. sender exists; 5. amount is positive; 6. complete ledger preflight,
+    /// including sequence and balance arithmetic; 7. **make the lock durable**;
+    /// 8. install the lock and sign.
     ///
     /// Every rejection before step 7 is mutation-free. In particular, an
     /// overspend cannot poison the slot and block a later valid order.
+    ///
+    /// Step 7 is the write-ahead point and it is not an optimisation: the vote is
+    /// this authority's irrevocable, externally-visible promise never to sign a
+    /// different order for the slot. Producing it before the lock is durable
+    /// would let a restart retract the promise — exactly the honest-crash-becomes-
+    /// equivocation failure (`audit-333-fsm-vs-borg-k8s-2026-07-15`). Journal
+    /// first, sign second.
     pub fn handle(&mut self, order: &SignedTransfer) -> Result<Vote, AuthorityError> {
+        if self.poisoned {
+            return Err(AuthorityError::Poisoned);
+        }
         order
             .verify(&self.policy)
             .map_err(AuthorityError::OwnerAuth)?;
@@ -466,6 +564,12 @@ impl Authority {
             });
         }
 
+        // Write-ahead: durable before the vote exists. On `Err` no lock is
+        // installed and no vote is produced, so the slot stays open.
+        self.journal_append(&JournalRecord::Locked(order.clone()))
+            .map_err(|e| AuthorityError::JournalFailed {
+                reason: e.to_string(),
+            })?;
         self.locked.insert(pending_slot, order.clone());
         Ok(self.sign(order))
     }
@@ -535,6 +639,16 @@ impl Authority {
         }
 
         self.ledger.apply(transfer).map_err(ConfirmError::State)?;
+        // Durability here is weaker than in `handle`, deliberately. A vote is an
+        // unrecoverable promise, so it must be journalled first. A confirmation is
+        // driven by a quorum certificate — public, self-authenticating evidence
+        // that anyone may re-present — so a lost confirmation is recoverable by
+        // replaying the certificate, not a safety hole. `apply` must therefore run
+        // first (it is the only step that can reject), and the record is written
+        // once the outcome is known. A failure here still fail-stops: in-memory
+        // state has moved ahead of stable storage.
+        self.journal_append(&JournalRecord::Confirmed(verified.order.clone()))
+            .map_err(|e| ConfirmError::Journal(e.to_string()))?;
         self.confirmed.insert(confirmed_slot.clone(), order_id);
         self.locked.remove(&confirmed_slot);
         Ok(ConfirmOutcome::Applied)
@@ -559,6 +673,8 @@ pub enum ConfirmError {
     },
     OwnerAuth(OwnerAuthError),
     State(Reject),
+    /// A durability barrier failed after the ledger moved; fail-stop.
+    Journal(String),
 }
 
 /// Quorum certificate for one owner-signed order.
@@ -692,6 +808,10 @@ pub fn certify(
                 refusals += 1;
                 contested = true;
             }
+            // A durability fault is an operational refusal, not contention: the
+            // authority produced no vote, and unlike Equivocation it says nothing
+            // about a competing order. Counting it as `contested` would mislabel a
+            // disk failure as a double-spend attempt.
             Err(
                 AuthorityError::OwnerAuth(_)
                 | AuthorityError::UnknownSender { .. }
@@ -699,7 +819,9 @@ pub fn certify(
                 | AuthorityError::OutOfOrder { .. }
                 | AuthorityError::InsufficientBalance { .. }
                 | AuthorityError::SequenceExhausted { .. }
-                | AuthorityError::BalanceOverflow { .. },
+                | AuthorityError::BalanceOverflow { .. }
+                | AuthorityError::JournalFailed { .. }
+                | AuthorityError::Poisoned,
             ) => refusals += 1,
         }
     }

@@ -263,6 +263,8 @@ pub fn certify_via_mesh(
                         refusals += 1;
                         contested = true;
                     }
+                    // Durability fault => no vote. Kept out of `contested` for the
+                    // same reason as in `certify`: a disk failure is not contention.
                     Err(
                         AuthorityError::OutOfOrder { .. }
                         | AuthorityError::OwnerAuth(_)
@@ -270,7 +272,9 @@ pub fn certify_via_mesh(
                         | AuthorityError::ZeroAmount
                         | AuthorityError::InsufficientBalance { .. }
                         | AuthorityError::SequenceExhausted { .. }
-                        | AuthorityError::BalanceOverflow { .. },
+                        | AuthorityError::BalanceOverflow { .. }
+                        | AuthorityError::JournalFailed { .. }
+                        | AuthorityError::Poisoned,
                     ) => {
                         refusals += 1;
                     }
