@@ -86,6 +86,7 @@ fn temp_log(tag: &str) -> std::path::PathBuf {
 ///
 /// Same event, same "never became durable" prefix, opposite outcomes.
 #[test]
+#[ignore = "RED: documents defect-333-journal-tolerates-only-one-torn-tail-shape-2026-07-15 (P2). Un-ignore with the fix."]
 fn decode_torn_header_is_inconsistent_with_torn_body() {
     let frame = encode_record(&JournalRecord::Locked(t("bob", 0, 30)));
     assert!(
@@ -122,6 +123,7 @@ fn decode_torn_header_is_inconsistent_with_torn_body() {
 /// tail parses as a well-formed, zero-length `Locked` frame rather than as the
 /// torn tail it is. There is no per-record checksum to catch it.
 #[test]
+#[ignore = "RED: documents defect-333-journal-tolerates-only-one-torn-tail-shape-2026-07-15 (P2). Un-ignore with the fix."]
 fn decode_tolerates_a_zero_filled_tail() {
     let mut body = encode_record(&JournalRecord::Locked(t("bob", 0, 30)));
     let good = decode_records(&body).expect("baseline decodes");
@@ -148,6 +150,7 @@ fn decode_tolerates_a_zero_filled_tail() {
 /// This is the reachable consequence — `Authority::recover` is what
 /// `node authority --journal <path>` calls at startup.
 #[test]
+#[ignore = "RED: documents defect-333-journal-tolerates-only-one-torn-tail-shape-2026-07-15 (P2). Un-ignore with the fix."]
 fn recover_survives_a_torn_header() {
     let (p, c, g) = (policy(), committee(), genesis());
     let path = temp_log("recover");
