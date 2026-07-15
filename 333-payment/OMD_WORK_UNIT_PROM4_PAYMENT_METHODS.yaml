@@ -1,0 +1,25 @@
+schema: omd-work-unit-v1
+task_id: prom4-payment-ooptdd-omd
+name: Apply canonical OOPTDD and OMD to payment333
+agent_id: codex-root-v2
+integration_branch: codex/prom-333-safety
+orbit_branch: omd/prom4-payment-ooptdd-omd
+orbit_id: orb-8215fb030d05
+fence: 1
+strict_writeset: true
+coordinator_source:
+  repository: airobotics-ailab/omd
+  revision: b124bfa306fd5626b336dde5d0f7a05e1c272962
+write_set:
+  - ooptdd/payment_*
+  - 333-payment/OOPTDD_*
+  - 333-payment/OMD_*
+  - 333-payment/KG_UPSERT_PROM4_PAYMENT_SAFETY.cypher
+  - 333-payment/PROM_4_PAYMENT_SAFETY_2026-07-15.md
+  - 333-payment/README.md
+  - README.md
+postconditions:
+  - strict write-set audit passes
+  - OOPTDD receipt is COMPLETE with 7/7 DONE
+  - all 14 enforced OOPTDD methodology checks pass
+  - OOPTDD and OMD evidence connect to LakatosTree_333PaymentSafety_20260715

@@ -47,3 +47,15 @@ cargo test --manifest-path 333-payment/Cargo.toml
 The adversarial suite is in `tests/payment_safety.rs`. See
 `PROM_4_PAYMENT_SAFETY_2026-07-15.md` for the research programme, falsifiers and
 scope boundary.
+
+The same seven behaviors are enforced by canonical OOPTDD:
+
+```sh
+python ooptdd/payment_run.py \
+  --runtime-root /path/to/lakatotree/_vendor \
+  --receipt 333-payment/OOPTDD_RECEIPT_PROM4_PAYMENT_2026-07-15.json
+```
+
+`ooptdd/payment_requirements.yaml` enables all 14 methodology rules. Exact Rust
+test registration plus process exit is the non-log oracle. See
+`OOPTDD_OMD_APPLICATION_2026-07-15.md` for the object protocol and OMD boundary.

@@ -136,6 +136,27 @@ Relevant executable evidence:
 - `333-payment/src/ledger.rs`
 - `333-payment/src/storage.rs`
 
+## OOPTDD and OMD operationalization
+
+The six PROM predictions refine into seven OOPTDD requirements (restart signing
+locks and durable ledger reopen are separate). `OOPTDD_methodology_v1` enforces
+structured positive evidence, correlation IDs, Longinus bindings, separate
+message/state contracts and real integration backstops. GREEN events require an
+exact registered Rust test with zero exit status; test text is not an oracle.
+
+Implementation work uses OMD revision `b124bfa306fd5626b336dde5d0f7a05e1c272962`,
+an explicit HELD write-set lease, `strict_writeset=true`, a dedicated worktree and
+the coordinator's connect fence.
+
+Evidence:
+
+- `ooptdd/payment_requirements.yaml`
+- `ooptdd/payment_conformance_adapter.py`
+- `333-payment/OOPTDD_RECEIPT_PROM4_PAYMENT_2026-07-15.json`
+- `333-payment/OMD_WORK_UNIT_PROM4_PAYMENT_METHODS.yaml`
+- `333-payment/OMD_EXECUTION_RECEIPT_PROM4_PAYMENT_2026-07-15.json`
+- `333-payment/OOPTDD_OMD_APPLICATION_2026-07-15.md`
+
 ## Appraisal
 
 Verdict: **PROGRESSIVE_CORE**.

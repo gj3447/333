@@ -32,6 +32,9 @@ asset-transfer theorem (Guerraoui et al., PODC 2019).
     orders, restart double-sign attempts, durable replay, cross-network/epoch
     replay, rotation drain, historical escrow funding, proof/epoch/voucher
     idempotency and supply conservation.
+  - Canonical OOPTDD maps those tests to structured correlation-scoped gates
+    with Longinus binding and 14 enforced rules; OMD supplies the strict
+    write-set lease and fenced integration path.
   - Research/appraisal: `333-payment/PROM_4_PAYMENT_SAFETY_2026-07-15.md`.
 
 - **`333-transfer` (`transfer333`)** — consensusless single-owner asset transfer +

@@ -1,0 +1,144 @@
+# OOPTDD guiding specification for the canonical payment333 safety boundary.
+name: payment333-safety-conformance
+
+methodology:
+  name: OOPTDD_methodology_v1
+  enforce: true
+
+target:
+  mode: in_process
+  callable: payment_conformance_adapter:run_payment_probe
+  backend: memory
+  root: ooptdd
+
+contracts:
+  - id: MC-OWNER-SIGNED-ORDER
+    kind: message_contract
+    description: An owner-authorized transfer crosses the authority boundary.
+    role: payment owner to payment authority
+    sender: PaymentOwner
+    receiver: PaymentAuthority
+    message: OwnerSignedTransferOrder
+    status: accepted
+    source_req: REQ-PAY-OWNER-AUTH
+    integration_backstop: REQ-PAY-OWNER-AUTH
+  - id: MC-DURABLE-AUTHORITY-VOTE
+    kind: message_contract
+    description: An authority releases a vote only after its slot lock is durable.
+    role: durable payment authority
+    sender: PaymentAuthority
+    receiver: CertificateCollector
+    message: DurableAuthorityVote
+    status: accepted
+    source_req: REQ-PAY-RESTART-LOCK
+    integration_backstop: REQ-PAY-RESTART-LOCK
+  - id: MC-EPOCH-BOUND-CERTIFICATE
+    kind: message_contract
+    description: A certificate is valid only in its complete payment context.
+    role: committee certificate verifier
+    sender: PaymentCommittee
+    receiver: PaymentLedger
+    message: EpochBoundCertificate
+    status: accepted
+    source_req: REQ-PAY-CONTEXT-EPOCH
+    integration_backstop: REQ-PAY-CONTEXT-EPOCH
+  - id: MC-ESCROW-FUNDING-PROOF
+    kind: message_contract
+    description: The control lane consumes one already-applied escrow funding proof.
+    role: ORRR escrow bridge
+    sender: FastPaymentLane
+    receiver: ControlPaymentLane
+    message: AppliedEscrowFundingProof
+    status: accepted
+    source_req: REQ-PAY-UNIFIED-LANES
+    integration_backstop: REQ-PAY-UNIFIED-LANES
+  - id: INV-OWNER-AUTHENTICITY
+    kind: state_invariant
+    description: No transfer mutates value without a public-key-bound owner signature.
+  - id: INV-DURABLE-SINGLE-VOTE
+    kind: state_invariant
+    description: One authority key signs at most one digest for a transfer slot or control height across restarts.
+  - id: INV-CONTEXT-ISOLATION
+    kind: state_invariant
+    description: Network, asset, genesis and committee epochs are replay-isolated.
+  - id: INV-SINGLE-SUPPLY
+    kind: state_invariant
+    description: Fast and control proof lanes share one conserved total supply.
+
+requirements:
+  - id: REQ-PAY-OWNER-AUTH
+    kind: guiding
+    description: A forged owner signature or mismatched public-key-bound account cannot obtain an honest authority vote.
+    covers: [MC-OWNER-SIGNED-ORDER, INV-OWNER-AUTHENTICITY]
+    gate: [{event: payment_owner_auth_verified, op: "==", count: 1}]
+    longinus:
+      kg_anchor: ooptdd-payment333-owner-auth-20260715
+      source: payment_conformance_adapter.py
+      symbol: run_payment_probe
+      must_emit: payment_owner_auth_verified
+  - id: REQ-PAY-RESTART-LOCK
+    kind: micro_race
+    description: Reopening an authority cannot erase its transfer or control signing lock.
+    non_log_oracle: subprocess_exit_and_exact_test_registry
+    covers: [MC-DURABLE-AUTHORITY-VOTE, INV-DURABLE-SINGLE-VOTE]
+    gate: [{event: payment_restart_safety_verified, op: "==", count: 1}]
+    longinus:
+      kg_anchor: ooptdd-payment333-restart-lock-20260715
+      source: payment_conformance_adapter.py
+      symbol: run_payment_probe
+      must_emit: payment_restart_safety_verified
+  - id: REQ-PAY-DURABLE-REOPEN
+    kind: security
+    description: A reopened ledger retains balances, sequences and replay protection.
+    non_log_oracle: subprocess_exit_and_exact_test_registry
+    covers: [INV-DURABLE-SINGLE-VOTE]
+    gate: [{event: payment_durable_reopen_verified, op: "==", count: 1}]
+    longinus:
+      kg_anchor: ooptdd-payment333-durable-reopen-20260715
+      source: payment_conformance_adapter.py
+      symbol: run_payment_probe
+      must_emit: payment_durable_reopen_verified
+  - id: REQ-PAY-CONTEXT-EPOCH
+    kind: security
+    description: Cross-network, cross-asset, cross-genesis and retired-epoch certificates cannot mutate the current ledger.
+    non_log_oracle: subprocess_exit_and_exact_test_registry
+    covers: [MC-EPOCH-BOUND-CERTIFICATE, INV-CONTEXT-ISOLATION]
+    gate: [{event: payment_context_epoch_binding_verified, op: "==", count: 1}]
+    longinus:
+      kg_anchor: ooptdd-payment333-context-epoch-20260715
+      source: payment_conformance_adapter.py
+      symbol: run_payment_probe
+      must_emit: payment_context_epoch_binding_verified
+  - id: REQ-PAY-ROTATION-LOCK-FENCE
+    kind: micro_race
+    description: Committee rotation cannot cross an unsettled fast-payment authority lock.
+    non_log_oracle: subprocess_exit_and_exact_test_registry
+    covers: [INV-DURABLE-SINGLE-VOTE, INV-CONTEXT-ISOLATION]
+    gate: [{event: payment_rotation_lock_fence_verified, op: "==", count: 1}]
+    longinus:
+      kg_anchor: ooptdd-payment333-rotation-lock-fence-20260715
+      source: payment_conformance_adapter.py
+      symbol: run_payment_probe
+      must_emit: payment_rotation_lock_fence_verified
+  - id: REQ-PAY-ROTATION-ESCROW
+    kind: security
+    description: A settled pre-rotation escrow deposit remains consumable after a valid committee rotation.
+    non_log_oracle: subprocess_exit_and_exact_test_registry
+    covers: [MC-ESCROW-FUNDING-PROOF, INV-CONTEXT-ISOLATION]
+    gate: [{event: payment_rotation_escrow_continuity_verified, op: "==", count: 1}]
+    longinus:
+      kg_anchor: ooptdd-payment333-rotation-escrow-20260715
+      source: payment_conformance_adapter.py
+      symbol: run_payment_probe
+      must_emit: payment_rotation_escrow_continuity_verified
+  - id: REQ-PAY-UNIFIED-LANES
+    kind: security
+    description: Fast and control proofs are one-shot, quorum-checked and conserve the single payment supply under escrow, dispute and reward interleavings.
+    non_log_oracle: subprocess_exit_and_exact_test_registry
+    covers: [MC-ESCROW-FUNDING-PROOF, INV-SINGLE-SUPPLY]
+    gate: [{event: payment_unified_lanes_supply_verified, op: "==", count: 1}]
+    longinus:
+      kg_anchor: ooptdd-payment333-unified-lanes-20260715
+      source: payment_conformance_adapter.py
+      symbol: run_payment_probe
+      must_emit: payment_unified_lanes_supply_verified

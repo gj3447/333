@@ -1,0 +1,407 @@
+{
+  "backend": "memory",
+  "cid": "payment333-prom4-ooptdd-20260715",
+  "complete": true,
+  "done": 7,
+  "execution": {
+    "host": "lagyeongjun@bhgman.iptime.org",
+    "root": "/Users/lagyeongjun/CD/worktrees/333-prom-safety"
+  },
+  "generated_at": "2026-07-15T03:48:46.398742+00:00",
+  "methodology_checks": [
+    {
+      "message": "at least one guiding/acceptance/feature requirement is required",
+      "passed": true,
+      "rule_id": "OOPTDD-R01",
+      "severity": "error"
+    },
+    {
+      "message": "every requirement must declare event/conforms/must_order trace gates",
+      "passed": true,
+      "rule_id": "OOPTDD-R02",
+      "severity": "error"
+    },
+    {
+      "message": "engine mints and propagates OOPTDD_CID for in_process/command/pytest targets",
+      "passed": true,
+      "rule_id": "OOPTDD-R03",
+      "severity": "error"
+    },
+    {
+      "message": "free-text log assertions are not accepted; use event/conforms/must_order/select",
+      "passed": true,
+      "rule_id": "OOPTDD-R04",
+      "severity": "error"
+    },
+    {
+      "message": "each contract candidate must point to an existing source_req",
+      "passed": true,
+      "rule_id": "OOPTDD-R05",
+      "severity": "error"
+    },
+    {
+      "message": "private/non-domain message contracts are forbidden: []",
+      "passed": true,
+      "rule_id": "OOPTDD-R06",
+      "severity": "error"
+    },
+    {
+      "message": "message contracts must name at least one role/sender/receiver",
+      "passed": true,
+      "rule_id": "OOPTDD-R07",
+      "severity": "error"
+    },
+    {
+      "message": "state invariant must be a separate contract node: []",
+      "passed": true,
+      "rule_id": "OOPTDD-R08",
+      "severity": "error"
+    },
+    {
+      "message": "accepted message contracts need integration_backstop reqs: []",
+      "passed": true,
+      "rule_id": "OOPTDD-R09",
+      "severity": "error"
+    },
+    {
+      "message": "requirements without Longinus binding: []",
+      "passed": true,
+      "rule_id": "OOPTDD-R10",
+      "severity": "error"
+    },
+    {
+      "message": "reverse orphan scan is possible only when every requirement has KG anchor",
+      "passed": true,
+      "rule_id": "OOPTDD-R11",
+      "severity": "error"
+    },
+    {
+      "message": "log-free requirements need non_log_oracle: []",
+      "passed": true,
+      "rule_id": "OOPTDD-R12",
+      "severity": "error"
+    },
+    {
+      "message": "agent work units need a human-readable red spec and expected evidence",
+      "passed": true,
+      "rule_id": "OOPTDD-R13",
+      "severity": "error"
+    },
+    {
+      "message": "DONE can only mean green plus bound plus valid covered contract ids",
+      "passed": true,
+      "rule_id": "OOPTDD-R14",
+      "severity": "error"
+    }
+  ],
+  "methodology_ok": true,
+  "requirements": [
+    {
+      "binding": {
+        "blob_oid": "e5620026438896ffd3113ff45d880f1d2052b60f",
+        "bound": true,
+        "commit": "0106098f64465066eefd0d1e82be3a8990377672",
+        "emits": "payment_owner_auth_verified",
+        "kg_anchor": "ooptdd-payment333-owner-auth-20260715",
+        "line_range": [
+          75,
+          108
+        ],
+        "reason": "bound",
+        "remote": "ssh://lagyeongjun@bhgman.iptime.org/Users/lagyeongjun/CD/333",
+        "repo_relpath": "ooptdd/payment_conformance_adapter.py",
+        "sha256": "fe51e3d75da6329b",
+        "source_path": "payment_conformance_adapter.py",
+        "symbol": "run_payment_probe"
+      },
+      "bound": true,
+      "checks": [
+        {
+          "charged": true,
+          "event": "payment_owner_auth_verified",
+          "got": 1,
+          "grounding": "derived-self",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "bounded",
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {}
+        }
+      ],
+      "done": true,
+      "gate_ok": true,
+      "id": "REQ-PAY-OWNER-AUTH",
+      "mutation_ok": true,
+      "rca": null
+    },
+    {
+      "binding": {
+        "blob_oid": "e5620026438896ffd3113ff45d880f1d2052b60f",
+        "bound": true,
+        "commit": "0106098f64465066eefd0d1e82be3a8990377672",
+        "emits": "payment_restart_safety_verified",
+        "kg_anchor": "ooptdd-payment333-restart-lock-20260715",
+        "line_range": [
+          75,
+          108
+        ],
+        "reason": "bound",
+        "remote": "ssh://lagyeongjun@bhgman.iptime.org/Users/lagyeongjun/CD/333",
+        "repo_relpath": "ooptdd/payment_conformance_adapter.py",
+        "sha256": "fe51e3d75da6329b",
+        "source_path": "payment_conformance_adapter.py",
+        "symbol": "run_payment_probe"
+      },
+      "bound": true,
+      "checks": [
+        {
+          "charged": true,
+          "event": "payment_restart_safety_verified",
+          "got": 1,
+          "grounding": "derived-self",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "bounded",
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {}
+        }
+      ],
+      "done": true,
+      "gate_ok": true,
+      "id": "REQ-PAY-RESTART-LOCK",
+      "mutation_ok": true,
+      "rca": null
+    },
+    {
+      "binding": {
+        "blob_oid": "e5620026438896ffd3113ff45d880f1d2052b60f",
+        "bound": true,
+        "commit": "0106098f64465066eefd0d1e82be3a8990377672",
+        "emits": "payment_durable_reopen_verified",
+        "kg_anchor": "ooptdd-payment333-durable-reopen-20260715",
+        "line_range": [
+          75,
+          108
+        ],
+        "reason": "bound",
+        "remote": "ssh://lagyeongjun@bhgman.iptime.org/Users/lagyeongjun/CD/333",
+        "repo_relpath": "ooptdd/payment_conformance_adapter.py",
+        "sha256": "fe51e3d75da6329b",
+        "source_path": "payment_conformance_adapter.py",
+        "symbol": "run_payment_probe"
+      },
+      "bound": true,
+      "checks": [
+        {
+          "charged": true,
+          "event": "payment_durable_reopen_verified",
+          "got": 1,
+          "grounding": "derived-self",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "bounded",
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {}
+        }
+      ],
+      "done": true,
+      "gate_ok": true,
+      "id": "REQ-PAY-DURABLE-REOPEN",
+      "mutation_ok": true,
+      "rca": null
+    },
+    {
+      "binding": {
+        "blob_oid": "e5620026438896ffd3113ff45d880f1d2052b60f",
+        "bound": true,
+        "commit": "0106098f64465066eefd0d1e82be3a8990377672",
+        "emits": "payment_context_epoch_binding_verified",
+        "kg_anchor": "ooptdd-payment333-context-epoch-20260715",
+        "line_range": [
+          75,
+          108
+        ],
+        "reason": "bound",
+        "remote": "ssh://lagyeongjun@bhgman.iptime.org/Users/lagyeongjun/CD/333",
+        "repo_relpath": "ooptdd/payment_conformance_adapter.py",
+        "sha256": "fe51e3d75da6329b",
+        "source_path": "payment_conformance_adapter.py",
+        "symbol": "run_payment_probe"
+      },
+      "bound": true,
+      "checks": [
+        {
+          "charged": true,
+          "event": "payment_context_epoch_binding_verified",
+          "got": 1,
+          "grounding": "derived-self",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "bounded",
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {}
+        }
+      ],
+      "done": true,
+      "gate_ok": true,
+      "id": "REQ-PAY-CONTEXT-EPOCH",
+      "mutation_ok": true,
+      "rca": null
+    },
+    {
+      "binding": {
+        "blob_oid": "e5620026438896ffd3113ff45d880f1d2052b60f",
+        "bound": true,
+        "commit": "0106098f64465066eefd0d1e82be3a8990377672",
+        "emits": "payment_rotation_lock_fence_verified",
+        "kg_anchor": "ooptdd-payment333-rotation-lock-fence-20260715",
+        "line_range": [
+          75,
+          108
+        ],
+        "reason": "bound",
+        "remote": "ssh://lagyeongjun@bhgman.iptime.org/Users/lagyeongjun/CD/333",
+        "repo_relpath": "ooptdd/payment_conformance_adapter.py",
+        "sha256": "fe51e3d75da6329b",
+        "source_path": "payment_conformance_adapter.py",
+        "symbol": "run_payment_probe"
+      },
+      "bound": true,
+      "checks": [
+        {
+          "charged": true,
+          "event": "payment_rotation_lock_fence_verified",
+          "got": 1,
+          "grounding": "derived-self",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "bounded",
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {}
+        }
+      ],
+      "done": true,
+      "gate_ok": true,
+      "id": "REQ-PAY-ROTATION-LOCK-FENCE",
+      "mutation_ok": true,
+      "rca": null
+    },
+    {
+      "binding": {
+        "blob_oid": "e5620026438896ffd3113ff45d880f1d2052b60f",
+        "bound": true,
+        "commit": "0106098f64465066eefd0d1e82be3a8990377672",
+        "emits": "payment_rotation_escrow_continuity_verified",
+        "kg_anchor": "ooptdd-payment333-rotation-escrow-20260715",
+        "line_range": [
+          75,
+          108
+        ],
+        "reason": "bound",
+        "remote": "ssh://lagyeongjun@bhgman.iptime.org/Users/lagyeongjun/CD/333",
+        "repo_relpath": "ooptdd/payment_conformance_adapter.py",
+        "sha256": "fe51e3d75da6329b",
+        "source_path": "payment_conformance_adapter.py",
+        "symbol": "run_payment_probe"
+      },
+      "bound": true,
+      "checks": [
+        {
+          "charged": true,
+          "event": "payment_rotation_escrow_continuity_verified",
+          "got": 1,
+          "grounding": "derived-self",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "bounded",
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {}
+        }
+      ],
+      "done": true,
+      "gate_ok": true,
+      "id": "REQ-PAY-ROTATION-ESCROW",
+      "mutation_ok": true,
+      "rca": null
+    },
+    {
+      "binding": {
+        "blob_oid": "e5620026438896ffd3113ff45d880f1d2052b60f",
+        "bound": true,
+        "commit": "0106098f64465066eefd0d1e82be3a8990377672",
+        "emits": "payment_unified_lanes_supply_verified",
+        "kg_anchor": "ooptdd-payment333-unified-lanes-20260715",
+        "line_range": [
+          75,
+          108
+        ],
+        "reason": "bound",
+        "remote": "ssh://lagyeongjun@bhgman.iptime.org/Users/lagyeongjun/CD/333",
+        "repo_relpath": "ooptdd/payment_conformance_adapter.py",
+        "sha256": "fe51e3d75da6329b",
+        "source_path": "payment_conformance_adapter.py",
+        "symbol": "run_payment_probe"
+      },
+      "bound": true,
+      "checks": [
+        {
+          "charged": true,
+          "event": "payment_unified_lanes_supply_verified",
+          "got": 1,
+          "grounding": "derived-self",
+          "op": "==",
+          "optional": false,
+          "passed": true,
+          "pending": false,
+          "settled_at": null,
+          "strength": "bounded",
+          "verdict": "pend",
+          "want": 1,
+          "weight": 1.0,
+          "where": {}
+        }
+      ],
+      "done": true,
+      "gate_ok": true,
+      "id": "REQ-PAY-UNIFIED-LANES",
+      "mutation_ok": true,
+      "rca": null
+    }
+  ],
+  "runtime_revision": "11c2e1a9c42b29d3440b1c21e650a4021c2d590d",
+  "runtime_root": "/private/tmp/333-lakatotree-runtime/_vendor",
+  "schema": "payment333-ooptdd-receipt-v1",
+  "source_revision": "0106098f64465066eefd0d1e82be3a8990377672",
+  "spec": "/Users/gj3447/CD/AGENT/worktrees/prom4-payment-ooptdd-omd/ooptdd/payment_requirements.yaml",
+  "total": 7
+}
