@@ -342,7 +342,7 @@ impl MultiNodeBftHarness {
                             // KG: sprint4A-gap-B-fix-2026-04-15
                             outgoing.push((idx, bcast));
                         }
-                        ProcessResult::None | ProcessResult::ViewChange(_) => {}
+                        ProcessResult::None | ProcessResult::ViewChange(..) => {}
                     }
                 }
             }

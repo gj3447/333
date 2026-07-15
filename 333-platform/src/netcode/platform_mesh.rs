@@ -185,7 +185,7 @@ impl PlatformMesh {
                         ProcessResult::Broadcast(bcast) => {
                             outgoing.push((idx, bcast, false));
                         }
-                        ProcessResult::ViewChange(_) | ProcessResult::None => {}
+                        ProcessResult::ViewChange(..) | ProcessResult::None => {}
                     }
                 }
                 if committed.is_some() { break; }

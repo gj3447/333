@@ -18,6 +18,7 @@ export interface IWasmConsensus {
   pollSync: () => Promise<OutgoingMsg[]>;
   roomState: () => Promise<RoomConsensusState>;
   tryPropose: () => Promise<OutgoingMsg[]>;
+  bftTick: () => Promise<OutgoingMsg[]>;
   getPublicKey: () => Promise<string>;
   registerPeerKey: (nodeId: number, pubKeyHex: string) => Promise<boolean>;
 }
@@ -134,6 +135,13 @@ function createBridge(mod: any, nodeId: number, validatorIds: number[]): WasmBri
       const json = platform.try_propose();
       try { return JSON.parse(json) as OutgoingMsg[]; } catch { return []; }
     }, 'tryPropose'),
+
+    // KG: fix-333-pacemaker-unwired-2026-07-15 — drives the view-change timer.
+    // Must be called from the poll loop or a stalled leader is never replaced.
+    bftTick: () => exec.run(() => {
+      const json = platform.bft_tick();
+      try { return JSON.parse(json) as OutgoingMsg[]; } catch { return []; }
+    }, 'bftTick'),
 
     getPublicKey: () => exec.run(() => platform.get_public_key(), 'getPublicKey'),
 

@@ -12,7 +12,33 @@ use super::crypto::{sign_with_identity, NodeId, QuorumCert, ValidatorSet};
 use crate::crypto_real::Identity;
 use super::types::*;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+/// Milliseconds from a platform-appropriate clock.
+///
+/// `std::time::Instant::now()` panics on wasm32-unknown-unknown
+/// (`std::sys::time::unsupported` → "time not implemented on this platform"),
+/// which made `ViewChangeTracker::new` — and therefore the whole
+/// `Platform333` constructor — abort in the browser. Mirrors `hlc::now_ms`.
+///
+/// Wall-clock, not monotonic: an NTP step can make a view time out early or
+/// late. That costs a spurious view change (liveness hiccup), never safety —
+/// the safety rule is `locked_qc`, not this timer.
+///
+/// # KG: lesson-333-viewchange-instant-panics-on-wasm-2026-07-15
+fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+}
 
 /// View change timeout configuration
 #[derive(Debug, Clone)]
@@ -36,8 +62,8 @@ impl Default for ViewChangeConfig {
 #[derive(Debug)]
 pub struct ViewChangeTracker {
     config: ViewChangeConfig,
-    /// When the current view started
-    view_start: Instant,
+    /// When the current view started (ms from `now_ms`)
+    view_start_ms: u64,
     /// Current timeout duration (exponential backoff)
     current_timeout: Duration,
     /// Consecutive timeouts (for exponential backoff)
@@ -51,7 +77,7 @@ impl ViewChangeTracker {
         Self {
             current_timeout: config.base_timeout,
             config,
-            view_start: Instant::now(),
+            view_start_ms: now_ms(),
             consecutive_timeouts: 0,
             pending: HashMap::new(),
         }
@@ -59,7 +85,7 @@ impl ViewChangeTracker {
 
     /// Reset timer — call when entering a new view normally (no timeout)
     pub fn reset(&mut self) {
-        self.view_start = Instant::now();
+        self.view_start_ms = now_ms();
         self.consecutive_timeouts = 0;
         self.current_timeout = self.config.base_timeout;
         self.pending.clear();
@@ -67,7 +93,8 @@ impl ViewChangeTracker {
 
     /// Check if current view has timed out
     pub fn is_timed_out(&self) -> bool {
-        self.view_start.elapsed() >= self.current_timeout
+        let elapsed_ms = now_ms().saturating_sub(self.view_start_ms);
+        elapsed_ms >= self.current_timeout.as_millis() as u64
     }
 
     /// Called when a timeout occurs — prepares ViewChange message
@@ -77,7 +104,7 @@ impl ViewChangeTracker {
         self.current_timeout = self.config.max_timeout.min(
             self.config.base_timeout * 2u32.saturating_pow(self.consecutive_timeouts),
         );
-        self.view_start = Instant::now();
+        self.view_start_ms = now_ms();
 
         HotStuffMsg::ViewChange {
             new_view: current_view + 1,

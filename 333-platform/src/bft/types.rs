@@ -98,6 +98,13 @@ pub enum ProcessResult {
     /// Callers (bft_bridge, bft_multi_node) MUST broadcast the inner NewView message.
     /// # KG: taliban2-H1-fix-2026-04-15
     Committed(Vec<OrderedTx>, HotStuffMsg),
-    /// Need to change view (leader timeout)
-    ViewChange(u64),
+    /// Leader timed out — carries the new view AND the already-signed
+    /// ViewChange message that callers MUST broadcast.
+    ///
+    /// The message is carried rather than rebuilt by each caller for the same
+    /// reason `Committed` carries its NewView (`taliban2-H1-fix-2026-04-15`):
+    /// `on_timeout` already signed it and already applied the exponential
+    /// backoff, so a caller-side rebuild can silently diverge.
+    /// # KG: fix-333-tick-discards-signed-viewchange-2026-07-15
+    ViewChange(u64, HotStuffMsg),
 }

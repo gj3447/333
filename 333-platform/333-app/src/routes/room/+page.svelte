@@ -183,10 +183,16 @@
         try {
           const crdtOut = await wasm!.pollSync();
           const bftOut  = await wasm!.tryPropose();
+          // KG: fix-333-pacemaker-unwired-2026-07-15 — without this the
+          // view-change timer never fires and a dead leader stalls the room.
+          const tickOut = await wasm!.bftTick();
           const state   = await wasm!.roomState();
-          const allOut  = [...crdtOut, ...bftOut];
+          const allOut  = [...crdtOut, ...bftOut, ...tickOut];
           if (bftOut.length > 0) {
             console.warn('[333-bft] tryPropose emitted ' + bftOut.length + ' msg, channel=' + bftOut[0].channel + ' len=' + bftOut[0].payload.length);
+          }
+          if (tickOut.length > 0) {
+            console.warn('[333-bft] pacemaker fired — leader stalled, broadcasting ViewChange');
           }
           if (allOut.length > 0) sendOutgoing(allOut);
           consensusState = state;

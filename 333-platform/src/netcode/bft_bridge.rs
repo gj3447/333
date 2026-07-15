@@ -202,8 +202,11 @@ impl HotStuffCheckpointProvider {
                     // after receiving a vote that doesn't yet reach quorum.
                     // For n=1 quorum=1 this should never happen mid-pipeline.
                 }
-                ProcessResult::ViewChange(new_view) => {
-                    // TODO: wire viewchange::on_timeout for multi-peer timer
+                ProcessResult::ViewChange(new_view, _vc_msg) => {
+                    // TODO: wire viewchange::on_timeout for multi-peer timer.
+                    // _vc_msg is the signed ViewChange; this single-node (n=1,f=0)
+                    // bridge has no peers to broadcast it to, and tick() cannot fire
+                    // here anyway (a lone validator is always its own leader).
                     state.view = new_view;
                     state.phase = Phase::Prepare;
                     // Re-try proposal after view change

@@ -502,7 +502,10 @@ impl HotStuffState {
             let vc_msg = self.view_change_tracker.on_timeout(
                 self.view, self.node_id, self.high_qc.clone(), &self.identity,
             );
-            return ProcessResult::ViewChange(self.view + 1);
+            // Carry the signed message out — dropping it here is what made the
+            // pacemaker inert even where tick() was called.
+            // # KG: fix-333-tick-discards-signed-viewchange-2026-07-15
+            return ProcessResult::ViewChange(self.view + 1, vc_msg);
         }
         ProcessResult::None
     }
@@ -1262,7 +1265,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         let result = node.tick();
         assert!(
-            matches!(result, ProcessResult::ViewChange(_)),
+            matches!(result, ProcessResult::ViewChange(..)),
             "non-leader tick after timeout must produce ViewChange; got {:?}", result
         );
     }

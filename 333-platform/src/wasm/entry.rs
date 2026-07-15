@@ -236,14 +236,10 @@ impl Platform333 {
                     outgoing.push(out);
                 }
             }
-            ProcessResult::ViewChange(new_view) => {
-                use crate::bft::crypto::sign_with_identity;
-                let vc_msg = HotStuffMsg::ViewChange {
-                    new_view,
-                    sender: self.core.node_id,
-                    high_qc: self.core.consensus.high_qc.clone(),
-                    signature: sign_with_identity(self.core.node_id, new_view, &self.identity),
-                };
+            ProcessResult::ViewChange(_new_view, vc_msg) => {
+                // Use the ViewChange signed by on_timeout rather than rebuilding it,
+                // for the same reason Committed's NewView is reused above.
+                // # KG: fix-333-tick-discards-signed-viewchange-2026-07-15
                 if let Some(out) = self.encode_bft_msg(&vc_msg) {
                     outgoing.push(out);
                 }
@@ -309,6 +305,26 @@ impl Platform333 {
     pub fn try_propose(&mut self) -> String {
         if let Some(msg) = self.core.consensus.propose() {
             if let Some(out) = self.encode_bft_msg(&msg) {
+                return serde_json::to_string(&vec![out])
+                    .unwrap_or_else(|_| "[]".to_string());
+            }
+        }
+        "[]".to_string()
+    }
+
+    /// Drive the BFT pacemaker. Call from the same 200ms poll loop as
+    /// `try_propose`; returns ViewChange messages to broadcast (JSON array,
+    /// `[]` when the leader is healthy).
+    ///
+    /// Without this the view-change timer never advances, so a crashed or
+    /// stalled leader stalls every honest validator forever — `viewchange.rs`
+    /// promises "even if a leader crashes, the protocol makes progress", and
+    /// that promise is only kept if something calls tick.
+    /// # KG: fix-333-pacemaker-unwired-2026-07-15
+    pub fn bft_tick(&mut self) -> String {
+        use crate::bft::types::ProcessResult;
+        if let ProcessResult::ViewChange(_new_view, vc_msg) = self.core.consensus.tick() {
+            if let Some(out) = self.encode_bft_msg(&vc_msg) {
                 return serde_json::to_string(&vec![out])
                     .unwrap_or_else(|_| "[]".to_string());
             }
