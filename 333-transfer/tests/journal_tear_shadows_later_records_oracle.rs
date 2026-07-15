@@ -26,7 +26,8 @@ use transfer333::{
     SignedTransfer, SigningKey, Transfer, TransferPolicy,
 };
 
-const JOURNAL_MAGIC_LEN: usize = b"transfer333/journal/v2\0".len();
+const JOURNAL_MAGIC_LEN: usize = b"transfer333/journal/v4\0".len();
+const IDENTITY_LEN: usize = 32;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -88,7 +89,6 @@ fn append_raw(path: &std::path::Path, bytes: &[u8]) {
 }
 
 #[test]
-#[ignore = "RED: documents defect-333-journal-tear-shadows-later-records-2026-07-15 (P0). Un-ignore with the fix."]
 fn a_tear_must_not_shadow_records_written_after_it() {
     let (p, c, g) = (policy(), committee(), genesis());
     let path = temp_log("shadow");
@@ -97,9 +97,12 @@ fn a_tear_must_not_shadow_records_written_after_it() {
     let conflicting = t("carol", 0, 30);
     assert_ne!(first, conflicting, "the two orders contend for slot (alice, 0)");
 
-    // --- session 1: a power loss mid-append, before any vote landed ----------
+    // --- session 1: the journal is created and claimed, then a power loss ----
     {
-        let _journal = FileJournal::open(&path).expect("open"); // writes the magic
+        let journal = FileJournal::open(&path).expect("open");
+        // Constructing the authority binds the identity block, so the tear below
+        // lands in the record area rather than inside the header.
+        let _auth = Authority::with_journal("a0", key(0), p.clone(), c.id(), g.clone(), journal);
     }
     // ext4 `data=ordered`: i_size is replayed, the data blocks never land.
     append_raw(&path, &[0u8; 64]);
@@ -124,7 +127,7 @@ fn a_tear_must_not_shadow_records_written_after_it() {
     // The vote IS durable — the bytes are on disk.
     let on_disk = std::fs::read(&path).expect("read");
     assert!(
-        on_disk.len() > JOURNAL_MAGIC_LEN + 64,
+        on_disk.len() > JOURNAL_MAGIC_LEN + IDENTITY_LEN + 64,
         "the Locked record was written past the tear"
     );
 

@@ -231,28 +231,54 @@ pub fn encode_record(record: &JournalRecord) -> Vec<u8> {
 /// Known limitation: without a chained hash this cannot detect corruption that
 /// destroys a frame *and* everything after it. Append-plus-fsync makes that
 /// shape unreachable in practice, but it is not proven away.
-pub fn decode_records(mut bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> {
+pub fn decode_records(bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> {
+    Ok(scan(bytes)?.0)
+}
+
+/// Byte length of the leading run of complete, checksum-valid frames.
+///
+/// Everything past it is a torn tail: bytes an `append` was still writing when
+/// the machine died, which therefore never became durable and never carried a
+/// decision anywhere. Callers truncate there.
+///
+/// This is deliberately *not* "everything decode_records could not read". A
+/// complete frame with a bad checksum is corruption, not a tear — [`scan`]
+/// propagates it as an error, because silently cutting there would discard
+/// durable records that follow.
+pub fn good_prefix_len(bytes: &[u8]) -> Result<usize, JournalError> {
+    Ok(scan(bytes)?.1)
+}
+
+/// Single parser behind [`decode_records`] and [`good_prefix_len`].
+///
+/// Returns the records and the offset where scanning stopped — the start of a
+/// torn tail, or `bytes.len()` when every byte belonged to a complete frame.
+/// Keeping one parser is the point: two would drift, and the whole safety
+/// argument rests on "where the log ends" having exactly one answer.
+fn scan(bytes: &[u8]) -> Result<(Vec<JournalRecord>, usize), JournalError> {
     let mut out = Vec::new();
-    while !bytes.is_empty() {
+    let mut rest = bytes;
+    let mut good = 0usize;
+    while !rest.is_empty() {
         // Torn header: fewer bytes than one frame header.
-        if bytes.len() < HEADER_LEN {
+        if rest.len() < HEADER_LEN {
             break;
         }
-        let tag = bytes[0];
+        let tag = rest[0];
         // Zero-filled tail (or any reserved tag): not a record.
         if tag == TAG_TORN {
             break;
         }
-        let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+        let len = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
         if len > MAX_RECORD_BYTES {
             return Err(JournalError::Corrupt(format!("record too large: {len}")));
         }
-        let crc = [bytes[5], bytes[6], bytes[7], bytes[8]];
+        let crc = [rest[5], rest[6], rest[7], rest[8]];
         // Torn body.
-        if bytes.len() < HEADER_LEN + len {
+        if rest.len() < HEADER_LEN + len {
             break;
         }
-        let body = &bytes[HEADER_LEN..HEADER_LEN + len];
+        let body = &rest[HEADER_LEN..HEADER_LEN + len];
         if frame_crc(tag, body) != crc {
             return Err(JournalError::Corrupt(
                 "frame checksum mismatch: complete frame with bad data".into(),
@@ -264,9 +290,10 @@ pub fn decode_records(mut bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalErr
             TAG_SNAPSHOT => JournalRecord::Snapshot(decode_snapshot(body)?),
             other => return Err(JournalError::Corrupt(format!("unknown tag: {other}"))),
         });
-        bytes = &bytes[HEADER_LEN + len..];
+        rest = &rest[HEADER_LEN + len..];
+        good += HEADER_LEN + len;
     }
-    Ok(out)
+    Ok((out, good))
 }
 
 
@@ -491,7 +518,49 @@ mod file {
                 file.sync_data()
                     .map_err(|e| JournalError::Io(format!("sync magic: {e}")))?;
             }
-            Ok(Self { path, file, identity: None })
+            let me = Self { path, file, identity: None };
+            if existed {
+                me.truncate_torn_tail()?;
+            }
+            Ok(me)
+        }
+
+        /// Cut a torn tail off before anything can append past it.
+        ///
+        /// Replay stops at a tear; `append` writes at EOF. Left alone the two
+        /// disagree about where the log ends, and a record written after a tear
+        /// is durable but unreachable forever. For a `Locked` record that is the
+        /// crash-restart equivocation this journal exists to prevent: the
+        /// authority forgets it voted and signs a second order for the slot.
+        /// Truncating here gives "the end of the log" one answer.
+        ///
+        /// Only a tear is cut. A complete frame with a bad checksum is
+        /// corruption — [`good_prefix_len`] raises it rather than letting us
+        /// discard durable records behind it.
+        ///
+        /// Idempotent, and safe to lose: a crash before the new length is
+        /// durable just leaves the tear for the next open to cut again.
+        fn truncate_torn_tail(&self) -> Result<(), JournalError> {
+            let body = self.read_body()?;
+            // A corrupt log is `recover`'s to report, not `open`'s. Swallowing the
+            // error here keeps `open`'s contract (it validates the header, not the
+            // whole log) and leaves the bytes untouched for the replay to fail
+            // closed on, exactly as before. We are only here to cut a tear.
+            let Ok(good) = good_prefix_len(&body) else {
+                return Ok(());
+            };
+            if good == body.len() {
+                return Ok(());
+            }
+            let keep = (JOURNAL_MAGIC.len() + IDENTITY_LEN + good) as u64;
+            self.file
+                .set_len(keep)
+                .map_err(|e| JournalError::Io(format!("truncate torn tail: {e}")))?;
+            // The size change is metadata, so sync_all rather than sync_data.
+            self.file
+                .sync_all()
+                .map_err(|e| JournalError::Io(format!("sync truncation: {e}")))?;
+            Ok(())
         }
 
         pub fn path(&self) -> &Path {

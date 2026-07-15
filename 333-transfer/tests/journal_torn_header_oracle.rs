@@ -28,8 +28,12 @@ use transfer333::{
     SignedTransfer, SigningKey, Transfer, TransferPolicy,
 };
 
-const JOURNAL_MAGIC_LEN: usize = b"transfer333/journal/v1\0".len();
-const HEADER_LEN: usize = 5; // 1 tag + 4 big-endian length
+const JOURNAL_MAGIC_LEN: usize = b"transfer333/journal/v4\0".len();
+const IDENTITY_LEN: usize = 32;
+/// `tag(1) || len(4, BE) || crc(4, BE)`
+const HEADER_LEN: usize = 9;
+/// Records start after the magic and the identity block.
+const RECORDS_START: usize = JOURNAL_MAGIC_LEN + IDENTITY_LEN;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -86,7 +90,6 @@ fn temp_log(tag: &str) -> std::path::PathBuf {
 ///
 /// Same event, same "never became durable" prefix, opposite outcomes.
 #[test]
-#[ignore = "RED: documents defect-333-journal-tolerates-only-one-torn-tail-shape-2026-07-15 (P2). Un-ignore with the fix."]
 fn decode_torn_header_is_inconsistent_with_torn_body() {
     let frame = encode_record(&JournalRecord::Locked(t("bob", 0, 30)));
     assert!(
@@ -123,7 +126,6 @@ fn decode_torn_header_is_inconsistent_with_torn_body() {
 /// tail parses as a well-formed, zero-length `Locked` frame rather than as the
 /// torn tail it is. There is no per-record checksum to catch it.
 #[test]
-#[ignore = "RED: documents defect-333-journal-tolerates-only-one-torn-tail-shape-2026-07-15 (P2). Un-ignore with the fix."]
 fn decode_tolerates_a_zero_filled_tail() {
     let mut body = encode_record(&JournalRecord::Locked(t("bob", 0, 30)));
     let good = decode_records(&body).expect("baseline decodes");
@@ -150,7 +152,6 @@ fn decode_tolerates_a_zero_filled_tail() {
 /// This is the reachable consequence — `Authority::recover` is what
 /// `node authority --journal <path>` calls at startup.
 #[test]
-#[ignore = "RED: documents defect-333-journal-tolerates-only-one-torn-tail-shape-2026-07-15 (P2). Un-ignore with the fix."]
 fn recover_survives_a_torn_header() {
     let (p, c, g) = (policy(), committee(), genesis());
     let path = temp_log("recover");
@@ -162,13 +163,15 @@ fn recover_survives_a_torn_header() {
         auth.handle(&t("bob", 0, 30)).expect("vote");
     }
 
-    // Power loss after 2 of the record's 5 header bytes reached the platter.
+    // Power loss after 2 of the record's 9 header bytes reached the platter.
+    // The cut must land in the *record* area: the identity block ahead of it is
+    // a separate header whose own tear is `read_identity`'s to reject.
     let bytes = std::fs::read(&path).expect("read");
     assert!(
-        bytes.len() > JOURNAL_MAGIC_LEN + HEADER_LEN,
-        "log must hold magic + a full frame"
+        bytes.len() > RECORDS_START + HEADER_LEN,
+        "log must hold magic + identity + a full frame"
     );
-    std::fs::write(&path, &bytes[..JOURNAL_MAGIC_LEN + 2]).expect("truncate");
+    std::fs::write(&path, &bytes[..RECORDS_START + 2]).expect("truncate");
 
     let journal = FileJournal::open(&path).expect("reopen");
     let recovered = Authority::recover("a0", key(0), p, c.id(), g, journal);
