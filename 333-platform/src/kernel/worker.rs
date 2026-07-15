@@ -130,6 +130,23 @@ impl WorkerQueue {
                 // unwind the whole tick loop or leak its in_flight entry. Catch the
                 // unwind, clean up, and map the panic to a Failed outcome so the
                 // kernel and the other queued jobs survive.
+                //
+                // NATIVE ONLY. On wasm32-unknown-unknown this catches nothing:
+                // the target spec hard-codes `"panic-strategy": "abort"`, so a
+                // panic traps the instance instead of unwinding and control never
+                // returns here. `-C panic=unwind` does not opt out — it fails to
+                // build ("the crate `panic_unwind` does not have the panic strategy
+                // `unwind`"), and the `panic = "abort"` line in [profile.release] is
+                // not the cause; removing it changes nothing but binary size.
+                // Measured 2026-07-15: a panicking job traps the wasm instance and
+                // every later call on it fails, in BOTH dev and release profiles.
+                //
+                // So in the browser the real contract is the job signature, not this
+                // guard: a job MUST report failure as `Err`, never by panicking.
+                // Genuine wasm panic isolation needs a process boundary (run the
+                // platform in a Web Worker and respawn it), which is architectural
+                // and deliberately out of scope here.
+                // # KG: lesson-333-catch-unwind-inert-on-wasm-2026-07-15
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.work)()));
                 self.in_flight.remove(&job.id);
 

@@ -78,6 +78,10 @@ wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", 
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
+# Not what disables worker.rs's catch_unwind — wasm32-unknown-unknown's target spec
+# already hard-codes "panic-strategy": "abort", and `-C panic=unwind` does not build
+# on it. Removing this line would grow the binary and restore no isolation.
+# # KG: lesson-333-catch-unwind-inert-on-wasm-2026-07-15
 panic = "abort"
 strip = "symbols"
 debug = false

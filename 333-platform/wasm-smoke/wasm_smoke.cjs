@@ -68,5 +68,16 @@ check('bft_tick emits a signed ViewChange after the leader stalls', () => {
   if (out[0].channel !== 'bft') throw new Error('wrong channel: ' + out[0].channel);
 });
 
+// 5. The kernel tick must survive being driven — this is the supported path.
+//    Note the contract it does NOT have: catch_unwind in worker.rs is inert here,
+//    because wasm32-unknown-unknown's target spec forces "panic-strategy": "abort".
+//    A job that panics traps the whole instance; a job must report failure as Err.
+//    Documented so nobody re-reads worker.rs's comment as a browser guarantee.
+//    # KG: lesson-333-catch-unwind-inert-on-wasm-2026-07-15
+check('tick_kernel runs without trapping the instance', () => {
+  p.tick_kernel(4);
+  if (typeof p.kernel_healthy() !== 'boolean') throw new Error('kernel unreadable after tick');
+});
+
 console.log(failed === 0 ? '\nall passed' : '\n' + failed + ' FAILED');
 process.exit(failed === 0 ? 0 : 1);
