@@ -1,0 +1,159 @@
+{
+  "schema_version": "engine-spec/v1",
+  "name": "transfer333-owner-authorized-certification",
+  "purpose": "Make a policy-bound owner signature plus executable account-state preflight the only path into the Byzantine-safe authority certification rail, and settle certificates without splitting authority balance from sequence state.",
+  "decision": {
+    "verdict": "engine",
+    "current_consumers": [
+      "transfer333 node authority adapter",
+      "in-memory AuthorityNet mesh",
+      "TCP AuthorityNet mesh",
+      "certificate-verifying ledger replicas"
+    ],
+    "planned_consumers": [
+      "durable authority service"
+    ],
+    "fit_evidence": [
+      "All authority transports require the same owner-authentication and account-slot admission semantics.",
+      "The immutable owner roster and network identity are verifier-owned trust roots shared by authorities, collectors, and ledger replicas."
+    ],
+    "alternatives_considered": [
+      "Trust a caller-supplied public key, rejected because it does not bind the string AccountId to its owner.",
+      "Immediately replace AccountId with a self-certifying NodeId, deferred because it would combine the security fix with a repository-wide identity migration."
+    ]
+  },
+  "boundary": {
+    "owns": "Owner-proof validation, policy/network binding, canonical genesis arithmetic, authority account balance and sequence, pending-slot admission, vote validation, certificate proof validation, and atomic in-memory settlement",
+    "mechanism": "Validate a SignedTransfer, preflight sender existence/positive amount/sequence/balance before locking, then atomically apply a trusted certificate to authority balance and sequence together",
+    "policy_outside": [
+      "Account naming and key-rotation governance",
+      "Genesis allocation and monetary policy",
+      "User-interface account aliases"
+    ],
+    "non_goals": [
+      "Durable authority recovery in this slice",
+      "Rolling interoperability with unsigned wire v1",
+      "Replacing the legacy local-credit Replica rail"
+    ],
+    "state_authority": "Each authority is the single writer for its local per-account balance, next sequence, and first-seen pending slot"
+  },
+  "model": {
+    "resources": [
+      "immutable account-to-owner-key binding",
+      "network-and-asset domain identifier",
+      "policy and committee fingerprints",
+      "authority-local account balance",
+      "per-account sequence slot",
+      "authority committee vote"
+    ],
+    "work_units": [
+      "SignedTransfer order",
+      "Vote",
+      "Certificate"
+    ]
+  },
+  "state_model": "A stateless owner/policy-authentication gate precedes a per-account FSM whose executable state is (balance, next sequence, pending order); confirmation changes balance and sequence in one authority-local commit or changes neither.",
+  "protocol": {
+    "commands": [
+      "SubmitSignedTransfer",
+      "ConfirmCertificate"
+    ],
+    "events": [
+      "OwnerIntentRejected",
+      "StatePreflightRejected",
+      "AuthorityVoteCast",
+      "TransferCertified",
+      "CertificateApplied"
+    ],
+    "effects": [
+      "BroadcastVote",
+      "BroadcastCertificate"
+    ],
+    "versioning": "Signed order, vote, and certificate wire domains use v2, authority vote signatures use alias-bound domain v4, and unsigned v1 fails closed; mixed-cohort rolling upgrade is not promised."
+  },
+  "invariants": [
+    "No owner-authentication failure may create a vote, advance a sequence, mutate a ledger, or occupy a slot lock.",
+    "No unknown-sender, zero-amount, insufficient-balance, or out-of-order order may create a vote or occupy a pending slot.",
+    "Certificate settlement updates an authority's sender balance, recipient balance, and sender sequence together; execution failure consumes no sequence.",
+    "Duplicate genesis accounts, overflowing total supply, recipient balance overflow, and sequence overflow are rejected before any ledger mutation or authority vote.",
+    "The sender AccountId is bound to a verifier-owned Ed25519 key, never a caller-supplied key.",
+    "The sender, recipient, network id, sequence, and amount are all covered by the owner signature.",
+    "A certificate is valid only when its owner proof and a distinct authority quorum both validate for the same policy, committee, network, and transfer.",
+    "One authority public key may occupy exactly one committee identity, and the authority alias is covered by every vote signature.",
+    "Invalid votes are verified before collector deduplication and cannot poison a signer slot."
+  ],
+  "ports": [
+    "AuthorityNet",
+    "OwnerKeyStore",
+    "AuthorityKeyStore"
+  ],
+  "runtime": {
+    "ordering": "Owner/policy authentication is evaluated before pending-slot inspection; sender existence, positive amount, exact sequence, and sufficient balance are evaluated before a new lock.",
+    "concurrency": "Different account slots may proceed independently; commands for one account are serialized by sequence and slot ownership.",
+    "backpressure": "The authentication kernel owns no queue; the existing transport remains unbounded and must gain bounded ingress before production promotion.",
+    "cancellation": "Certification collection is bounded by caller-supplied rounds; cancellation beyond process termination is outside this slice.",
+    "timeouts": "TCP collection uses a bounded round count and pause; exhaustion emits a structured certification failure."
+  },
+  "durability": {
+    "persistence": "None in this slice; authority locks and ledger state remain in memory and restart safety is not promised.",
+    "atomic_commit": "No durable commit exists in this slice; pending admission and certificate settlement are in-memory single-writer transitions, and a failed settlement does not advance sequence independently of balance.",
+    "recovery": "Process restart rebuilds only configured trust roots and genesis; WAL and snapshot recovery are the next engine slice.",
+    "effect_idempotency": "Owner and authority signatures are deterministic, votes are deduplicated after verification, and replayed old certificates return AlreadyApplied without a second debit or sequence increment.",
+    "migration": "All node processes must move to wire v2 as one cohort; unsigned v1 orders are rejected by domain mismatch."
+  },
+  "failure_model": [
+    "Wrong network, unknown sender, unknown recipient, and invalid owner signature are permanent rejections with no mutation.",
+    "Unknown authority-ledger sender, zero amount, and insufficient balance are permanent preflight rejections with no pending lock or vote.",
+    "Duplicate authority keys and invalid canonical genesis allocations fail during configuration before network startup.",
+    "Sequence or recipient-balance arithmetic overflow is a permanent preflight rejection with no pending lock, vote, debit, credit, or sequence advance.",
+    "Out-of-order and equivocation remain typed authority rejections after owner authentication.",
+    "Malformed or oversized length-prefixed wire fields and certificate vote counts are rejected before field allocation or state mutation.",
+    "Sub-quorum collection exhausts into an observable Certified::Failed outcome."
+  ],
+  "observability": {
+    "traces": [
+      "Owner-auth rejection, state-preflight rejection, vote cast, certificate result, and ledger application carry a SHA-256 order identity without secret keys or signature bytes."
+    ],
+    "metrics": [
+      "Owner-auth and state-preflight rejection counts, votes accepted, invalid votes dropped, quorum failures, and certificate applications."
+    ],
+    "redaction": "Secret seeds, private-key bytes, and full signatures are never emitted; public account ids and rejection classes are allowed."
+  },
+  "security": [
+    "Owner and authority signatures use separate domain tags.",
+    "PolicyId binds NetworkId and the sorted owner roster; CommitteeId additionally binds the sorted authority roster, and both are covered by the relevant signatures.",
+    "Committee construction rejects duplicate authority aliases and duplicate public keys; authority aliases are length-prefixed into the authority signature preimage.",
+    "NetworkId is an operator-assigned deployment/genesis/asset epoch name and must never be reused for a different genesis.",
+    "Committee configuration contains public keys only; secret-key loading is separate and explicit.",
+    "The test-only deterministic seed path is named dev-seed and is not a production credential format."
+  ],
+  "verification": [
+    "A forged owner order arriving first gets zero votes and does not poison the valid owner's same slot.",
+    "A correctly signed overspend, zero amount, or registered-but-unfunded sender gets zero votes and does not consume the valid owner's same sequence.",
+    "Changing sender, recipient, sequence, amount, or network after signing invalidates the order.",
+    "A bad owner proof cannot become Verified even when authority signatures are otherwise valid, and a Verified value is branded by CommitteeId at application.",
+    "A vote signature copied from one authority alias to another is rejected, and a committee containing two aliases for one physical public key is unconstructible.",
+    "Duplicate genesis accounts and total-supply overflow fail construction; recipient-balance or sequence overflow returns a typed error before any ledger or pending-slot mutation.",
+    "Signed order, vote, and certificate v2 round-trip over the wire while unsigned v1 fails closed.",
+    "The real four-authority TCP harness rejects an impersonator before accepting the legitimate owner."
+  ],
+  "implementation_slices": [
+    "OwnerRegistry, NetworkId, PolicyId, SignedTransfer, and owner-domain canonical bytes",
+    "CommitteeId-bound votes, authority auth/state-preflight-before-lock, and self-contained certificate validation",
+    "Authority-local balance/sequence settlement with typed no-advance failures",
+    "Alias-bound authority signature preimages, duplicate-key committee rejection, and checked genesis and settlement arithmetic",
+    "Wire v2 and verified-before-dedup collectors",
+    "Public-key rosters plus separate authority and owner secret loading",
+    "Forge-first multi-process OOPTDD conformance"
+  ],
+  "falsifiers": [
+    "Any unsigned network Order reaches Authority::handle.",
+    "A wrong-key Alice order produces one authority vote or prevents a later valid Alice order at the same sequence.",
+    "A signed overspend forms a certificate, occupies a pending slot, or advances authority sequence while its balance debit fails.",
+    "A certificate validates without independently validating the owner proof.",
+    "A vote or Verified value created for one policy or committee is accepted under another trust domain.",
+    "One physical Ed25519 authority key counts as multiple authority aliases toward quorum.",
+    "Any genesis, balance, or sequence arithmetic overflow panics, wraps, emits a vote, or partially mutates ledger or pending-slot state.",
+    "A committee roster value can be used to reconstruct an authority private key."
+  ]
+}

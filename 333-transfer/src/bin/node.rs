@@ -14,9 +14,11 @@ use std::thread;
 use std::time::Duration;
 
 use transfer333::{
-    Authority, AuthorityError, AuthorityMsg, AuthorityNet, Certified, Committee, Ledger,
-    SigningKey, TcpAuthorityNet, Transfer, VoteCollector,
+    Authority, AuthorityError, AuthorityMsg, AuthorityNet, Certified, Committee, ConfirmError,
+    ConfirmOutcome, Ledger, NetworkId, OwnerAuthError, OwnerRegistry, SignedTransfer, SigningKey,
+    TcpAuthorityNet, Transfer, TransferPolicy, VerifyingKey, VoteCollector,
 };
+use zeroize::Zeroizing;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -46,8 +48,12 @@ fn main() -> ExitCode {
 fn usage() {
     eprintln!(
         "usage:
-  node authority --id <a0> --seed <0> --listen <127.0.0.1:PORT> --peers <addr,addr,...> --committee a0=0,a1=1,... [--genesis alice=100,bob=0] [--rounds-idle-exit <n>]
-  node submit --seed <99> --listen <127.0.0.1:PORT> --peers <authority_addrs,...> --committee a0=0,... --transfer <alice:0:bob:30> [--max-rounds 200] [--pause-ms 10]"
+  node authority --id <a0> (--key-file <hex-key-file> | --dev-seed <0>) --network-id <deployment> --owner-roster alice=<pubhex>,bob=<pubhex> --listen <127.0.0.1:PORT> --peers <addr,addr,...> --committee a0=<pubhex>,a1=<pubhex>,... [--genesis alice=100,bob=0] [--rounds-idle-exit <n>]
+  node submit (--key-file <hex-key-file> | --dev-seed <42>) --network-id <deployment> --owner-roster alice=<pubhex>,bob=<pubhex> --listen <127.0.0.1:PORT> --peers <authority_addrs,...> --committee a0=<pubhex>,... --transfer <alice:0:bob:30> [--max-rounds 200] [--pause-ms 10]
+
+`--dev-seed` is deterministic debug-build scaffolding only and is rejected by
+release builds. Production rosters contain public keys; private authority/owner
+keys are loaded separately."
     );
 }
 
@@ -114,6 +120,14 @@ fn transfer_str(t: &Transfer) -> String {
     format!("{}:{}:{}:{}", t.from, t.from_seq, t.to, t.amount)
 }
 
+fn order_id_hex(order: &SignedTransfer) -> String {
+    order
+        .order_id()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn balances_json(ledger: &Ledger) -> String {
     let mut parts = Vec::new();
     for (id, bal) in ledger.balances() {
@@ -131,31 +145,101 @@ fn emit(obj: &str) {
 
 // --- shared parsers ----------------------------------------------------------
 
-fn parse_seed(s: &str) -> Result<u8, String> {
+#[cfg(debug_assertions)]
+fn parse_dev_seed(s: &str) -> Result<u8, String> {
     s.parse::<u8>()
         .map_err(|_| format!("invalid seed (need u8 0..255): {s}"))
 }
 
-fn signing_key_from_seed(seed: u8) -> SigningKey {
+#[cfg(debug_assertions)]
+fn signing_key_from_dev_seed(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-/// `a0=0,a1=1,a2=2,a3=3` → Committee with deterministic keys.
-fn parse_committee(s: &str) -> Result<Committee, String> {
+fn decode_hex_32(s: &str, label: &str) -> Result<[u8; 32], String> {
+    if s.len() != 64 || !s.is_ascii() {
+        return Err(format!("{label} must be exactly 64 hexadecimal characters"));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("{label} contains non-hexadecimal characters"))?;
+    }
+    Ok(out)
+}
+
+fn parse_verifying_key(s: &str, label: &str) -> Result<VerifyingKey, String> {
+    VerifyingKey::from_bytes(&decode_hex_32(s, label)?)
+        .map_err(|_| format!("{label} is not a valid Ed25519 public key"))
+}
+
+fn load_signing_key(flags: &Flags) -> Result<SigningKey, String> {
+    match (flags.get("key-file"), flags.get("dev-seed")) {
+        (Some(_), Some(_)) => Err("use exactly one of --key-file or --dev-seed".into()),
+        (None, None) => Err("missing --key-file (or test-only --dev-seed)".into()),
+        (Some(path), None) => {
+            let encoded = Zeroizing::new(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read --key-file: {e}"))?,
+            );
+            let bytes = Zeroizing::new(decode_hex_32(
+                encoded.trim(),
+                "private key file",
+            )?);
+            Ok(SigningKey::from_bytes(&bytes))
+        }
+        (None, Some(seed)) => {
+            #[cfg(debug_assertions)]
+            {
+                Ok(signing_key_from_dev_seed(parse_dev_seed(seed)?))
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                let _ = seed;
+                Err("--dev-seed is disabled in release builds; use --key-file".into())
+            }
+        }
+    }
+}
+
+/// Public-key-only authority roster. Private seeds never appear in this value.
+fn parse_committee(s: &str, policy: TransferPolicy) -> Result<Committee, String> {
     let mut members = Vec::new();
     for part in s.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        let (id, seed_s) = part
+        let (id, public_hex) = part
             .split_once('=')
-            .ok_or_else(|| format!("bad committee entry (want id=seed): {part}"))?;
-        let seed = parse_seed(seed_s.trim())?;
-        let sk = signing_key_from_seed(seed);
-        members.push((id.trim().to_string(), sk.verifying_key()));
+            .ok_or_else(|| format!("bad committee entry (want id=public-key-hex): {part}"))?;
+        let id = id.trim().to_string();
+        let key = parse_verifying_key(public_hex.trim(), "committee public key")?;
+        members.push((id, key));
     }
-    Committee::new(members).ok_or_else(|| "empty committee".into())
+    Committee::new(members, policy).ok_or_else(|| "empty or duplicate committee".into())
+}
+
+/// `alice=<pubhex>,bob=<pubhex>` → immutable verifier-owned alias bindings.
+fn parse_owner_roster(s: &str) -> Result<OwnerRegistry, String> {
+    let mut owners = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (account, public_hex) = part
+            .split_once('=')
+            .ok_or_else(|| format!("bad owner entry (want account=public-key-hex): {part}"))?;
+        let account = account.trim().to_string();
+        let key = parse_verifying_key(public_hex.trim(), "owner public key")?;
+        owners.push((account, key));
+    }
+    OwnerRegistry::new(owners).map_err(|e| format!("invalid owner roster: {e:?}"))
+}
+
+fn parse_network_id(s: &str) -> Result<NetworkId, String> {
+    NetworkId::new(s).map_err(|e| format!("invalid --network-id: {e:?}"))
 }
 
 /// `alice=100,bob=0`
@@ -178,7 +262,7 @@ fn parse_genesis(s: &str) -> Result<Ledger, String> {
     if alloc.is_empty() {
         return Err("empty genesis".into());
     }
-    Ok(Ledger::genesis(alloc))
+    Ledger::try_genesis(alloc).map_err(|e| format!("invalid genesis: {e:?}"))
 }
 
 /// `alice:0:bob:30`
@@ -231,12 +315,15 @@ fn run_authority(args: &[String]) -> Result<(), String> {
         e
     })?;
     let id = flags.require("id")?.to_string();
-    let seed = parse_seed(flags.require("seed")?)?;
+    let signing_key = load_signing_key(&flags)?;
+    let network_id = parse_network_id(flags.require("network-id")?)?;
+    let owners = parse_owner_roster(flags.require("owner-roster")?)?;
+    let policy = TransferPolicy::new(network_id, owners);
     let listen = parse_listen(flags.require("listen")?)?;
     let peers = parse_peers(flags.require("peers")?)?;
-    let committee = parse_committee(flags.require("committee")?)?;
+    let committee = parse_committee(flags.require("committee")?, policy.clone())?;
     let genesis_s = flags.get("genesis").unwrap_or("alice=100,bob=0");
-    let mut ledger = parse_genesis(genesis_s)?;
+    let ledger = parse_genesis(genesis_s)?;
     let idle_exit: Option<usize> = match flags.get("rounds-idle-exit") {
         Some(s) => Some(
             s.parse()
@@ -245,12 +332,18 @@ fn run_authority(args: &[String]) -> Result<(), String> {
         None => None,
     };
 
-    let mut auth = Authority::new(id.clone(), signing_key_from_seed(seed));
+    let mut auth = Authority::new(
+        id.clone(),
+        signing_key,
+        policy,
+        committee.id(),
+        ledger,
+    );
     // Public key must match committee entry for this id.
     if let Some(expected) = committee.key_of(&id) {
         if auth.verifying_key() != *expected {
             return Err(format!(
-                "authority --id {id} --seed {seed} does not match --committee key"
+                "authority --id {id} private key does not match --committee public key"
             ));
         }
     } else {
@@ -310,15 +403,17 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                     Ok(vote) => {
                         let _ = endpoint.broadcast_vote(vote);
                         emit(&format!(
-                            "{{\"event\":\"vote_cast\",\"transfer\":\"{}\",\"authority\":\"{}\"}}",
-                            escape_json(&transfer_str(&t)),
+                            "{{\"event\":\"vote_cast\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\"}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
                             escape_json(&id)
                         ));
                     }
                     Err(AuthorityError::Equivocation { account, seq }) => {
                         emit(&format!(
-                            "{{\"event\":\"equivocation_rejected\",\"transfer\":\"{}\",\"authority\":\"{}\",\"account\":\"{}\",\"seq\":{}}}",
-                            escape_json(&transfer_str(&t)),
+                            "{{\"event\":\"equivocation_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"account\":\"{}\",\"seq\":{}}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
                             escape_json(&id),
                             escape_json(&account),
                             seq
@@ -330,32 +425,116 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                         got,
                     }) => {
                         emit(&format!(
-                            "{{\"event\":\"out_of_order\",\"transfer\":\"{}\",\"authority\":\"{}\",\"account\":\"{}\",\"expected\":{},\"got\":{}}}",
-                            escape_json(&transfer_str(&t)),
+                            "{{\"event\":\"out_of_order\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"account\":\"{}\",\"expected\":{},\"got\":{},\"balances\":{},\"total_supply\":{}}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
                             escape_json(&id),
                             escape_json(&account),
                             expected,
-                            got
+                            got,
+                            balances_json(auth.ledger()),
+                            auth.ledger().total_supply()
+                        ));
+                    }
+                    Err(AuthorityError::OwnerAuth(error)) => {
+                        let reason = match error {
+                            OwnerAuthError::WrongNetwork { .. } => "wrong_network",
+                            OwnerAuthError::WrongPolicy { .. } => "wrong_policy",
+                            OwnerAuthError::UnknownSender { .. } => "unknown_sender",
+                            OwnerAuthError::UnknownRecipient { .. } => "unknown_recipient",
+                            OwnerAuthError::InvalidOwnerSignature { .. } => {
+                                "invalid_owner_signature"
+                            }
+                        };
+                        emit(&format!(
+                            "{{\"event\":\"owner_auth_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"{}\"}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id),
+                            reason
+                        ));
+                    }
+                    Err(AuthorityError::UnknownSender { account }) => {
+                        emit(&format!(
+                            "{{\"event\":\"state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"unknown_sender\",\"account\":\"{}\"}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id),
+                            escape_json(&account)
+                        ));
+                    }
+                    Err(AuthorityError::ZeroAmount) => {
+                        emit(&format!(
+                            "{{\"event\":\"state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"zero_amount\"}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id)
+                        ));
+                    }
+                    Err(AuthorityError::InsufficientBalance { account, have, need }) => {
+                        emit(&format!(
+                            "{{\"event\":\"state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"insufficient_balance\",\"account\":\"{}\",\"have\":{},\"need\":{}}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id),
+                            escape_json(&account),
+                            have,
+                            need
+                        ));
+                    }
+                    Err(AuthorityError::SequenceExhausted { account }) => {
+                        emit(&format!(
+                            "{{\"event\":\"state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"sequence_exhausted\",\"account\":\"{}\"}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id),
+                            escape_json(&account)
+                        ));
+                    }
+                    Err(AuthorityError::BalanceOverflow {
+                        account,
+                        have,
+                        credit,
+                    }) => {
+                        emit(&format!(
+                            "{{\"event\":\"state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"balance_overflow\",\"account\":\"{}\",\"have\":{},\"credit\":{}}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id),
+                            escape_json(&account),
+                            have,
+                            credit
                         ));
                     }
                 },
                 AuthorityMsg::Cert(c) => {
                     if let Some(v) = c.verify(&committee) {
-                        // Double delivery is possible under full-mesh + accept-as-write;
-                        // only emit on successful apply. confirm is monotonic/idempotent.
-                        match ledger.apply_verified(&v) {
-                            Ok(()) => {
-                                auth.confirm(&v);
+                        match auth.confirm(&v, &committee) {
+                            Ok(ConfirmOutcome::Applied) => {
                                 emit(&format!(
-                                    "{{\"event\":\"cert_applied\",\"authority\":\"{}\",\"balances\":{},\"total_supply\":{}}}",
+                                    "{{\"event\":\"cert_applied\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"balances\":{},\"total_supply\":{}}}",
+                                    order_id_hex(v.order()),
+                                    escape_json(&transfer_str(v.transfer())),
                                     escape_json(&id),
-                                    balances_json(&ledger),
-                                    ledger.total_supply()
+                                    balances_json(auth.ledger()),
+                                    auth.ledger().total_supply()
                                 ));
                             }
-                            Err(_) => {
-                                // Already applied (or reject); still confirm for seq advance.
-                                auth.confirm(&v);
+                            Ok(ConfirmOutcome::AlreadyApplied) => {}
+                            Err(error) => {
+                                let reason = match error {
+                                    ConfirmError::WrongCommittee { .. } => "wrong_committee",
+                                    ConfirmError::WrongPolicy { .. } => "wrong_policy",
+                                    ConfirmError::OwnerAuth(_) => "owner_auth",
+                                    ConfirmError::State(_) => "state",
+                                };
+                                emit(&format!(
+                                    "{{\"event\":\"cert_state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"{}\"}}",
+                                    order_id_hex(v.order()),
+                                    escape_json(&transfer_str(v.transfer())),
+                                    escape_json(&id),
+                                    reason
+                                ));
                             }
                         }
                     }
@@ -379,11 +558,15 @@ fn run_submit(args: &[String]) -> Result<ExitCode, String> {
         usage();
         e
     })?;
-    let seed = parse_seed(flags.require("seed")?)?;
+    let signing_key = load_signing_key(&flags)?;
+    let network_id = parse_network_id(flags.require("network-id")?)?;
+    let owners = parse_owner_roster(flags.require("owner-roster")?)?;
+    let policy = TransferPolicy::new(network_id.clone(), owners);
     let listen = parse_listen(flags.require("listen")?)?;
     let peers = parse_peers(flags.require("peers")?)?;
-    let committee = parse_committee(flags.require("committee")?)?;
+    let committee = parse_committee(flags.require("committee")?, policy.clone())?;
     let transfer = parse_transfer(flags.require("transfer")?)?;
+    let order = SignedTransfer::sign(&policy, transfer, &signing_key);
     let max_rounds: usize = flags
         .get("max-rounds")
         .unwrap_or("200")
@@ -395,9 +578,7 @@ fn run_submit(args: &[String]) -> Result<ExitCode, String> {
         .parse()
         .map_err(|e| format!("bad --pause-ms: {e}"))?;
 
-    // Client identity is only used for the TCP peer id; seed is reserved for
-    // future client signing and keeps the CLI symmetric with authority.
-    let client_id = format!("client-{seed}");
+    let client_id = format!("client-{}", std::process::id());
     let net = TcpAuthorityNet::bind_at(client_id, listen)
         .map_err(|e| format!("bind {listen}: {e}"))?;
     emit(&format!(
@@ -417,10 +598,10 @@ fn run_submit(args: &[String]) -> Result<ExitCode, String> {
 
     let endpoint = net.endpoint();
     endpoint
-        .broadcast_order(transfer.clone())
+        .broadcast_order(order.clone())
         .map_err(|e| format!("broadcast_order: {e:?}"))?;
 
-    let mut coll = VoteCollector::new(transfer.clone());
+    let mut coll = VoteCollector::new(order.clone());
     let (cert, status) = coll.collect_until_quorum_with_pause(
         &endpoint,
         &committee,
@@ -438,21 +619,21 @@ fn run_submit(args: &[String]) -> Result<ExitCode, String> {
             // client connections (accepted write peers die with our process).
             thread::sleep(Duration::from_millis(50));
             emit(&format!(
-                "{{\"event\":\"certified\",\"transfer\":\"{}\",\"status\":\"Ok\"}}",
-                escape_json(&transfer_str(&transfer))
+                "{{\"event\":\"certified\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"status\":\"Ok\"}}",
+                order_id_hex(&order),
+                escape_json(&transfer_str(&order.transfer))
             ));
             ExitCode::SUCCESS
         }
         failed => {
-            // Rejected double-spend / out-of-order / sub-quorum is a correct
-            // protocol outcome — exit 0 so the harness can assert on the event.
             let reason = format!("{failed:?}");
             emit(&format!(
-                "{{\"event\":\"cert_failed\",\"transfer\":\"{}\",\"reason\":\"{}\"}}",
-                escape_json(&transfer_str(&transfer)),
+                "{{\"event\":\"cert_failed\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"reason\":\"{}\"}}",
+                order_id_hex(&order),
+                escape_json(&transfer_str(&order.transfer)),
                 escape_json(&reason)
             ));
-            ExitCode::SUCCESS
+            ExitCode::from(2)
         }
     };
 

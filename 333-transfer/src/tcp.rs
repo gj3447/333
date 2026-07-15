@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::authority::{Certificate, Vote};
 use crate::net::{AuthorityMsg, AuthorityNet, NetError};
 use crate::wire::{decode_authority_msg, encode_authority_msg};
-use crate::Transfer;
+use crate::SignedTransfer;
 
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const CONNECT_ATTEMPTS: u32 = 40;
@@ -177,8 +177,8 @@ impl TcpEndpoint {
 }
 
 impl AuthorityNet for TcpEndpoint {
-    fn broadcast_order(&self, t: Transfer) -> Result<(), NetError> {
-        self.write_all(&AuthorityMsg::Order(t))
+    fn broadcast_order(&self, order: SignedTransfer) -> Result<(), NetError> {
+        self.write_all(&AuthorityMsg::Order(order))
     }
 
     fn broadcast_vote(&self, v: Vote) -> Result<(), NetError> {
@@ -347,6 +347,7 @@ mod tests {
     use super::*;
     use crate::authority::{Authority, Certificate, Committee};
     use crate::net::AuthorityNet;
+    use crate::{Ledger, NetworkId, OwnerRegistry, Transfer, TransferPolicy};
     use ed25519_dalek::SigningKey;
 
     fn tx(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
@@ -362,8 +363,35 @@ mod tests {
         SigningKey::from_bytes(&[i; 32])
     }
 
+    fn policy() -> TransferPolicy {
+        TransferPolicy::new(
+            NetworkId::new("tcp-testnet").unwrap(),
+            OwnerRegistry::new([
+                ("alice", key(42).verifying_key()),
+                ("bob", key(43).verifying_key()),
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn authority_genesis() -> Ledger {
+        Ledger::genesis([
+            ("alice".to_string(), 100),
+            ("bob".to_string(), 0),
+            ("carol".to_string(), 0),
+            ("a".to_string(), 100),
+            ("b".to_string(), 0),
+        ])
+    }
+
+    fn signed_tx(policy: &TransferPolicy, seq: u64, amount: u128) -> SignedTransfer {
+        SignedTransfer::sign(policy, tx("alice", seq, "bob", amount), &key(42))
+    }
+
     #[test]
     fn tcp_order_round_trip_two_peers() {
+        let policy = policy();
+        let order = signed_tx(&policy, 0, 1);
         let a = TcpAuthorityNet::bind("a").unwrap();
         let b = TcpAuthorityNet::bind("b").unwrap();
         let addrs = [a.addr(), b.addr()];
@@ -372,7 +400,7 @@ mod tests {
 
         let ea = a.endpoint();
         let eb = b.endpoint();
-        ea.broadcast_order(tx("alice", 0, "bob", 1)).unwrap();
+        ea.broadcast_order(order.clone()).unwrap();
 
         // Poll with small retries for reader thread.
         let mut got = Vec::new();
@@ -384,7 +412,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(
-            matches!(got.as_slice(), [AuthorityMsg::Order(_)]),
+            matches!(got.as_slice(), [AuthorityMsg::Order(received)] if received == &order),
             "got {got:?}"
         );
         a.shutdown();
@@ -394,19 +422,31 @@ mod tests {
     #[test]
     fn tcp_frame_preserves_valid_certificate_bytes() {
         // Encode path used on the wire must still yield is_valid after decode.
-        let t = tx("alice", 0, "bob", 10);
+        let policy = policy();
+        let order = signed_tx(&policy, 0, 10);
+        let committee = Committee::new(
+            (0..4u8).map(|i| (format!("a{i}"), key(i).verifying_key())),
+            policy.clone(),
+        )
+        .unwrap();
         let auth: Vec<Authority> = (0..4u8)
-            .map(|i| Authority::new(format!("a{i}"), key(i)))
+            .map(|i| {
+                Authority::new(
+                    format!("a{i}"),
+                    key(i),
+                    policy.clone(),
+                    committee.id(),
+                    authority_genesis(),
+                )
+            })
             .collect();
-        let committee =
-            Committee::new(auth.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
         let mut auth = auth;
         let votes: Vec<_> = auth
             .iter_mut()
             .take(3)
-            .map(|a| a.handle(&t).unwrap())
+            .map(|a| a.handle(&order).unwrap())
             .collect();
-        let cert = Certificate::assemble(t, votes, &committee).unwrap();
+        let cert = Certificate::assemble(order, votes, &committee).unwrap();
         let frame = encode_tcp_frame(&AuthorityMsg::Cert(cert.clone()));
         // Strip length prefix and decode body as wire does on the reader.
         let body = &frame[4..];

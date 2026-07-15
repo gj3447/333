@@ -7,20 +7,48 @@
 use transfer333::{
     authority_handle_round, certify_via_mesh_rounds, collect_until_quorum, confirm_from_mesh,
     disseminate_certificate, Authority, AuthorityMsg, AuthorityNet, Certified, Committee,
-    InMemoryAuthorityMesh, Ledger, MeshEndpoint, MeshLedger, SigningKey, Transfer, VoteCollector,
+    InMemoryAuthorityMesh, Ledger, MeshEndpoint, MeshLedger, NetworkId, OwnerRegistry,
+    SignedTransfer, SigningKey, Transfer, TransferPolicy, VoteCollector,
 };
-
-fn t(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
-    Transfer {
-        from: from.into(),
-        from_seq: seq,
-        to: to.into(),
-        amount,
-    }
-}
 
 fn key(i: u8) -> SigningKey {
     SigningKey::from_bytes(&[i; 32])
+}
+
+fn policy() -> TransferPolicy {
+    TransferPolicy::new(
+        NetworkId::new("mesh-async-testnet").unwrap(),
+        OwnerRegistry::new([
+            ("alice", key(42).verifying_key()),
+            ("bob", key(43).verifying_key()),
+            ("carol", key(44).verifying_key()),
+        ])
+        .unwrap(),
+    )
+}
+
+fn authority_genesis() -> Ledger {
+    Ledger::genesis([
+        ("alice".to_string(), 100),
+        ("bob".to_string(), 0),
+        ("carol".to_string(), 0),
+        ("a".to_string(), 100),
+        ("b".to_string(), 0),
+    ])
+}
+
+fn t(from: &str, seq: u64, to: &str, amount: u128) -> SignedTransfer {
+    let policy = policy();
+    SignedTransfer::sign(
+        &policy,
+        Transfer {
+            from: from.into(),
+            from_seq: seq,
+            to: to.into(),
+            amount,
+        },
+        &key(42),
+    )
 }
 
 fn setup_mesh(
@@ -32,11 +60,23 @@ fn setup_mesh(
     Vec<MeshEndpoint>,
     MeshEndpoint,
 ) {
+    let policy = policy();
+    let committee = Committee::new(
+        (0..n).map(|i| (format!("a{i}"), key(i).verifying_key())),
+        policy.clone(),
+    )
+    .unwrap();
     let authorities: Vec<Authority> = (0..n)
-        .map(|i| Authority::new(format!("a{i}"), key(i)))
+        .map(|i| {
+            Authority::new(
+                format!("a{i}"),
+                key(i),
+                policy.clone(),
+                committee.id(),
+                authority_genesis(),
+            )
+        })
         .collect();
-    let committee =
-        Committee::new(authorities.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
     let mesh = InMemoryAuthorityMesh::new();
     let endpoints: Vec<MeshEndpoint> = authorities
         .iter()
@@ -64,11 +104,11 @@ fn step5_votes_across_rounds_reach_quorum() {
     for i in 0..4 {
         let vote = authorities[i].handle(&transfer).unwrap();
         mesh.deliver_to(client.id(), AuthorityMsg::Vote(vote)).unwrap();
-        coll.poll_round(&client);
+        coll.poll_round(&client, &committee);
         if let Some(cert) = coll.try_assemble(&committee) {
             finished_at = Some(i);
             let verified = cert.verify(&committee).expect("valid Verified");
-            assert_eq!(verified.transfer(), &transfer);
+            assert_eq!(verified.transfer(), &transfer.transfer);
             assert_eq!(coll.vote_count(), 3);
             break;
         }
@@ -88,7 +128,7 @@ fn step5_collect_until_quorum_free_fn_with_preloaded_votes() {
     let (verified, status) = collect_until_quorum(&client, &transfer, &committee, 3);
     assert_eq!(status, Certified::Ok);
     let verified = verified.expect("quorum");
-    assert_eq!(verified.transfer(), &transfer);
+    assert_eq!(verified.transfer(), &transfer.transfer);
 }
 
 #[test]
@@ -198,7 +238,7 @@ fn step6_independent_ledgers_converge_on_same_balances() {
         ledgers[1].ledger().balance(&"bob".into())
     );
     // Type-state: we only applied via Verified path.
-    assert_eq!(verified.transfer(), &transfer);
+    assert_eq!(verified.transfer(), &transfer.transfer);
 }
 
 #[test]

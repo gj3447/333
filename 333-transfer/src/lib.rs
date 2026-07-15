@@ -35,11 +35,13 @@
 //     quorum. So the sequence-number check here defends only against an HONEST
 //     owner. The `KNOWN_LIMITATION_*` test proves that gap on the BARE `apply`
 //     rail; the `authority.rs` quorum-certificate layer (`apply_certified`) now
-//     CLOSES it — see `authority::tests::equivocation_barred_by_quorum_certificate`.
+//     CLOSES it — see `authority::tests::equivocation_is_barred_by_quorum_intersection`.
 //     Authority votes now carry REAL Ed25519 signatures (RFC 8032), verified per
 //     authority against the committee's public keys — a vote is unforgeable
-//     outside the key holder (`authority::tests::forged_vote_with_wrong_key_is_rejected`).
-//     Gossip/broadcast TRANSPORT remains the follow-up. ***
+//     outside the key holder (`authority::tests::duplicate_or_wrong_key_votes_do_not_make_a_certificate`).
+//     The networked rail now also requires a deployment-bound owner signature;
+//     owner proof is checked before any authority slot mutation. In-memory, TCP,
+//     and epidemic transports all carry that same signed order contract. ***
 //
 // This crate is the missing single-owner application on top of crdt333::rcb.
 //
@@ -71,12 +73,14 @@ use crdt333::{CausalBroadcast, CausalMsg, VectorClockBroadcaster};
 pub mod authority;
 pub mod epidemic;
 pub mod net;
+pub mod owner;
 pub mod tcp;
 pub mod wire;
 
 pub use authority::{
-    certify, quorum, signing_message, Authority, AuthorityError, Certificate, Certified, Committee,
-    Verified, Vote,
+    authority_signing_message, certify, quorum, signing_message, Authority, AuthorityError,
+    Certificate, CertificateError, Certified, Committee, CommitteeId, ConfirmError,
+    ConfirmOutcome, Verified, Vote, VoteError, MAX_AUTHORITY_ID_BYTES, MAX_COMMITTEE_MEMBERS,
 };
 pub use epidemic::{
     mesh_all_eager, mesh_with_dropped_eager_edge, msg_id_of, peer_node_id, pump, EpidemicEndpoint,
@@ -87,6 +91,11 @@ pub use net::{
     certify_via_mesh_rounds_with_pause, collect_until_quorum, confirm_from_mesh,
     disseminate_certificate, disseminate_certificate_with_pause, AuthorityMsg, AuthorityNet,
     InMemoryAuthorityMesh, MeshEndpoint, MeshLedger, NetError, VoteCollector,
+};
+pub use owner::{
+    owner_signing_message, NetworkId, NetworkIdError, OwnerAuthError, OwnerRegistry,
+    OwnerRegistryError, PolicyId, SignedTransfer, TransferPolicy, MAX_ACCOUNT_ID_BYTES,
+    MAX_NETWORK_ID_BYTES,
 };
 pub use tcp::{TcpAuthorityNet, TcpEndpoint};
 pub use wire::{
@@ -102,14 +111,13 @@ pub use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 pub type AccountId = String;
 pub type Amount = u128;
 
-/// An intent to move value. `from_seq` is the FastPay "account sequence
-/// number": the owner's monotonic per-account counter. Against an HONEST owner
-/// it is the whole double-spend defence and needs no global ordering; it does
-/// NOT defend against a Byzantine owner equivocating across replicas — that
-/// needs the authority quorum, built (safety core + real Ed25519 authority
-/// votes) in `authority.rs`; use `Ledger::apply_certified`. The Transfer struct
-/// itself is unsigned — authenticity lives on the authority `Vote`, not the
-/// owner's intent, which is what the FastPay quorum certifies.
+/// Unsigned local-credit payload. `from_seq` is the owner's monotonic
+/// per-account counter. The legacy `Ledger::apply` / `Replica` rail assumes an
+/// honest local owner and deliberately accepts this bare payload.
+///
+/// The networked Byzantine-safe rail never accepts a bare `Transfer`: callers
+/// must wrap it in an owner-authenticated, network-bound [`SignedTransfer`]
+/// before `Authority::handle`, transport, voting, or certification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transfer {
     pub from: AccountId,
@@ -134,11 +142,29 @@ pub enum Reject {
     /// double-spend, and out-of-order authorship. `expected`/`got` for debugging.
     StaleSequence { expected: u64, got: u64 },
     Insufficient { have: Amount, need: Amount },
-    /// `apply_certified` was called without a valid 2f+1 quorum certificate.
+    /// The sender has consumed the complete u64 sequence space. Reusing or
+    /// wrapping sequence zero would make an old signed order replayable.
+    SequenceExhausted { account: AccountId },
+    /// Crediting the recipient would exceed the representable balance. This is
+    /// checked before sender debit so settlement remains all-or-nothing.
+    BalanceOverflow {
+        account: AccountId,
+        have: Amount,
+        credit: Amount,
+    },
+    /// `apply_certified` was called without a valid `n-f` quorum certificate.
     /// This is the gate that makes Byzantine-safe transferable value possible:
     /// an equivocating owner cannot obtain a certificate for two conflicting
     /// transfers at the same (account, seq), so double-spend is barred.
     NoCertificate,
+}
+
+/// Invalid canonical genesis input. A deployment must never silently replace
+/// a duplicate account allocation or create a supply that cannot be represented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenesisError {
+    DuplicateAccount { account: AccountId },
+    TotalSupplyOverflow,
 }
 
 /// The consensusless single-owner ledger. Applying transfers is a pure,
@@ -161,15 +187,35 @@ impl Ledger {
     where
         I: IntoIterator<Item = (AccountId, Amount)>,
     {
+        Self::try_genesis(alloc).expect("invalid canonical genesis")
+    }
+
+    /// Fallible production constructor for canonical premint state.
+    pub fn try_genesis<I>(alloc: I) -> Result<Self, GenesisError>
+    where
+        I: IntoIterator<Item = (AccountId, Amount)>,
+    {
         let mut accounts = BTreeMap::new();
+        let mut total = 0u128;
         for (id, balance) in alloc {
+            if accounts.contains_key(&id) {
+                return Err(GenesisError::DuplicateAccount { account: id });
+            }
+            total = total
+                .checked_add(balance)
+                .ok_or(GenesisError::TotalSupplyOverflow)?;
             accounts.insert(id, Account { balance, next_seq: 0 });
         }
-        Self { accounts }
+        let _ = total;
+        Ok(Self { accounts })
     }
 
     pub fn balance(&self, id: &AccountId) -> Amount {
         self.accounts.get(id).map(|a| a.balance).unwrap_or(0)
+    }
+
+    pub fn contains_account(&self, id: &AccountId) -> bool {
+        self.accounts.contains_key(id)
     }
 
     /// Snapshot of every account balance (node telemetry / harness JSON).
@@ -189,18 +235,15 @@ impl Ledger {
     /// Total value in the ledger. Invariant: transfers preserve it exactly
     /// (conservation) — no mint/burn on the consensusless path.
     pub fn total_supply(&self) -> Amount {
-        self.accounts.values().map(|a| a.balance).sum()
+        self.accounts
+            .values()
+            .try_fold(0u128, |total, account| total.checked_add(account.balance))
+            .expect("ledger supply invariant violated")
     }
 
-    /// Apply a transfer. This is the whole consensus-number-1 core:
-    ///   1. sender must exist (single-owner account),
-    ///   2. from_seq must equal the owner's expected next_seq (double-spend /
-    ///      replay defence — the *only* ordering constraint, and it is per-sender
-    ///      not global),
-    ///   3. sender must have the funds.
-    /// On success: debit sender, credit receiver (creating it if absent), and
-    /// bump the sender's sequence.
-    pub fn apply(&mut self, t: &Transfer) -> Result<(), Reject> {
+    /// Validate every arithmetic and state guard without mutation. Authorities
+    /// call this before locking/voting; `apply` repeats it before committing.
+    pub(crate) fn preflight(&self, t: &Transfer) -> Result<(), Reject> {
         let from = self.accounts.get(&t.from).ok_or(Reject::UnknownSender)?;
         if t.from_seq != from.next_seq {
             return Err(Reject::StaleSequence {
@@ -214,13 +257,64 @@ impl Ledger {
                 need: t.amount,
             });
         }
-        // Commit. Receiver may be a fresh account (transferable value, not a
-        // pre-registered credit line).
-        let from = self.accounts.get_mut(&t.from).expect("checked above");
+        from.next_seq
+            .checked_add(1)
+            .ok_or_else(|| Reject::SequenceExhausted {
+                account: t.from.clone(),
+            })?;
+        if t.from != t.to {
+            let recipient_balance = self.balance(&t.to);
+            recipient_balance
+                .checked_add(t.amount)
+                .ok_or_else(|| Reject::BalanceOverflow {
+                    account: t.to.clone(),
+                    have: recipient_balance,
+                    credit: t.amount,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Apply a transfer. This is the whole consensus-number-1 core:
+    ///   1. sender must exist (single-owner account),
+    ///   2. from_seq must equal the owner's expected next_seq (double-spend /
+    ///      replay defence — the *only* ordering constraint, and it is per-sender
+    ///      not global),
+    ///   3. sender must have the funds.
+    /// On success: debit sender, credit receiver (creating it if absent), and
+    /// bump the sender's sequence.
+    pub fn apply(&mut self, t: &Transfer) -> Result<(), Reject> {
+        self.preflight(t)?;
+
+        let next_seq = self
+            .accounts
+            .get(&t.from)
+            .expect("preflight checked sender")
+            .next_seq
+            .checked_add(1)
+            .expect("preflight checked sequence arithmetic");
+        if t.from == t.to {
+            // A self-transfer moves no value but still consumes exactly one
+            // authenticated sequence slot.
+            self.accounts
+                .get_mut(&t.from)
+                .expect("preflight checked sender")
+                .next_seq = next_seq;
+            return Ok(());
+        }
+
+        let credited = self
+            .balance(&t.to)
+            .checked_add(t.amount)
+            .expect("preflight checked recipient arithmetic");
+        // Commit only after every fallible calculation above has succeeded.
+        let from = self
+            .accounts
+            .get_mut(&t.from)
+            .expect("preflight checked sender");
         from.balance -= t.amount;
-        from.next_seq += 1;
-        let to = self.accounts.entry(t.to.clone()).or_default();
-        to.balance += t.amount;
+        from.next_seq = next_seq;
+        self.accounts.entry(t.to.clone()).or_default().balance = credited;
         Ok(())
     }
 
@@ -235,11 +329,15 @@ impl Ledger {
     /// closes the gap the bare `apply` (honest-owner only) leaves open. See
     /// `authority.rs` and the `equivocation_barred_*` / `byzantine_authority_*`
     /// tests.
-    pub fn apply_certified(&mut self, cert: &Certificate, committee: &Committee) -> Result<(), Reject> {
+    pub fn apply_certified(
+        &mut self,
+        cert: &Certificate,
+        committee: &Committee,
+    ) -> Result<(), Reject> {
         if !cert.is_valid(committee) {
             return Err(Reject::NoCertificate);
         }
-        self.apply(&cert.transfer)
+        self.apply(&cert.order.transfer)
     }
 
     /// Apply a `Verified` transfer — the type-state Byzantine-safe path. A
@@ -247,7 +345,12 @@ impl Ledger {
     /// this signature makes the double-spend-vulnerable bare `apply` impossible
     /// to reach with an uncertified transfer: the safe rail is the DEFAULT rail,
     /// not merely the recommended one (assessment action 9).
-    pub fn apply_verified(&mut self, v: &Verified) -> Result<(), Reject> {
+    pub fn apply_verified(&mut self, v: &Verified, committee: &Committee) -> Result<(), Reject> {
+        if v.committee_id() != committee.id()
+            || v.order().verify(committee.policy()).is_err()
+        {
+            return Err(Reject::NoCertificate);
+        }
         self.apply(v.transfer())
     }
 }
@@ -335,6 +438,119 @@ mod tests {
         assert_eq!(l.balance(&"alice".into()), 100);
         assert_eq!(l.total_supply(), 100);
         // There is deliberately no mint() on Ledger: issuance is off the fast path.
+    }
+
+    #[test]
+    fn genesis_rejects_duplicate_accounts_and_supply_overflow() {
+        assert!(matches!(
+            Ledger::try_genesis([
+                ("alice".into(), 1),
+                ("alice".into(), 2),
+            ]),
+            Err(GenesisError::DuplicateAccount { account }) if account == "alice"
+        ));
+        // Duplicate identity is the primary structural error even if summing
+        // the duplicate allocation would otherwise overflow.
+        assert!(matches!(
+            Ledger::try_genesis([
+                ("alice".into(), u128::MAX),
+                ("alice".into(), 1),
+            ]),
+            Err(GenesisError::DuplicateAccount { account }) if account == "alice"
+        ));
+        assert!(matches!(
+            Ledger::try_genesis([
+                ("alice".into(), u128::MAX),
+                ("bob".into(), 1),
+            ]),
+            Err(GenesisError::TotalSupplyOverflow)
+        ));
+    }
+
+    #[test]
+    fn arithmetic_failure_is_checked_before_any_ledger_mutation() {
+        // Construct deliberately corrupt recovered state to exercise the last
+        // defensive boundary. `try_genesis` prevents this state in normal use.
+        let mut l = Ledger {
+            accounts: BTreeMap::from([
+                (
+                    "alice".into(),
+                    Account {
+                        balance: 1,
+                        next_seq: 0,
+                    },
+                ),
+                (
+                    "bob".into(),
+                    Account {
+                        balance: u128::MAX,
+                        next_seq: 0,
+                    },
+                ),
+            ]),
+        };
+        let before = l.clone();
+        assert_eq!(
+            l.apply(&Transfer {
+                from: "alice".into(),
+                from_seq: 0,
+                to: "bob".into(),
+                amount: 1,
+            }),
+            Err(Reject::BalanceOverflow {
+                account: "bob".into(),
+                have: u128::MAX,
+                credit: 1,
+            })
+        );
+        assert_eq!(l.accounts, before.accounts);
+
+        l.accounts.get_mut("bob").unwrap().balance = 0;
+        l.accounts.get_mut("alice").unwrap().next_seq = u64::MAX;
+        let before = l.clone();
+        assert_eq!(
+            l.apply(&Transfer {
+                from: "alice".into(),
+                from_seq: u64::MAX,
+                to: "bob".into(),
+                amount: 1,
+            }),
+            Err(Reject::SequenceExhausted {
+                account: "alice".into(),
+            })
+        );
+        assert_eq!(l.accounts, before.accounts);
+    }
+
+    #[test]
+    fn self_transfer_preserves_value_and_consumes_exactly_one_sequence() {
+        let mut l = genesis();
+        l.apply(&Transfer {
+            from: "alice".into(),
+            from_seq: 0,
+            to: "alice".into(),
+            amount: 100,
+        })
+        .unwrap();
+
+        assert_eq!(l.balance(&"alice".into()), 100);
+        assert_eq!(l.next_seq(&"alice".into()), 1);
+        assert_eq!(l.total_supply(), 100);
+
+        let before = l.clone();
+        assert_eq!(
+            l.apply(&Transfer {
+                from: "alice".into(),
+                from_seq: 1,
+                to: "alice".into(),
+                amount: 101,
+            }),
+            Err(Reject::Insufficient {
+                have: 100,
+                need: 101,
+            })
+        );
+        assert_eq!(l.accounts, before.accounts);
     }
 
     #[test]

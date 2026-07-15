@@ -6,24 +6,67 @@
 
 use transfer333::{
     certify_via_mesh, Authority, Certified, Committee, InMemoryAuthorityMesh, Ledger, MeshEndpoint,
-    SigningKey, Transfer,
+    NetworkId, OwnerRegistry, SignedTransfer, SigningKey, Transfer, TransferPolicy,
 };
 
-fn t(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
-    Transfer {
-        from: from.into(),
-        from_seq: seq,
-        to: to.into(),
-        amount,
-    }
+fn key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+fn policy() -> TransferPolicy {
+    TransferPolicy::new(
+        NetworkId::new("mesh-certified-testnet").unwrap(),
+        OwnerRegistry::new([
+            ("alice", key(42).verifying_key()),
+            ("bob", key(43).verifying_key()),
+            ("carol", key(44).verifying_key()),
+        ])
+        .unwrap(),
+    )
+}
+
+fn authority_genesis() -> Ledger {
+    Ledger::genesis([
+        ("alice".to_string(), 100),
+        ("bob".to_string(), 0),
+        ("carol".to_string(), 0),
+        ("a".to_string(), 100),
+        ("b".to_string(), 0),
+    ])
+}
+
+fn t(from: &str, seq: u64, to: &str, amount: u128) -> SignedTransfer {
+    let policy = policy();
+    SignedTransfer::sign(
+        &policy,
+        Transfer {
+            from: from.into(),
+            from_seq: seq,
+            to: to.into(),
+            amount,
+        },
+        &key(42),
+    )
 }
 
 fn setup() -> (Committee, Vec<Authority>, Vec<MeshEndpoint>, MeshEndpoint) {
+    let policy = policy();
+    let committee = Committee::new(
+        (0..4u8).map(|i| (format!("a{i}"), key(i).verifying_key())),
+        policy.clone(),
+    )
+    .unwrap();
     let authorities: Vec<Authority> = (0..4u8)
-        .map(|i| Authority::new(format!("a{i}"), SigningKey::from_bytes(&[i; 32])))
+        .map(|i| {
+            Authority::new(
+                format!("a{i}"),
+                key(i),
+                policy.clone(),
+                committee.id(),
+                authority_genesis(),
+            )
+        })
         .collect();
-    let committee =
-        Committee::new(authorities.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
     let mesh = InMemoryAuthorityMesh::new();
     let endpoints: Vec<MeshEndpoint> = authorities
         .iter()
@@ -48,7 +91,7 @@ fn mesh_end_to_end_certified_transfer_applies_only_via_verified() {
     assert_eq!(status, Certified::Ok);
     let verified = verified.expect("quorum reached over mailboxes");
 
-    ledger.apply_verified(&verified).unwrap();
+    ledger.apply_verified(&verified, &committee).unwrap();
     assert_eq!(ledger.balance(&"bob".to_string()), 30);
     assert_eq!(ledger.balance(&"alice".to_string()), 70);
     assert_eq!(ledger.total_supply(), 100);
@@ -71,7 +114,7 @@ fn mesh_end_to_end_byzantine_equivocation_cannot_double_apply() {
         &committee,
     );
     assert_eq!(s1, Certified::Ok);
-    ledger.apply_verified(&v1.unwrap()).unwrap();
+    ledger.apply_verified(&v1.unwrap(), &committee).unwrap();
 
     let (v2, s2) = certify_via_mesh(
         &t("alice", 0, "carol", 100),
@@ -102,7 +145,7 @@ fn mesh_sequential_transfers_certify_in_order_only() {
             &committee,
         );
         assert_eq!(s, Certified::Ok, "seq {seq}");
-        ledger.apply_verified(&v.unwrap()).unwrap();
+        ledger.apply_verified(&v.unwrap(), &committee).unwrap();
     }
     assert_eq!(ledger.balance(&"bob".to_string()), 65);
 

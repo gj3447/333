@@ -23,7 +23,7 @@ use identity333::NodeId;
 use crate::authority::{Certificate, Vote};
 use crate::net::{AuthorityNet, InMemoryAuthorityMesh, NetError};
 use crate::wire::{decode_authority_msg, encode_authority_msg, AuthorityMsg};
-use crate::Transfer;
+use crate::SignedTransfer;
 
 /// Deterministic AuthorityId → gossip NodeId bridge.
 ///
@@ -398,8 +398,8 @@ impl EpidemicEndpoint {
 }
 
 impl AuthorityNet for EpidemicEndpoint {
-    fn broadcast_order(&self, t: Transfer) -> Result<(), NetError> {
-        self.broadcast_msg(AuthorityMsg::Order(t))
+    fn broadcast_order(&self, order: SignedTransfer) -> Result<(), NetError> {
+        self.broadcast_msg(AuthorityMsg::Order(order))
     }
 
     fn broadcast_vote(&self, v: Vote) -> Result<(), NetError> {
@@ -468,6 +468,36 @@ pub fn mesh_with_dropped_eager_edge(endpoints: &[&EpidemicEndpoint], from: &str,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NetworkId, OwnerRegistry, Transfer, TransferPolicy};
+    use ed25519_dalek::SigningKey;
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn policy() -> TransferPolicy {
+        TransferPolicy::new(
+            NetworkId::new("epidemic-testnet").unwrap(),
+            OwnerRegistry::new([
+                ("alice", key(42).verifying_key()),
+                ("bob", key(43).verifying_key()),
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn signed_tx(policy: &TransferPolicy) -> SignedTransfer {
+        SignedTransfer::sign(
+            policy,
+            Transfer {
+                from: "alice".into(),
+                from_seq: 0,
+                to: "bob".into(),
+                amount: 1,
+            },
+            &key(42),
+        )
+    }
 
     #[test]
     fn peer_node_id_stable_and_distinct() {
@@ -478,12 +508,8 @@ mod tests {
 
     #[test]
     fn msg_id_stable() {
-        let p = encode_authority_msg(&AuthorityMsg::Order(Transfer {
-            from: "alice".into(),
-            from_seq: 0,
-            to: "bob".into(),
-            amount: 1,
-        }));
+        let policy = policy();
+        let p = encode_authority_msg(&AuthorityMsg::Order(signed_tx(&policy)));
         assert_eq!(msg_id_of(&p), msg_id_of(&p));
     }
 }

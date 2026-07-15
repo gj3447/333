@@ -7,10 +7,16 @@ A broken node (no consensus / diverged ledgers / double-spend applied / skipped 
 accepted) => the corresponding bound gate goes RED.
 
 Behaviours (one gate each in node_requirements.yaml):
-    node_certifies_over_tcp    : an honest transfer certifies across 4 TCP authority processes
-    authority_ledgers_converge : all 4 independent authority ledgers apply the SAME balances
-    double_spend_rejected      : a reused-seq spend gets no cert AND leaves ledgers unchanged
-    out_of_order_rejected      : a skipped-seq spend gets no cert (ordering invariant holds)
+    forged_owner_rejected       : wrong-key Alice is rejected by every authority
+    forged_order_zero_votes     : the forged order gets no vote and changes no ledger
+    forgery_did_not_poison_slot : valid Alice certifies at the same slot immediately after
+    node_certifies_over_tcp     : an honest transfer certifies across 4 TCP authority processes
+    authority_ledgers_converge  : all 4 independent authority ledgers apply the SAME balances
+    double_spend_rejected       : a reused-seq spend gets no cert AND leaves ledgers unchanged
+    out_of_order_rejected       : a skipped-seq spend gets no cert (ordering invariant holds)
+    overspend_rejected          : a signed overspend gets no vote and consumes no sequence
+    duplicate_authority_key_rejected : one physical signing key cannot inflate quorum aliases
+    invalid_genesis_rejected    : overflowing premint config fails before node startup
 
 # KG: transport-plan Step 8 / node-binary (2026-07-14)
 """
@@ -25,7 +31,17 @@ from pathlib import Path
 
 _ADAPTER_DIR = Path(__file__).resolve().parent
 _NODE_BIN = _ADAPTER_DIR.parent / "333-transfer" / "target" / "debug" / "node"
-_COMMITTEE = "a0=0,a1=1,a2=2,a3=3"
+_COMMITTEE = ",".join([
+    "a0=3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",
+    "a1=8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "a2=8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    "a3=ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+])
+_OWNER_ROSTER = ",".join([
+    "alice=197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61",
+    "bob=4508a07aa941707f3eb2db94c8897a80b2c1197476b6de213ac273df7d86c4ff",
+])
+_NETWORK_ID = "transfer333-ooptdd-v2"
 _N_AUTH = 4
 _GENESIS = "alice=100,bob=0"
 
@@ -102,15 +118,18 @@ class _Proc:
             return list(self.events)
 
     def wait_event(self, name: str, timeout: float = 10.0) -> dict | None:
+        return self.wait_matching(lambda event: event.get("event") == name, timeout)
+
+    def wait_matching(self, predicate, timeout: float = 10.0) -> dict | None:
         deadline = time.time() + timeout
         while time.time() < deadline:
             for e in self.snapshot():
-                if e.get("event") == name:
+                if predicate(e):
                     return e
             if self.proc.poll() is not None:
                 # process exited — one last look then give up
                 for e in self.snapshot():
-                    if e.get("event") == name:
+                    if predicate(e):
                         return e
                 return None
             time.sleep(0.02)
@@ -125,10 +144,14 @@ class _Proc:
                 self.proc.kill()
 
 
-def _submit(client_port: int, auth_addrs: list[str], transfer: str) -> _Proc:
+def _submit(
+    client_port: int, auth_addrs: list[str], transfer: str, owner_seed: int
+) -> _Proc:
     argv = [
         str(_NODE_BIN), "submit",
-        "--seed", "99",
+        "--dev-seed", str(owner_seed),
+        "--network-id", _NETWORK_ID,
+        "--owner-roster", _OWNER_ROSTER,
         "--listen", f"127.0.0.1:{client_port}",
         "--peers", ",".join(auth_addrs),
         "--committee", _COMMITTEE,
@@ -143,19 +166,162 @@ def _cert_applied_balances(auth: _Proc) -> list[dict]:
     return [e for e in auth.snapshot() if e.get("event") == "cert_applied"]
 
 
-def run_node_probe(backend, cid: str) -> dict:
+# One emitter symbol per requirement. Longinus binds the exact behavior literal
+# to the exact oracle that decides whether evidence is strong enough to ship it.
+def _emit_forged_owner_rejected(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-forged-owner-rejected-20260715
+    if ok:
+        backend.ship([_ev(cid, "forged_owner_rejected", **attrs)])
+    return ok
+
+
+def _emit_forged_order_zero_votes(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-forged-order-zero-votes-20260715
+    if ok:
+        backend.ship([_ev(cid, "forged_order_zero_votes", **attrs)])
+    return ok
+
+
+def _emit_overspend_rejected(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-overspend-rejected-20260715
+    if ok:
+        backend.ship([_ev(cid, "overspend_rejected", **attrs)])
+    return ok
+
+
+def _emit_duplicate_authority_key_rejected(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-duplicate-authority-key-rejected-20260715
+    if ok:
+        backend.ship([_ev(cid, "duplicate_authority_key_rejected", **attrs)])
+    return ok
+
+
+def _emit_invalid_genesis_rejected(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-invalid-genesis-rejected-20260715
+    if ok:
+        backend.ship([_ev(cid, "invalid_genesis_rejected", **attrs)])
+    return ok
+
+
+def _emit_forgery_did_not_poison_slot(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-forgery-no-slot-poison-20260715
+    if ok:
+        backend.ship([_ev(cid, "forgery_did_not_poison_slot", **attrs)])
+    return ok
+
+
+def _emit_node_certifies_over_tcp(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-certify-over-tcp-20260715
+    if ok:
+        backend.ship([_ev(cid, "node_certifies_over_tcp", **attrs)])
+    return ok
+
+
+def _emit_authority_ledgers_converge(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-ledgers-converge-20260715
+    if ok:
+        backend.ship([_ev(cid, "authority_ledgers_converge", **attrs)])
+    return ok
+
+
+def _emit_double_spend_rejected(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-double-spend-rejected-20260715
+    if ok:
+        backend.ship([_ev(cid, "double_spend_rejected", **attrs)])
+    return ok
+
+
+def _emit_out_of_order_rejected(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-out-of-order-rejected-20260715
+    if ok:
+        backend.ship([_ev(cid, "out_of_order_rejected", **attrs)])
+    return ok
+
+
+def _authority_config_probe(*, committee: str, genesis: str) -> subprocess.CompletedProcess:
+    """Run one authority config through the real CLI; expected failures occur pre-bind."""
+    return subprocess.run(
+        [
+            str(_NODE_BIN), "authority",
+            "--id", "a0", "--dev-seed", "0",
+            "--network-id", _NETWORK_ID,
+            "--owner-roster", _OWNER_ROSTER,
+            "--listen", "127.0.0.1:0",
+            "--peers", "127.0.0.1:1",
+            "--committee", committee,
+            "--genesis", genesis,
+            "--rounds-idle-exit", "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+
+def run_node_probe(backend, cid: str) -> dict:  # KG: transfer333-node-conformance-20260715
     """Loop entry point. Boots a real 4-authority TCP node network + submits transfers,
     shipping a trace event per genuinely-observed distributed-systems behaviour."""
     summary: dict = {"node_bin": str(_NODE_BIN)}
-    if not _NODE_BIN.exists():
-        subprocess.run(
-            ["cargo", "build", "--bin", "node"],
-            cwd=str(_ADAPTER_DIR.parent / "333-transfer"), check=True,
-        )
+    # Always ask Cargo for the current binary. The build is incremental, and
+    # existence alone is unsafe because target/debug/node may predate this CLI
+    # and wire contract.
+    subprocess.run(
+        ["cargo", "build", "--bin", "node"],
+        cwd=str(_ADAPTER_DIR.parent / "333-transfer"), check=True,
+    )
 
-    _ports = _free_ports(_N_AUTH + 1)
+    # Configuration falsifiers run through the real node CLI before
+    # any TCP authority is admitted to the live committee.
+    shared_key = _COMMITTEE.split(",", 1)[0].split("=", 1)[1]
+    alias_inflated_committee = ",".join(
+        f"a{i}={shared_key}" for i in range(_N_AUTH)
+    )
+    duplicate_key = _authority_config_probe(
+        committee=alias_inflated_committee,
+        genesis=_GENESIS,
+    )
+    duplicate_key_ok = (
+        duplicate_key.returncode != 0
+        and "empty or duplicate committee" in duplicate_key.stderr
+    )
+    summary["duplicate_authority_key"] = {
+        "exit": duplicate_key.returncode,
+        "rejected": duplicate_key_ok,
+    }
+    _emit_duplicate_authority_key_rejected(
+        backend,
+        cid,
+        duplicate_key_ok,
+        aliases=_N_AUTH,
+        distinct_public_keys=1,
+    )
+
+    overflowing_genesis = (
+        "alice=340282366920938463463374607431768211455,bob=1"
+    )
+    invalid_genesis = _authority_config_probe(
+        committee=_COMMITTEE,
+        genesis=overflowing_genesis,
+    )
+    invalid_genesis_ok = (
+        invalid_genesis.returncode != 0
+        and "TotalSupplyOverflow" in invalid_genesis.stderr
+    )
+    summary["invalid_genesis"] = {
+        "exit": invalid_genesis.returncode,
+        "rejected": invalid_genesis_ok,
+    }
+    _emit_invalid_genesis_rejected(
+        backend,
+        cid,
+        invalid_genesis_ok,
+        reason="total_supply_overflow",
+    )
+
+    # One distinct client port per sequential submit avoids TIME_WAIT/rebind
+    # coupling between the five sequential submit probes.
+    _ports = _free_ports(_N_AUTH + 5)
     auth_ports = _ports[:_N_AUTH]
-    client_port = _ports[_N_AUTH]
+    (
+        forged_client_port,
+        overspend_client_port,
+        valid_client_port,
+        double_client_port,
+        skip_client_port,
+    ) = (
+        _ports[_N_AUTH:]
+    )
     auth_addrs = [f"127.0.0.1:{p}" for p in auth_ports]
     summary["auth_addrs"] = auth_addrs
 
@@ -164,7 +330,9 @@ def run_node_probe(backend, cid: str) -> dict:
         for i in range(_N_AUTH):
             argv = [
                 str(_NODE_BIN), "authority",
-                "--id", f"a{i}", "--seed", str(i),
+                "--id", f"a{i}", "--dev-seed", str(i),
+                "--network-id", _NETWORK_ID,
+                "--owner-roster", _OWNER_ROSTER,
                 "--listen", auth_addrs[i],
                 "--peers", ",".join(auth_addrs),
                 "--committee", _COMMITTEE,
@@ -178,16 +346,164 @@ def run_node_probe(backend, cid: str) -> dict:
         summary["committee_ready"] = ready
         time.sleep(0.3)  # settle accept threads
 
-        # 1) Honest transfer certifies over 4 TCP authority processes.
-        s1 = _submit(client_port, auth_addrs, "alice:0:bob:30")
+        # 1) Forge first. Seed 99 signs as Alice, whose roster key is seed 42.
+        # Every authority must reject before sequence inspection/slot mutation.
+        forged_transfer = "alice:0:bob:30"
+        forged = _submit(forged_client_port, auth_addrs, forged_transfer, 99)
+        forged_failed = forged.wait_event("cert_failed", timeout=25.0)
+        forged_order_id = forged_failed.get("order_id") if forged_failed else None
+        owner_rejections = [
+            a.wait_matching(
+                lambda event, order_id=forged_order_id: (
+                    event.get("event") == "owner_auth_rejected"
+                    and event.get("order_id") == order_id
+                ),
+                timeout=10.0,
+            )
+            for a in authorities
+        ]
+        forged.stop()
+        time.sleep(0.3)
+
+        rejected_by_all = (
+            bool(forged_failed)
+            and all(e is not None for e in owner_rejections)
+            and all(
+                e.get("transfer") == forged_transfer
+                and e.get("reason") == "invalid_owner_signature"
+                and e.get("order_id") == forged_order_id
+                for e in owner_rejections
+                if e is not None
+            )
+        )
+        summary["forged_owner"] = {
+            "cert_failed": bool(forged_failed),
+            "rejected_each": [bool(e) for e in owner_rejections],
+            "reasons": [e.get("reason") if e else None for e in owner_rejections],
+        }
+        _emit_forged_owner_rejected(
+            backend,
+            cid,
+            ready and rejected_by_all,
+            transfer=forged_transfer,
+            order_id=forged_order_id,
+            authorities=_N_AUTH,
+        )
+
+        forged_votes = [
+            e
+            for a in authorities
+            for e in a.snapshot()
+            if e.get("event") == "vote_cast"
+            and e.get("order_id") == forged_order_id
+        ]
+        forged_applies = [
+            e
+            for a in authorities
+            for e in a.snapshot()
+            if e.get("event") == "cert_applied"
+            and e.get("order_id") == forged_order_id
+        ]
+        zero_vote_no_apply = not forged_votes and not forged_applies
+        summary["forged_order_zero_votes"] = {
+            "votes": len(forged_votes),
+            "cert_applies": len(forged_applies),
+        }
+        _emit_forged_order_zero_votes(
+            backend,
+            cid,
+            ready and rejected_by_all and zero_vote_no_apply,
+            transfer=forged_transfer,
+            order_id=forged_order_id,
+            votes=0,
+            cert_applies=0,
+        )
+
+        # 2) A correctly signed overspend must be refused before slot mutation.
+        overspend_transfer = "alice:0:bob:101"
+        overspend = _submit(
+            overspend_client_port, auth_addrs, overspend_transfer, 42
+        )
+        overspend_failed = overspend.wait_event("cert_failed", timeout=25.0)
+        overspend_order_id = (
+            overspend_failed.get("order_id") if overspend_failed else None
+        )
+        balance_rejections = [
+            a.wait_matching(
+                lambda event, order_id=overspend_order_id: (
+                    event.get("event") == "state_rejected"
+                    and event.get("order_id") == order_id
+                    and event.get("reason") == "insufficient_balance"
+                    and event.get("have") == 100
+                    and event.get("need") == 101
+                ),
+                timeout=10.0,
+            )
+            for a in authorities
+        ]
+        overspend.stop()
+        overspend_votes = [
+            event
+            for authority in authorities
+            for event in authority.snapshot()
+            if event.get("event") == "vote_cast"
+            and event.get("order_id") == overspend_order_id
+        ]
+        overspend_applies = [
+            event
+            for authority in authorities
+            for event in authority.snapshot()
+            if event.get("event") == "cert_applied"
+            and event.get("order_id") == overspend_order_id
+        ]
+        overspend_rejected = (
+            bool(overspend_failed)
+            and overspend_order_id is not None
+            and all(event is not None for event in balance_rejections)
+            and not overspend_votes
+            and not overspend_applies
+        )
+        summary["overspend"] = {
+            "cert_failed": bool(overspend_failed),
+            "rejected_each": [bool(event) for event in balance_rejections],
+            "votes": len(overspend_votes),
+            "cert_applies": len(overspend_applies),
+        }
+        _emit_overspend_rejected(
+            backend,
+            cid,
+            ready and overspend_rejected,
+            transfer=overspend_transfer,
+            order_id=overspend_order_id,
+            authorities=_N_AUTH,
+        )
+
+        # 3) Legitimate Alice now submits the same slot after both rejections.
+        s1 = _submit(valid_client_port, auth_addrs, forged_transfer, 42)
         certified = s1.wait_event("certified", timeout=25.0)
         summary["certified"] = bool(certified)
-        if certified and certified.get("status") == "Ok":
-            backend.ship([_ev(cid, "node_certifies_over_tcp", transfer=certified.get("transfer"))])
+        valid_order_id = certified.get("order_id") if certified else None
+        certified_ok = bool(certified and certified.get("status") == "Ok")
+        _emit_node_certifies_over_tcp(
+            backend,
+            cid,
+            ready and certified_ok,
+            transfer=certified.get("transfer") if certified else None,
+            order_id=valid_order_id,
+        )
         s1.stop()
 
-        # 2) Convergence: every authority applied the SAME balances {alice:70, bob:30}.
-        applied = [a.wait_event("cert_applied", timeout=10.0) for a in authorities]
+        # 4) Convergence for the exact legitimate order id.
+        applied = [
+            a.wait_matching(
+                lambda event, order_id=valid_order_id: (
+                    event.get("event") == "cert_applied"
+                    and event.get("order_id") == order_id
+                ),
+                timeout=10.0,
+            )
+            for a in authorities
+        ]
         summary["cert_applied_each"] = [bool(x) for x in applied]
         balances_all = [x.get("balances") if x else None for x in applied]
         summary["balances_all"] = balances_all
@@ -195,31 +511,106 @@ def run_node_probe(backend, cid: str) -> dict:
         converged = (
             all(x is not None for x in applied)
             and all(b == want for b in balances_all)
+            and all(x.get("total_supply") == 100 for x in applied if x is not None)
         )
-        if converged:
-            backend.ship([_ev(cid, "authority_ledgers_converge", balances=want, n=_N_AUTH)])
+        _emit_authority_ledgers_converge(
+            backend, cid, ready and converged, balances=want, n=_N_AUTH,
+            order_id=valid_order_id,
+        )
+        same_slot_recovered = bool(
+            ready
+            and rejected_by_all
+            and zero_vote_no_apply
+            and overspend_rejected
+            and certified_ok
+            and converged
+            and len({forged_order_id, overspend_order_id, valid_order_id}) == 3
+        )
+        _emit_forgery_did_not_poison_slot(
+            backend,
+            cid,
+            same_slot_recovered,
+            transfer=forged_transfer,
+            slot="alice:0",
+            order_id=valid_order_id,
+        )
+        summary["forgery_did_not_poison_slot"] = same_slot_recovered
 
         # snapshot cert_applied counts BEFORE the adversarial submits
         pre_counts = [len(_cert_applied_balances(a)) for a in authorities]
 
-        # 3) Double-spend: reuse seq 0 for a different payout → no cert, ledgers unchanged.
-        s2 = _submit(client_port, auth_addrs, "alice:0:bob:99")
+        # 5) Double-spend: require exact typed rejections from all authorities.
+        s2 = _submit(double_client_port, auth_addrs, "alice:0:bob:99", 42)
         failed2 = s2.wait_event("cert_failed", timeout=25.0)
+        double_order_id = failed2.get("order_id") if failed2 else None
+        double_rejections = [
+            authority.wait_matching(
+                lambda event, order_id=double_order_id: (
+                    event.get("event") == "out_of_order"
+                    and event.get("order_id") == order_id
+                    and event.get("expected") == 1
+                    and event.get("got") == 0
+                    and event.get("balances") == want
+                    and event.get("total_supply") == 100
+                ),
+                timeout=10.0,
+            )
+            for authority in authorities
+        ]
         s2.stop()
         time.sleep(0.3)
         post_counts = [len(_cert_applied_balances(a)) for a in authorities]
-        balances_unchanged = post_counts == pre_counts  # no new cert applied anywhere
+        balances_unchanged = (
+            post_counts == pre_counts
+            and all(event is not None for event in double_rejections)
+        )
         summary["double_spend"] = {"cert_failed": bool(failed2), "unchanged": balances_unchanged}
-        if failed2 and balances_unchanged:
-            backend.ship([_ev(cid, "double_spend_rejected", reason=failed2.get("reason"))])
+        double_rejected = bool(
+            failed2
+            and all(event is not None for event in double_rejections)
+            and balances_unchanged
+        )
+        _emit_double_spend_rejected(
+            backend,
+            cid,
+            double_rejected,
+            reason=failed2.get("reason") if failed2 else None,
+            order_id=double_order_id,
+        )
 
-        # 4) Out-of-order: skip seq 1, submit seq 2 → no cert.
-        s3 = _submit(client_port, auth_addrs, "alice:2:bob:5")
+        # 6) Out-of-order: require expected=1/got=2 from every authority.
+        s3 = _submit(skip_client_port, auth_addrs, "alice:2:bob:5", 42)
         failed3 = s3.wait_event("cert_failed", timeout=25.0)
+        skip_order_id = failed3.get("order_id") if failed3 else None
+        skip_rejections = [
+            authority.wait_matching(
+                lambda event, order_id=skip_order_id: (
+                    event.get("event") == "out_of_order"
+                    and event.get("order_id") == order_id
+                    and event.get("expected") == 1
+                    and event.get("got") == 2
+                    and event.get("balances") == want
+                    and event.get("total_supply") == 100
+                ),
+                timeout=10.0,
+            )
+            for authority in authorities
+        ]
         s3.stop()
-        summary["out_of_order"] = {"cert_failed": bool(failed3)}
-        if failed3:
-            backend.ship([_ev(cid, "out_of_order_rejected", reason=failed3.get("reason"))])
+        skip_rejected = bool(
+            failed3 and all(event is not None for event in skip_rejections)
+        )
+        summary["out_of_order"] = {
+            "cert_failed": bool(failed3),
+            "rejected_each": [bool(event) for event in skip_rejections],
+        }
+        _emit_out_of_order_rejected(
+            backend,
+            cid,
+            skip_rejected,
+            reason=failed3.get("reason") if failed3 else None,
+            order_id=skip_order_id,
+        )
 
         return summary
     finally:

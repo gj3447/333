@@ -27,7 +27,7 @@ use std::time::Duration;
 use crate::authority::{
     Authority, AuthorityError, Certificate, Certified, Committee, Verified, Vote,
 };
-use crate::{Ledger, Reject, Transfer};
+use crate::{Ledger, Reject, SignedTransfer};
 
 pub use crate::wire::AuthorityMsg;
 
@@ -49,7 +49,7 @@ pub enum NetError {
 /// - `broadcast_cert`  — optional cert fan-out after assembly
 /// - `poll`            — drain this endpoint's inbox
 pub trait AuthorityNet: Send + Sync {
-    fn broadcast_order(&self, t: Transfer) -> Result<(), NetError>;
+    fn broadcast_order(&self, order: SignedTransfer) -> Result<(), NetError>;
     fn broadcast_vote(&self, v: Vote) -> Result<(), NetError>;
     fn broadcast_cert(&self, c: Certificate) -> Result<(), NetError>;
     fn poll(&self) -> Vec<AuthorityMsg>;
@@ -191,8 +191,8 @@ impl MeshEndpoint {
 }
 
 impl AuthorityNet for MeshEndpoint {
-    fn broadcast_order(&self, t: Transfer) -> Result<(), NetError> {
-        self.mesh.fanout(AuthorityMsg::Order(t))
+    fn broadcast_order(&self, order: SignedTransfer) -> Result<(), NetError> {
+        self.mesh.fanout(AuthorityMsg::Order(order))
     }
 
     fn broadcast_vote(&self, v: Vote) -> Result<(), NetError> {
@@ -223,7 +223,7 @@ impl AuthorityNet for MeshEndpoint {
 /// Authorities are mutated only via messages that appeared in their mailbox;
 /// there is no `certify(&mut [Authority])` shared-slice pass.
 pub fn certify_via_mesh(
-    t: &Transfer,
+    order: &SignedTransfer,
     authorities: &mut [Authority],
     auth_endpoints: &[MeshEndpoint],
     client: &MeshEndpoint,
@@ -236,7 +236,7 @@ pub fn certify_via_mesh(
     );
 
     // 1. Client publishes the order to the mesh.
-    if client.broadcast_order(t.clone()).is_err() {
+    if client.broadcast_order(order.clone()).is_err() {
         return (
             None,
             Certified::Failed {
@@ -263,7 +263,15 @@ pub fn certify_via_mesh(
                         refusals += 1;
                         contested = true;
                     }
-                    Err(AuthorityError::OutOfOrder { .. }) => {
+                    Err(
+                        AuthorityError::OutOfOrder { .. }
+                        | AuthorityError::OwnerAuth(_)
+                        | AuthorityError::UnknownSender { .. }
+                        | AuthorityError::ZeroAmount
+                        | AuthorityError::InsufficientBalance { .. }
+                        | AuthorityError::SequenceExhausted { .. }
+                        | AuthorityError::BalanceOverflow { .. },
+                    ) => {
                         refusals += 1;
                     }
                 }
@@ -276,13 +284,13 @@ pub fn certify_via_mesh(
     let mut seen: HashSet<String> = HashSet::new();
     for msg in client.poll() {
         if let AuthorityMsg::Vote(v) = msg {
-            if v.transfer == *t && seen.insert(v.authority.clone()) {
+            if v.validate_for(order, committee).is_ok() && seen.insert(v.authority.clone()) {
                 votes.push(v);
             }
         }
     }
 
-    match Certificate::assemble(t.clone(), votes.clone(), committee) {
+    match Certificate::assemble(order.clone(), votes.clone(), committee) {
         Some(cert) => {
             let verified = cert
                 .verify(committee)
@@ -293,7 +301,7 @@ pub fn certify_via_mesh(
                 for msg in ep.poll() {
                     if let AuthorityMsg::Cert(c) = msg {
                         if let Some(v) = c.verify(committee) {
-                            auth.confirm(&v);
+                            let _ = auth.confirm(&v, committee);
                         }
                     }
                 }
@@ -324,7 +332,7 @@ pub fn certify_via_mesh(
 /// caller observes `Authority::handle` outcomes (collection alone only sees votes).
 #[derive(Debug, Clone)]
 pub struct VoteCollector {
-    transfer: Transfer,
+    order: SignedTransfer,
     votes: Vec<Vote>,
     seen: HashSet<String>,
     refusals: usize,
@@ -332,9 +340,9 @@ pub struct VoteCollector {
 }
 
 impl VoteCollector {
-    pub fn new(transfer: Transfer) -> Self {
+    pub fn new(order: SignedTransfer) -> Self {
         Self {
-            transfer,
+            order,
             votes: Vec::new(),
             seen: HashSet::new(),
             refusals: 0,
@@ -342,8 +350,12 @@ impl VoteCollector {
         }
     }
 
-    pub fn transfer(&self) -> &Transfer {
-        &self.transfer
+    pub fn transfer(&self) -> &crate::Transfer {
+        &self.order.transfer
+    }
+
+    pub fn order(&self) -> &SignedTransfer {
+        &self.order
     }
 
     pub fn votes(&self) -> &[Vote] {
@@ -372,10 +384,18 @@ impl VoteCollector {
 
     /// One round: drain currently-available Vote messages matching this transfer
     /// (dedupe by authority id). Works for any [`AuthorityNet`] (in-mem or TCP).
-    pub fn poll_round<N: AuthorityNet + ?Sized>(&mut self, collector: &N) {
+    pub fn poll_round<N: AuthorityNet + ?Sized>(
+        &mut self,
+        collector: &N,
+        committee: &Committee,
+    ) {
         for msg in collector.poll() {
             if let AuthorityMsg::Vote(v) = msg {
-                if v.transfer == self.transfer && self.seen.insert(v.authority.clone()) {
+                // Validate before dedupe: an invalid vote claiming a real id may
+                // not occupy that id and suppress the later valid vote.
+                if v.validate_for(&self.order, committee).is_ok()
+                    && self.seen.insert(v.authority.clone())
+                {
                     self.votes.push(v);
                 }
             }
@@ -384,7 +404,7 @@ impl VoteCollector {
 
     /// Try `Certificate::assemble` with votes collected so far.
     pub fn try_assemble(&self, committee: &Committee) -> Option<Certificate> {
-        Certificate::assemble(self.transfer.clone(), self.votes.clone(), committee)
+        Certificate::assemble(self.order.clone(), self.votes.clone(), committee)
     }
 
     /// Failure snapshot matching `certify` / `certify_via_mesh` counters.
@@ -407,7 +427,7 @@ impl VoteCollector {
         pause: Duration,
     ) -> (Option<Certificate>, Certified) {
         for r in 0..max_rounds {
-            self.poll_round(collector);
+            self.poll_round(collector, committee);
             if let Some(cert) = self.try_assemble(committee) {
                 // assemble already ran is_valid; verify is the type-state mint path.
                 let _ = cert
@@ -443,11 +463,11 @@ impl VoteCollector {
 /// splits use [`VoteCollector::note_refusal`] then [`VoteCollector::collect_until_quorum`].
 pub fn collect_until_quorum<N: AuthorityNet + ?Sized>(
     collector: &N,
-    transfer: &Transfer,
+    order: &SignedTransfer,
     committee: &Committee,
     max_rounds: usize,
 ) -> (Option<Verified>, Certified) {
-    let mut coll = VoteCollector::new(transfer.clone());
+    let mut coll = VoteCollector::new(order.clone());
     match coll.collect_until_quorum(collector, committee, max_rounds) {
         (Some(cert), Certified::Ok) => {
             let verified = cert
@@ -520,7 +540,7 @@ impl<N: AuthorityNet> MeshLedger<N> {
         for msg in self.endpoint.poll() {
             if let AuthorityMsg::Cert(c) = msg {
                 match c.verify(committee) {
-                    Some(v) => outcomes.push(self.ledger.apply_verified(&v)),
+                    Some(v) => outcomes.push(self.ledger.apply_verified(&v, committee)),
                     None => outcomes.push(Err(Reject::NoCertificate)),
                 }
             }
@@ -597,7 +617,7 @@ pub fn confirm_from_mesh<N: AuthorityNet>(
         for msg in ep.poll() {
             if let AuthorityMsg::Cert(c) = msg {
                 if let Some(v) = c.verify(committee) {
-                    auth.confirm(&v);
+                    let _ = auth.confirm(&v, committee);
                 }
             }
         }
@@ -611,7 +631,7 @@ pub fn confirm_from_mesh<N: AuthorityNet>(
 /// `pause` is `Duration::ZERO` for deterministic in-memory tests; TCP tests
 /// pass a short sleep so orders/votes/certs can land in peer inboxes.
 pub fn certify_via_mesh_rounds_with_pause<N: AuthorityNet>(
-    t: &Transfer,
+    order: &SignedTransfer,
     authorities: &mut [Authority],
     auth_endpoints: &[N],
     client: &N,
@@ -625,7 +645,7 @@ pub fn certify_via_mesh_rounds_with_pause<N: AuthorityNet>(
         "one endpoint per authority"
     );
 
-    if client.broadcast_order(t.clone()).is_err() {
+    if client.broadcast_order(order.clone()).is_err() {
         return (
             None,
             None,
@@ -637,13 +657,13 @@ pub fn certify_via_mesh_rounds_with_pause<N: AuthorityNet>(
         );
     }
 
-    let mut coll = VoteCollector::new(t.clone());
+    let mut coll = VoteCollector::new(order.clone());
     // Interleave authority handle + collector poll so TCP latency on Order
     // delivery still reaches handle before we give up (in-mem: first round
     // still sees the order immediately after broadcast).
     for r in 0..max_rounds {
         authority_handle_round(authorities, auth_endpoints, &mut coll);
-        coll.poll_round(client);
+        coll.poll_round(client, committee);
         if let Some(cert) = coll.try_assemble(committee) {
             let verified = cert
                 .verify(committee)
@@ -669,7 +689,7 @@ pub fn certify_via_mesh_rounds_with_pause<N: AuthorityNet>(
 /// Multi-round certification path (Steps 5–7, no wall-clock pause).
 /// Separates collection from single-pass [`certify_via_mesh`].
 pub fn certify_via_mesh_rounds<N: AuthorityNet>(
-    t: &Transfer,
+    order: &SignedTransfer,
     authorities: &mut [Authority],
     auth_endpoints: &[N],
     client: &N,
@@ -677,7 +697,7 @@ pub fn certify_via_mesh_rounds<N: AuthorityNet>(
     max_rounds: usize,
 ) -> (Option<Verified>, Option<Certificate>, Certified) {
     certify_via_mesh_rounds_with_pause(
-        t,
+        order,
         authorities,
         auth_endpoints,
         client,
@@ -690,11 +710,11 @@ pub fn certify_via_mesh_rounds<N: AuthorityNet>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::{Authority, Committee};
-    use crate::Ledger;
-    use ed25519_dalek::SigningKey;
+    use crate::authority::{authority_signing_message, Authority, Committee};
+    use crate::{NetworkId, OwnerRegistry, Transfer, TransferPolicy};
+    use ed25519_dalek::{Signer, SigningKey};
 
-    fn tx(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
+    fn raw_tx(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
         Transfer {
             from: from.into(),
             from_seq: seq,
@@ -707,12 +727,66 @@ mod tests {
         SigningKey::from_bytes(&[i; 32])
     }
 
+    fn owner_key(account: &str) -> SigningKey {
+        match account {
+            "alice" => key(42),
+            "bob" => key(43),
+            "carol" => key(44),
+            "a" => key(45),
+            "b" => key(46),
+            other => panic!("no test owner key for {other}"),
+        }
+    }
+
+    fn policy() -> TransferPolicy {
+        TransferPolicy::new(
+            NetworkId::new("net-testnet").unwrap(),
+            OwnerRegistry::new(
+                ["alice", "bob", "carol", "a", "b"]
+                    .map(|account| (account, owner_key(account).verifying_key())),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn authority_genesis() -> Ledger {
+        Ledger::genesis([
+            ("alice".to_string(), 100),
+            ("bob".to_string(), 0),
+            ("carol".to_string(), 0),
+            ("a".to_string(), 100),
+            ("b".to_string(), 0),
+        ])
+    }
+
+    fn committee(n: u8, policy: &TransferPolicy) -> Committee {
+        Committee::new(
+            (0..n).map(|i| (format!("a{i}"), key(i).verifying_key())),
+            policy.clone(),
+        )
+        .unwrap()
+    }
+
+    fn tx(from: &str, seq: u64, to: &str, amount: u128) -> SignedTransfer {
+        let policy = policy();
+        SignedTransfer::sign(&policy, raw_tx(from, seq, to, amount), &owner_key(from))
+    }
+
     fn setup_mesh(n: u8) -> (Committee, Vec<Authority>, Arc<InMemoryAuthorityMesh>, Vec<MeshEndpoint>, MeshEndpoint) {
+        let policy = policy();
+        let committee = committee(n, &policy);
+        let committee_id = committee.id();
         let authorities: Vec<Authority> = (0..n)
-            .map(|i| Authority::new(format!("a{i}"), key(i)))
+            .map(|i| {
+                Authority::new(
+                    format!("a{i}"),
+                    key(i),
+                    policy.clone(),
+                    committee_id,
+                    authority_genesis(),
+                )
+            })
             .collect();
-        let committee =
-            Committee::new(authorities.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
         let mesh = InMemoryAuthorityMesh::new();
         let endpoints: Vec<MeshEndpoint> = authorities
             .iter()
@@ -738,7 +812,15 @@ mod tests {
         assert!(a0.poll().is_empty());
 
         // Vote fan-out after a synthetic vote.
-        let mut auth = Authority::new("a0", key(0));
+        let policy = policy();
+        let committee = committee(1, &policy);
+        let mut auth = Authority::new(
+            "a0",
+            key(0),
+            policy,
+            committee.id(),
+            authority_genesis(),
+        );
         let v = auth.handle(&t).unwrap();
         a0.broadcast_vote(v).unwrap();
         assert!(matches!(a1.poll().as_slice(), [AuthorityMsg::Vote(_)]));
@@ -754,6 +836,36 @@ mod tests {
     }
 
     #[test]
+    fn invalid_vote_cannot_poison_later_valid_vote_from_same_authority() {
+        let (committee, mut authorities, _mesh, endpoints, client) = setup_mesh(4);
+        let order = tx("alice", 0, "bob", 1);
+        let forged_authority = "a0".to_string();
+        let forged = Vote {
+            authority: forged_authority.clone(),
+            committee_id: committee.id(),
+            policy_id: order.policy_id(),
+            network_id: order.network_id.clone(),
+            transfer: order.transfer.clone(),
+            signature: key(99).sign(&authority_signing_message(
+                &forged_authority,
+                &committee.id(),
+                &order.policy_id(),
+                &order.network_id,
+                &order.transfer,
+            )),
+        };
+        let valid = authorities[0].handle(&order).unwrap();
+
+        client.broadcast_vote(forged).unwrap();
+        endpoints[0].broadcast_vote(valid.clone()).unwrap();
+        let mut collector = VoteCollector::new(order);
+        collector.poll_round(&client, &committee);
+
+        assert_eq!(collector.vote_count(), 1);
+        assert_eq!(collector.votes()[0], valid);
+    }
+
+    #[test]
     fn honest_transfer_certifies_over_mesh_without_shared_certify() {
         let (committee, mut authorities, _mesh, endpoints, client) = setup_mesh(4);
         assert_eq!(committee.quorum(), 3);
@@ -765,7 +877,7 @@ mod tests {
         let verified = verified.expect("quorum over mailboxes");
 
         let mut ledger = Ledger::genesis([("alice".to_string(), 100u128), ("bob".to_string(), 0u128)]);
-        ledger.apply_verified(&verified).unwrap();
+        ledger.apply_verified(&verified, &committee).unwrap();
         assert_eq!(ledger.balance(&"bob".to_string()), 30);
         assert_eq!(ledger.balance(&"alice".to_string()), 70);
         assert_eq!(ledger.total_supply(), 100);
@@ -789,7 +901,7 @@ mod tests {
             &committee,
         );
         assert_eq!(s1, Certified::Ok);
-        ledger.apply_verified(&v1.unwrap()).unwrap();
+        ledger.apply_verified(&v1.unwrap(), &committee).unwrap();
 
         // Reuse seq 0 for a different recipient: every authority is past seq 0.
         let (v2, s2) = certify_via_mesh(
@@ -821,7 +933,7 @@ mod tests {
                 &committee,
             );
             assert_eq!(s, Certified::Ok, "seq {seq}");
-            ledger.apply_verified(&v.unwrap()).unwrap();
+            ledger.apply_verified(&v.unwrap(), &committee).unwrap();
         }
         assert_eq!(ledger.balance(&"bob".to_string()), 65);
 

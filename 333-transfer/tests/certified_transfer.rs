@@ -5,20 +5,71 @@
 // transfer is certified by an independent authority committee and applied to the
 // ledger ONLY via a `Verified` minted by quorum-certificate verification.
 
-use transfer333::{certify, Authority, Certified, Committee, Ledger, SigningKey, Transfer};
+use transfer333::{
+    certify, Authority, Certified, Committee, Ledger, NetworkId, OwnerRegistry, SignedTransfer,
+    SigningKey, Transfer, TransferPolicy,
+};
 
-fn t(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
-    Transfer { from: from.into(), from_seq: seq, to: to.into(), amount }
+fn key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+fn policy() -> TransferPolicy {
+    TransferPolicy::new(
+        NetworkId::new("certified-transfer-testnet").unwrap(),
+        OwnerRegistry::new([
+            ("alice", key(42).verifying_key()),
+            ("bob", key(43).verifying_key()),
+            ("carol", key(44).verifying_key()),
+        ])
+        .unwrap(),
+    )
+}
+
+fn authority_genesis() -> Ledger {
+    Ledger::genesis([
+        ("alice".to_string(), 100),
+        ("bob".to_string(), 0),
+        ("carol".to_string(), 0),
+        ("a".to_string(), 100),
+        ("b".to_string(), 0),
+    ])
+}
+
+fn t(from: &str, seq: u64, to: &str, amount: u128) -> SignedTransfer {
+    let policy = policy();
+    SignedTransfer::sign(
+        &policy,
+        Transfer {
+            from: from.into(),
+            from_seq: seq,
+            to: to.into(),
+            amount,
+        },
+        &key(42),
+    )
 }
 
 fn setup() -> (Committee, Vec<Authority>) {
     // n=4, quorum=3. Each authority holds a seeded Ed25519 secret key; the
     // committee binds each id to the matching public key.
+    let policy = policy();
+    let committee = Committee::new(
+        (0..4u8).map(|i| (format!("a{i}"), key(i).verifying_key())),
+        policy.clone(),
+    )
+    .unwrap();
     let authorities: Vec<Authority> = (0..4u8)
-        .map(|i| Authority::new(format!("a{i}"), SigningKey::from_bytes(&[i; 32])))
+        .map(|i| {
+            Authority::new(
+                format!("a{i}"),
+                key(i),
+                policy.clone(),
+                committee.id(),
+                authority_genesis(),
+            )
+        })
         .collect();
-    let committee =
-        Committee::new(authorities.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
     (committee, authorities)
 }
 
@@ -31,7 +82,7 @@ fn end_to_end_certified_transfer_applies_only_via_verified() {
     assert_eq!(status, Certified::Ok);
     let verified = verified.expect("quorum reached -> a Verified is minted");
 
-    ledger.apply_verified(&verified).unwrap();
+    ledger.apply_verified(&verified, &committee).unwrap();
     assert_eq!(ledger.balance(&"bob".to_string()), 30);
     assert_eq!(ledger.balance(&"alice".to_string()), 70);
     assert_eq!(ledger.total_supply(), 100); // conservation
@@ -49,7 +100,7 @@ fn end_to_end_byzantine_equivocation_cannot_double_apply() {
     // Owner alice's honest seq-0 transfer certifies (all 4 lock it, then confirm).
     let (v1, s1) = certify(&t("alice", 0, "bob", 100), &mut authorities, &committee);
     assert_eq!(s1, Certified::Ok);
-    ledger.apply_verified(&v1.unwrap()).unwrap();
+    ledger.apply_verified(&v1.unwrap(), &committee).unwrap();
 
     // A Byzantine attempt to reuse seq 0 for a different recipient: authorities
     // have advanced next-expected past 0, so every one refuses (OutOfOrder) and
@@ -72,7 +123,7 @@ fn sequential_transfers_certify_in_order_only() {
     for (seq, amt) in [(0u64, 40u128), (1, 25)] {
         let (v, s) = certify(&t("alice", seq, "bob", amt), &mut authorities, &committee);
         assert_eq!(s, Certified::Ok, "seq {seq}");
-        ledger.apply_verified(&v.unwrap()).unwrap();
+        ledger.apply_verified(&v.unwrap(), &committee).unwrap();
     }
     assert_eq!(ledger.balance(&"bob".to_string()), 65);
 

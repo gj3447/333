@@ -6,26 +6,74 @@
 use transfer333::{
     certify_via_mesh_rounds, encode_authority_msg, mesh_all_eager, mesh_with_dropped_eager_edge,
     msg_id_of, pump, Authority, AuthorityMsg, AuthorityNet, Certified, Committee, EpidemicEndpoint,
-    EpidemicNetwork, Ledger, SigningKey, Transfer,
+    EpidemicNetwork, Ledger, NetworkId, OwnerRegistry, SignedTransfer, SigningKey, Transfer,
+    TransferPolicy,
 };
-
-fn t(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
-    Transfer {
-        from: from.into(),
-        from_seq: seq,
-        to: to.into(),
-        amount,
-    }
-}
 
 fn key(i: u8) -> SigningKey {
     SigningKey::from_bytes(&[i; 32])
 }
 
-fn vote_msg(auth_idx: u8, transfer: &Transfer) -> (Authority, AuthorityMsg) {
-    let mut a = Authority::new(format!("a{auth_idx}"), key(auth_idx));
-    let v = a.handle(transfer).unwrap();
-    (a, AuthorityMsg::Vote(v))
+fn policy() -> TransferPolicy {
+    TransferPolicy::new(
+        NetworkId::new("mesh-epidemic-testnet").unwrap(),
+        OwnerRegistry::new([
+            ("alice", key(42).verifying_key()),
+            ("bob", key(43).verifying_key()),
+            ("carol", key(44).verifying_key()),
+        ])
+        .unwrap(),
+    )
+}
+
+fn authority_genesis() -> Ledger {
+    Ledger::genesis([
+        ("alice".to_string(), 100),
+        ("bob".to_string(), 0),
+        ("carol".to_string(), 0),
+        ("a".to_string(), 100),
+        ("b".to_string(), 0),
+    ])
+}
+
+fn committee(policy: &TransferPolicy) -> Committee {
+    Committee::new(
+        (0..4u8).map(|i| (format!("a{i}"), key(i).verifying_key())),
+        policy.clone(),
+    )
+    .unwrap()
+}
+
+fn authority(auth_idx: u8) -> Authority {
+    let policy = policy();
+    let committee = committee(&policy);
+    Authority::new(
+        format!("a{auth_idx}"),
+        key(auth_idx),
+        policy,
+        committee.id(),
+        authority_genesis(),
+    )
+}
+
+fn t(from: &str, seq: u64, to: &str, amount: u128) -> SignedTransfer {
+    let policy = policy();
+    SignedTransfer::sign(
+        &policy,
+        Transfer {
+            from: from.into(),
+            from_seq: seq,
+            to: to.into(),
+            amount,
+        },
+        &key(42),
+    )
+}
+
+fn vote_msg(auth_idx: u8, transfer: &SignedTransfer) -> (Authority, AuthorityMsg) {
+    let mut authority = authority(auth_idx);
+    let v = authority.handle(transfer).unwrap();
+    (authority, AuthorityMsg::Vote(v))
 }
 
 /// 1. Full eager mesh: a broadcast Vote reaches all N peers' inboxes.
@@ -82,7 +130,7 @@ fn resilience_dropped_eager_edge_recovers_via_ihave_graft() {
     assert!(!a.eager_peers().contains(&"d".to_string()));
 
     let transfer = t("alice", 0, "bob", 7);
-    let mut auth = Authority::new("a0", key(0));
+    let mut auth = authority(0);
     let vote = auth.handle(&transfer).unwrap();
     let id = msg_id_of(&encode_authority_msg(&AuthorityMsg::Vote(vote.clone())));
 
@@ -117,7 +165,7 @@ fn no_duplicate_delivery_prune_on_second_eager() {
     mesh_all_eager(&[&a, &b]);
 
     let transfer = t("alice", 0, "bob", 3);
-    let mut auth = Authority::new("a0", key(0));
+    let mut auth = authority(0);
     let vote = auth.handle(&transfer).unwrap();
     let msg = AuthorityMsg::Vote(vote.clone());
     let id = msg_id_of(&encode_authority_msg(&msg));
@@ -145,11 +193,19 @@ fn no_duplicate_delivery_prune_on_second_eager() {
 /// 4. End-to-end certify over the epidemic layer matches full-mesh certify semantics.
 #[test]
 fn certify_over_epidemic_layer_reaches_quorum() {
+    let policy = policy();
+    let committee = committee(&policy);
     let authorities: Vec<Authority> = (0..4u8)
-        .map(|i| Authority::new(format!("a{i}"), key(i)))
+        .map(|i| {
+            Authority::new(
+                format!("a{i}"),
+                key(i),
+                policy.clone(),
+                committee.id(),
+                authority_genesis(),
+            )
+        })
         .collect();
-    let committee =
-        Committee::new(authorities.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
     assert_eq!(committee.quorum(), 3);
 
     let net = EpidemicNetwork::new();
@@ -182,7 +238,7 @@ fn certify_over_epidemic_layer_reaches_quorum() {
 
     let mut ledger =
         Ledger::genesis([("alice".to_string(), 100u128), ("bob".to_string(), 0u128)]);
-    ledger.apply_verified(&verified).unwrap();
+    ledger.apply_verified(&verified, &committee).unwrap();
     assert_eq!(ledger.balance(&"bob".to_string()), 30);
     assert_eq!(ledger.balance(&"alice".to_string()), 70);
     assert_eq!(ledger.total_supply(), 100);

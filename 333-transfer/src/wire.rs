@@ -9,12 +9,18 @@
 
 use ed25519_dalek::Signature;
 
-use crate::authority::{Certificate, Vote};
+use crate::authority::{
+    Certificate, CommitteeId, Vote, MAX_AUTHORITY_ID_BYTES, MAX_COMMITTEE_MEMBERS,
+};
+use crate::owner::{
+    NetworkId, PolicyId, SignedTransfer, MAX_ACCOUNT_ID_BYTES, MAX_NETWORK_ID_BYTES,
+};
 use crate::Transfer;
 
-const DOMAIN_TRANSFER: &[u8] = b"transfer333/wire-transfer/v1\0";
-const DOMAIN_VOTE: &[u8] = b"transfer333/wire-vote/v1\0";
-const DOMAIN_CERT: &[u8] = b"transfer333/wire-cert/v1\0";
+const DOMAIN_TRANSFER: &[u8] = b"transfer333/wire-signed-order/v2\0";
+const DOMAIN_VOTE: &[u8] = b"transfer333/wire-vote/v2\0";
+const DOMAIN_CERT: &[u8] = b"transfer333/wire-cert/v2\0";
+pub const MAX_CERTIFICATE_VOTES: usize = MAX_COMMITTEE_MEMBERS;
 
 /// Wire tag for [`AuthorityMsg`] over TCP / framed streams.
 pub const TAG_ORDER: u8 = 0;
@@ -25,7 +31,7 @@ pub const TAG_CERT: u8 = 2;
 /// Shared by the in-memory mesh and the TCP backend.
 #[derive(Debug, Clone)]
 pub enum AuthorityMsg {
-    Order(Transfer),
+    Order(SignedTransfer),
     Vote(Vote),
     Cert(Certificate),
 }
@@ -36,7 +42,15 @@ pub enum WireError {
     Truncated,
     BadDomain,
     BadUtf8,
+    BadNetworkId,
     BadSignature,
+    LengthOverflow { field: &'static str, length: u64 },
+    FieldTooLong {
+        field: &'static str,
+        length: u64,
+        max: usize,
+    },
+    TooManyVotes { count: u64, max: usize },
     /// Unknown `AuthorityMsg` tag (not Order/Vote/Cert).
     UnknownTag(u8),
 }
@@ -52,12 +66,19 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
     put_bytes(buf, s.as_bytes());
 }
 
-/// Transfer body without a domain tag (nested inside Vote / Certificate).
+/// Unsigned transfer payload without a domain tag.
 fn put_transfer_body(buf: &mut Vec<u8>, t: &Transfer) {
     put_str(buf, &t.from);
     buf.extend_from_slice(&t.from_seq.to_le_bytes());
     put_str(buf, &t.to);
     buf.extend_from_slice(&t.amount.to_le_bytes());
+}
+
+fn put_signed_transfer_body(buf: &mut Vec<u8>, order: &SignedTransfer) {
+    buf.extend_from_slice(order.policy_id().as_bytes());
+    put_str(buf, order.network_id.as_str());
+    put_transfer_body(buf, &order.transfer);
+    buf.extend_from_slice(&order.owner_signature().to_bytes());
 }
 
 fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8], WireError> {
@@ -79,22 +100,41 @@ fn take_u128(input: &mut &[u8]) -> Result<u128, WireError> {
     Ok(u128::from_le_bytes(b.try_into().expect("16 bytes")))
 }
 
-fn take_len_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], WireError> {
-    let n = take_u64(input)? as usize;
+fn take_len_bytes<'a>(
+    input: &mut &'a [u8],
+    field: &'static str,
+    max: usize,
+) -> Result<&'a [u8], WireError> {
+    let length = take_u64(input)?;
+    let n = usize::try_from(length)
+        .map_err(|_| WireError::LengthOverflow { field, length })?;
+    if n > max {
+        return Err(WireError::FieldTooLong {
+            field,
+            length,
+            max,
+        });
+    }
     take(input, n)
 }
 
-fn take_str(input: &mut &[u8]) -> Result<String, WireError> {
-    let b = take_len_bytes(input)?;
+fn take_str(
+    input: &mut &[u8],
+    field: &'static str,
+    max: usize,
+) -> Result<String, WireError> {
+    // The length prefix is converted and bounded before UTF-8 validation or
+    // `to_owned`, so an attacker cannot drive an unbounded String allocation.
+    let b = take_len_bytes(input, field, max)?;
     std::str::from_utf8(b)
         .map(|s| s.to_owned())
         .map_err(|_| WireError::BadUtf8)
 }
 
 fn take_transfer_body(input: &mut &[u8]) -> Result<Transfer, WireError> {
-    let from = take_str(input)?;
+    let from = take_str(input, "transfer.from", MAX_ACCOUNT_ID_BYTES)?;
     let from_seq = take_u64(input)?;
-    let to = take_str(input)?;
+    let to = take_str(input, "transfer.to", MAX_ACCOUNT_ID_BYTES)?;
     let amount = take_u128(input)?;
     Ok(Transfer {
         from,
@@ -102,6 +142,42 @@ fn take_transfer_body(input: &mut &[u8]) -> Result<Transfer, WireError> {
         to,
         amount,
     })
+}
+
+fn take_network_id(input: &mut &[u8]) -> Result<NetworkId, WireError> {
+    NetworkId::new(take_str(
+        input,
+        "network_id",
+        MAX_NETWORK_ID_BYTES,
+    )?)
+    .map_err(|_| WireError::BadNetworkId)
+}
+
+fn take_policy_id(input: &mut &[u8]) -> Result<PolicyId, WireError> {
+    let bytes: [u8; 32] = take(input, 32)?
+        .try_into()
+        .expect("take returned exactly 32 policy-id bytes");
+    Ok(PolicyId::from_bytes(bytes))
+}
+
+fn take_committee_id(input: &mut &[u8]) -> Result<CommitteeId, WireError> {
+    let bytes: [u8; 32] = take(input, 32)?
+        .try_into()
+        .expect("take returned exactly 32 committee-id bytes");
+    Ok(CommitteeId::from_bytes(bytes))
+}
+
+fn take_signed_transfer_body(input: &mut &[u8]) -> Result<SignedTransfer, WireError> {
+    let policy_id = take_policy_id(input)?;
+    let network_id = take_network_id(input)?;
+    let transfer = take_transfer_body(input)?;
+    let owner_signature = take_signature(input)?;
+    Ok(SignedTransfer::from_parts(
+        network_id,
+        policy_id,
+        transfer,
+        owner_signature,
+    ))
 }
 
 fn take_signature(input: &mut &[u8]) -> Result<Signature, WireError> {
@@ -120,16 +196,25 @@ fn expect_domain(input: &mut &[u8], domain: &[u8]) -> Result<(), WireError> {
 
 fn put_vote_body(buf: &mut Vec<u8>, v: &Vote) {
     put_str(buf, &v.authority);
+    buf.extend_from_slice(v.committee_id.as_bytes());
+    buf.extend_from_slice(v.policy_id.as_bytes());
+    put_str(buf, v.network_id.as_str());
     put_transfer_body(buf, &v.transfer);
     buf.extend_from_slice(&v.signature.to_bytes());
 }
 
 fn take_vote_body(input: &mut &[u8]) -> Result<Vote, WireError> {
-    let authority = take_str(input)?;
+    let authority = take_str(input, "vote.authority", MAX_AUTHORITY_ID_BYTES)?;
+    let committee_id = take_committee_id(input)?;
+    let policy_id = take_policy_id(input)?;
+    let network_id = take_network_id(input)?;
     let transfer = take_transfer_body(input)?;
     let signature = take_signature(input)?;
     Ok(Vote {
         authority,
+        committee_id,
+        policy_id,
+        network_id,
         transfer,
         signature,
     })
@@ -137,28 +222,37 @@ fn take_vote_body(input: &mut &[u8]) -> Result<Vote, WireError> {
 
 // --- public encode / decode --------------------------------------------------
 
-/// Encode a `Transfer` with domain separation.
-pub fn encode_transfer(t: &Transfer) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64 + t.from.len() + t.to.len());
+/// Encode an owner-authenticated order with the fail-closed v2 domain.
+pub fn encode_transfer(order: &SignedTransfer) -> Vec<u8> {
+    let t = &order.transfer;
+    let mut buf = Vec::with_capacity(
+        128 + order.network_id.as_str().len() + t.from.len() + t.to.len(),
+    );
     buf.extend_from_slice(DOMAIN_TRANSFER);
-    put_transfer_body(&mut buf, t);
+    put_signed_transfer_body(&mut buf, order);
     buf
 }
 
-/// Decode a domain-tagged `Transfer`. Consumes the whole buffer (no trailing junk).
-pub fn decode_transfer(bytes: &[u8]) -> Result<Transfer, WireError> {
+/// Decode a v2 owner-authenticated order. Unsigned v1 domains fail closed.
+pub fn decode_transfer(bytes: &[u8]) -> Result<SignedTransfer, WireError> {
     let mut input = bytes;
     expect_domain(&mut input, DOMAIN_TRANSFER)?;
-    let t = take_transfer_body(&mut input)?;
+    let order = take_signed_transfer_body(&mut input)?;
     if !input.is_empty() {
         return Err(WireError::Truncated);
     }
-    Ok(t)
+    Ok(order)
 }
 
 /// Encode a signed `Vote` (authority id + transfer + 64-byte Ed25519 sig).
 pub fn encode_vote(v: &Vote) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(128 + v.authority.len() + v.transfer.from.len() + v.transfer.to.len());
+    let mut buf = Vec::with_capacity(
+        160
+            + v.authority.len()
+            + v.network_id.as_str().len()
+            + v.transfer.from.len()
+            + v.transfer.to.len(),
+    );
     buf.extend_from_slice(DOMAIN_VOTE);
     put_vote_body(&mut buf, v);
     buf
@@ -175,11 +269,11 @@ pub fn decode_vote(bytes: &[u8]) -> Result<Vote, WireError> {
     Ok(v)
 }
 
-/// Encode a quorum `Certificate` (transfer + full vote list).
+/// Encode a quorum `Certificate` (owner-signed order + full vote list).
 pub fn encode_certificate(c: &Certificate) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128 + c.votes.len() * 128);
     buf.extend_from_slice(DOMAIN_CERT);
-    put_transfer_body(&mut buf, &c.transfer);
+    put_signed_transfer_body(&mut buf, &c.order);
     buf.extend_from_slice(&(c.votes.len() as u64).to_le_bytes());
     for v in &c.votes {
         put_vote_body(&mut buf, v);
@@ -192,8 +286,18 @@ pub fn encode_certificate(c: &Certificate) -> Vec<u8> {
 pub fn decode_certificate(bytes: &[u8]) -> Result<Certificate, WireError> {
     let mut input = bytes;
     expect_domain(&mut input, DOMAIN_CERT)?;
-    let transfer = take_transfer_body(&mut input)?;
-    let n = take_u64(&mut input)? as usize;
+    let order = take_signed_transfer_body(&mut input)?;
+    let count = take_u64(&mut input)?;
+    if count > MAX_CERTIFICATE_VOTES as u64 {
+        return Err(WireError::TooManyVotes {
+            count,
+            max: MAX_CERTIFICATE_VOTES,
+        });
+    }
+    let n = usize::try_from(count).map_err(|_| WireError::TooManyVotes {
+        count,
+        max: MAX_CERTIFICATE_VOTES,
+    })?;
     let mut votes = Vec::with_capacity(n);
     for _ in 0..n {
         votes.push(take_vote_body(&mut input)?);
@@ -201,7 +305,7 @@ pub fn decode_certificate(bytes: &[u8]) -> Result<Certificate, WireError> {
     if !input.is_empty() {
         return Err(WireError::Truncated);
     }
-    Ok(Certificate { transfer, votes })
+    Ok(Certificate { order, votes })
 }
 
 // --- AuthorityMsg frame (1-byte tag + domain body) ---------------------------
@@ -252,8 +356,9 @@ pub fn decode_authority_msg(bytes: &[u8]) -> Result<AuthorityMsg, WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::{signing_message, Authority, Certificate, Committee};
-    use ed25519_dalek::{Signer, SigningKey};
+    use crate::authority::{Authority, Certificate, Committee};
+    use crate::{Ledger, OwnerAuthError, OwnerRegistry, TransferPolicy};
+    use ed25519_dalek::SigningKey;
 
     fn tx(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
         Transfer {
@@ -268,53 +373,139 @@ mod tests {
         SigningKey::from_bytes(&[i; 32])
     }
 
-    fn setup(n: u8) -> (Committee, Vec<Authority>) {
+    fn policy() -> TransferPolicy {
+        TransferPolicy::new(
+            NetworkId::new("wire-testnet").unwrap(),
+            OwnerRegistry::new([
+                ("alice", key(42).verifying_key()),
+                ("bob", key(43).verifying_key()),
+                ("carol", key(44).verifying_key()),
+                ("a", key(45).verifying_key()),
+                ("b", key(46).verifying_key()),
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn signed_tx(
+        policy: &TransferPolicy,
+        from: &str,
+        owner_seed: u8,
+        seq: u64,
+        to: &str,
+        amount: u128,
+    ) -> SignedTransfer {
+        SignedTransfer::sign(policy, tx(from, seq, to, amount), &key(owner_seed))
+    }
+
+    fn setup(n: u8) -> (Committee, Vec<Authority>, TransferPolicy) {
+        let policy = policy();
+        let committee = Committee::new(
+            (0..n).map(|i| (format!("a{i}"), key(i).verifying_key())),
+            policy.clone(),
+        )
+        .unwrap();
+        let genesis = Ledger::genesis([
+            ("alice".into(), 100),
+            ("bob".into(), 0),
+            ("carol".into(), 0),
+            ("a".into(), 0),
+            ("b".into(), 0),
+        ]);
         let auth: Vec<Authority> = (0..n)
-            .map(|i| Authority::new(format!("a{i}"), key(i)))
+            .map(|i| {
+                Authority::new(
+                    format!("a{i}"),
+                    key(i),
+                    policy.clone(),
+                    committee.id(),
+                    genesis.clone(),
+                )
+            })
             .collect();
-        let committee =
-            Committee::new(auth.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
-        (committee, auth)
+        (committee, auth, policy)
     }
 
     #[test]
     fn transfer_round_trip() {
-        let t = tx("alice", 7, "bob", 42);
-        let bytes = encode_transfer(&t);
-        assert_eq!(decode_transfer(&bytes).unwrap(), t);
+        let policy = policy();
+        let order = signed_tx(&policy, "alice", 42, 7, "bob", 42);
+        let bytes = encode_transfer(&order);
+        let back = decode_transfer(&bytes).unwrap();
+        assert_eq!(back, order);
+        assert_eq!(back.policy_id(), policy.id());
+        assert_eq!(back.verify(&policy), Ok(()));
     }
 
     #[test]
     fn vote_round_trip() {
-        let t = tx("alice", 0, "bob", 10);
-        let mut a = Authority::new("a0", key(0));
-        let v = a.handle(&t).unwrap();
+        let (_committee, mut authorities, policy) = setup(1);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 10);
+        let v = authorities[0].handle(&order).unwrap();
         let bytes = encode_vote(&v);
         let back = decode_vote(&bytes).unwrap();
         assert_eq!(back, v);
+        assert_eq!(back.committee_id, v.committee_id);
+        assert_eq!(back.policy_id, policy.id());
+    }
+
+    #[test]
+    fn tampered_order_policy_id_round_trips_but_fails_policy_validation() {
+        let policy = policy();
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 10);
+        let mut bytes = encode_transfer(&order);
+        bytes[DOMAIN_TRANSFER.len()] ^= 0x01;
+
+        let tampered = decode_transfer(&bytes).expect("policy id remains structurally valid");
+        assert_ne!(tampered.policy_id(), policy.id());
+        assert!(matches!(
+            tampered.verify(&policy),
+            Err(OwnerAuthError::WrongPolicy { .. })
+        ));
+    }
+
+    #[test]
+    fn tampered_vote_policy_or_committee_id_cannot_validate_for_order() {
+        let (committee, mut authorities, policy) = setup(4);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 10);
+        let vote = authorities[0].handle(&order).unwrap();
+        let id_offset = DOMAIN_VOTE.len() + 8 + vote.authority.len();
+
+        let mut wrong_committee = encode_vote(&vote);
+        wrong_committee[id_offset] ^= 0x01;
+        let wrong_committee = decode_vote(&wrong_committee).unwrap();
+        assert_ne!(wrong_committee.committee_id, vote.committee_id);
+        assert!(wrong_committee.validate_for(&order, &committee).is_err());
+
+        let mut wrong_policy = encode_vote(&vote);
+        wrong_policy[id_offset + 32] ^= 0x01;
+        let wrong_policy = decode_vote(&wrong_policy).unwrap();
+        assert_ne!(wrong_policy.policy_id, vote.policy_id);
+        assert!(wrong_policy.validate_for(&order, &committee).is_err());
     }
 
     #[test]
     fn certificate_round_trip() {
-        let t = tx("alice", 0, "bob", 30);
-        let (c, mut auth) = setup(4);
+        let (c, mut auth, policy) = setup(4);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 30);
         let votes: Vec<Vote> = auth
             .iter_mut()
             .take(3)
-            .map(|a| a.handle(&t).unwrap())
+            .map(|a| a.handle(&order).unwrap())
             .collect();
-        let cert = Certificate::assemble(t, votes, &c).expect("quorum");
+        let cert = Certificate::assemble(order, votes, &c).expect("quorum");
         let bytes = encode_certificate(&cert);
         let back = decode_certificate(&bytes).unwrap();
-        assert_eq!(back.transfer, cert.transfer);
+        assert_eq!(back.order, cert.order);
         assert_eq!(back.votes, cert.votes);
         assert!(back.is_valid(&c));
     }
 
     #[test]
     fn wrong_domain_rejected() {
-        let t = tx("alice", 0, "bob", 1);
-        let mut bytes = encode_transfer(&t);
+        let policy = policy();
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 1);
+        let mut bytes = encode_transfer(&order);
         // Corrupt the domain tag.
         bytes[0] ^= 0xff;
         assert_eq!(decode_transfer(&bytes), Err(WireError::BadDomain));
@@ -322,22 +513,110 @@ mod tests {
 
     #[test]
     fn truncated_stream_rejected() {
-        let t = tx("alice", 0, "bob", 1);
-        let bytes = encode_transfer(&t);
+        let policy = policy();
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 1);
+        let bytes = encode_transfer(&order);
         assert!(decode_transfer(&bytes[..bytes.len().saturating_sub(1)]).is_err());
+    }
+
+    #[test]
+    fn unsigned_v1_order_fails_closed() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(b"transfer333/wire-transfer/v1\0");
+        put_transfer_body(&mut legacy, &tx("alice", 0, "bob", 1));
+        assert_eq!(decode_transfer(&legacy), Err(WireError::BadDomain));
+
+        let mut framed = vec![TAG_ORDER];
+        framed.extend_from_slice(&legacy);
+        assert!(matches!(
+            decode_authority_msg(&framed),
+            Err(WireError::BadDomain)
+        ));
+    }
+
+    #[test]
+    fn oversized_network_length_is_rejected_before_string_allocation() {
+        let policy = policy();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DOMAIN_TRANSFER);
+        bytes.extend_from_slice(policy.id().as_bytes());
+        bytes.extend_from_slice(&((MAX_NETWORK_ID_BYTES as u64) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_transfer(&bytes),
+            Err(WireError::FieldTooLong {
+                field: "network_id",
+                length: (MAX_NETWORK_ID_BYTES as u64) + 1,
+                max: MAX_NETWORK_ID_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn oversized_account_length_is_rejected_before_string_allocation() {
+        let policy = policy();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DOMAIN_TRANSFER);
+        bytes.extend_from_slice(policy.id().as_bytes());
+        put_str(&mut bytes, policy.network_id().as_str());
+        bytes.extend_from_slice(&((MAX_ACCOUNT_ID_BYTES as u64) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_transfer(&bytes),
+            Err(WireError::FieldTooLong {
+                field: "transfer.from",
+                length: (MAX_ACCOUNT_ID_BYTES as u64) + 1,
+                max: MAX_ACCOUNT_ID_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn oversized_authority_length_is_rejected_before_string_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DOMAIN_VOTE);
+        bytes.extend_from_slice(&((MAX_AUTHORITY_ID_BYTES as u64) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_vote(&bytes),
+            Err(WireError::FieldTooLong {
+                field: "vote.authority",
+                length: (MAX_AUTHORITY_ID_BYTES as u64) + 1,
+                max: MAX_AUTHORITY_ID_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn absurd_certificate_vote_count_is_rejected_before_allocation() {
+        assert_eq!(MAX_CERTIFICATE_VOTES, MAX_COMMITTEE_MEMBERS);
+        let policy = policy();
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 1);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DOMAIN_CERT);
+        put_signed_transfer_body(&mut bytes, &order);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        assert!(matches!(
+            decode_certificate(&bytes),
+            Err(WireError::TooManyVotes {
+                count: u64::MAX,
+                max: MAX_CERTIFICATE_VOTES,
+            })
+        ));
     }
 
     #[test]
     fn tampered_vote_bytes_fail_certificate_is_valid() {
         // A flipped signature byte must not silently produce a valid cert.
-        let t = tx("alice", 0, "bob", 10);
-        let (committee, mut auth) = setup(4);
+        let (committee, mut auth, policy) = setup(4);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 10);
         let votes: Vec<Vote> = auth
             .iter_mut()
             .take(3)
-            .map(|a| a.handle(&t).unwrap())
+            .map(|a| a.handle(&order).unwrap())
             .collect();
-        let cert = Certificate::assemble(t.clone(), votes, &committee).unwrap();
+        let cert = Certificate::assemble(order, votes, &committee).unwrap();
         assert!(cert.is_valid(&committee));
 
         let mut bytes = encode_certificate(&cert);
@@ -360,14 +639,14 @@ mod tests {
 
     #[test]
     fn tampered_standalone_vote_fails_when_assembled() {
-        let t = tx("alice", 0, "bob", 10);
-        let (committee, mut auth) = setup(4);
+        let (committee, mut auth, policy) = setup(4);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 10);
         let good: Vec<Vote> = auth
             .iter_mut()
             .take(2)
-            .map(|a| a.handle(&t).unwrap())
+            .map(|a| a.handle(&order).unwrap())
             .collect();
-        let mut v2 = auth[2].handle(&t).unwrap();
+        let mut v2 = auth[2].handle(&order).unwrap();
         let mut wire = encode_vote(&v2);
         // Corrupt signature bytes at the end of the vote stream.
         let last = wire.len() - 1;
@@ -378,7 +657,7 @@ mod tests {
                 let mut all = good;
                 all.push(v2);
                 assert!(
-                    Certificate::assemble(t, all, &committee).is_none(),
+                    Certificate::assemble(order, all, &committee).is_none(),
                     "tampered vote must not form a valid certificate"
                 );
             }
@@ -389,35 +668,28 @@ mod tests {
     }
 
     #[test]
-    fn wire_layout_is_independent_of_signing_message_but_vote_still_verifies() {
-        // Sanity: round-tripped vote still verifies under the same signing_message.
-        let t = tx("alice", 0, "bob", 3);
-        let sk = key(9);
-        let v = Vote {
-            authority: "a9".into(),
-            transfer: t.clone(),
-            signature: sk.sign(&signing_message(&t)),
-        };
+    fn wire_layout_round_trip_preserves_a_valid_vote_preimage() {
+        let (committee, mut authorities, policy) = setup(4);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 3);
+        let v = authorities[0].handle(&order).unwrap();
         let back = decode_vote(&encode_vote(&v)).unwrap();
-        assert_eq!(back.signature, v.signature);
-        sk.verifying_key()
-            .verify_strict(&signing_message(&t), &back.signature)
-            .unwrap();
+        assert_eq!(back, v);
+        assert!(back.validate_for(&order, &committee).is_ok());
     }
 
     #[test]
     fn authority_msg_frame_round_trip_order_vote_cert() {
-        let t = tx("alice", 0, "bob", 30);
-        let (committee, mut auth) = setup(4);
+        let (committee, mut auth, policy) = setup(4);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 30);
 
-        let order = AuthorityMsg::Order(t.clone());
-        let back = decode_authority_msg(&encode_authority_msg(&order)).unwrap();
+        let order_msg = AuthorityMsg::Order(order.clone());
+        let back = decode_authority_msg(&encode_authority_msg(&order_msg)).unwrap();
         match back {
-            AuthorityMsg::Order(got) => assert_eq!(got, t),
+            AuthorityMsg::Order(got) => assert_eq!(got, order),
             _ => panic!("expected Order"),
         }
 
-        let vote = auth[0].handle(&t).unwrap();
+        let vote = auth[0].handle(&order).unwrap();
         let vote_msg = AuthorityMsg::Vote(vote.clone());
         let back = decode_authority_msg(&encode_authority_msg(&vote_msg)).unwrap();
         match back {
@@ -428,14 +700,14 @@ mod tests {
         let votes: Vec<Vote> = auth
             .iter_mut()
             .take(3)
-            .map(|a| a.handle(&t).unwrap())
+            .map(|a| a.handle(&order).unwrap())
             .collect();
-        let cert = Certificate::assemble(t, votes, &committee).unwrap();
+        let cert = Certificate::assemble(order, votes, &committee).unwrap();
         let cert_msg = AuthorityMsg::Cert(cert.clone());
         let back = decode_authority_msg(&encode_authority_msg(&cert_msg)).unwrap();
         match back {
             AuthorityMsg::Cert(got) => {
-                assert_eq!(got.transfer, cert.transfer);
+                assert_eq!(got.order, cert.order);
                 assert_eq!(got.votes, cert.votes);
                 assert!(got.is_valid(&committee));
             }
@@ -446,14 +718,14 @@ mod tests {
     #[test]
     fn authority_msg_frame_tamper_fails_certificate_is_valid() {
         // Same guarantee as in-memory: a flipped cert byte must not yield a valid QC.
-        let t = tx("alice", 0, "bob", 10);
-        let (committee, mut auth) = setup(4);
+        let (committee, mut auth, policy) = setup(4);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 10);
         let votes: Vec<Vote> = auth
             .iter_mut()
             .take(3)
-            .map(|a| a.handle(&t).unwrap())
+            .map(|a| a.handle(&order).unwrap())
             .collect();
-        let cert = Certificate::assemble(t, votes, &committee).unwrap();
+        let cert = Certificate::assemble(order, votes, &committee).unwrap();
         assert!(cert.is_valid(&committee));
 
         let mut bytes = encode_authority_msg(&AuthorityMsg::Cert(cert));
@@ -476,7 +748,9 @@ mod tests {
 
     #[test]
     fn authority_msg_unknown_tag_rejected() {
-        let mut bytes = encode_authority_msg(&AuthorityMsg::Order(tx("a", 0, "b", 1)));
+        let policy = policy();
+        let order = signed_tx(&policy, "a", 45, 0, "b", 1);
+        let mut bytes = encode_authority_msg(&AuthorityMsg::Order(order));
         bytes[0] = 0xFF;
         match decode_authority_msg(&bytes) {
             Err(WireError::UnknownTag(0xFF)) => {}

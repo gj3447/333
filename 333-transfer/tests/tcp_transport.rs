@@ -8,23 +8,51 @@ use std::time::Duration;
 
 use transfer333::{
     certify_via_mesh_rounds_with_pause, disseminate_certificate_with_pause, Authority, Certified,
-    Committee, Ledger, MeshLedger, SigningKey, TcpAuthorityNet, TcpEndpoint, Transfer,
+    Committee, Ledger, MeshLedger, NetworkId, OwnerRegistry, SignedTransfer, SigningKey,
+    TcpAuthorityNet, TcpEndpoint, Transfer, TransferPolicy,
 };
 
 const PAUSE: Duration = Duration::from_millis(10);
 const MAX_ROUNDS: usize = 80;
 
-fn t(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
-    Transfer {
-        from: from.into(),
-        from_seq: seq,
-        to: to.into(),
-        amount,
-    }
-}
-
 fn key(i: u8) -> SigningKey {
     SigningKey::from_bytes(&[i; 32])
+}
+
+fn policy() -> TransferPolicy {
+    TransferPolicy::new(
+        NetworkId::new("tcp-transport-testnet").unwrap(),
+        OwnerRegistry::new([
+            ("alice", key(42).verifying_key()),
+            ("bob", key(43).verifying_key()),
+            ("carol", key(44).verifying_key()),
+        ])
+        .unwrap(),
+    )
+}
+
+fn authority_genesis() -> Ledger {
+    Ledger::genesis([
+        ("alice".to_string(), 100),
+        ("bob".to_string(), 0),
+        ("carol".to_string(), 0),
+        ("a".to_string(), 100),
+        ("b".to_string(), 0),
+    ])
+}
+
+fn t(from: &str, seq: u64, to: &str, amount: u128) -> SignedTransfer {
+    let policy = policy();
+    SignedTransfer::sign(
+        &policy,
+        Transfer {
+            from: from.into(),
+            from_seq: seq,
+            to: to.into(),
+            amount,
+        },
+        &key(42),
+    )
 }
 
 fn genesis_alice_bob() -> Ledger {
@@ -53,12 +81,23 @@ struct TcpMesh {
 
 impl TcpMesh {
     fn boot(n_auth: u8, n_ledgers: usize, ledger_genesis: impl Fn() -> Ledger) -> Self {
+        let policy = policy();
+        let committee = Committee::new(
+            (0..n_auth).map(|i| (format!("a{i}"), key(i).verifying_key())),
+            policy.clone(),
+        )
+        .unwrap();
         let authorities: Vec<Authority> = (0..n_auth)
-            .map(|i| Authority::new(format!("a{i}"), key(i)))
+            .map(|i| {
+                Authority::new(
+                    format!("a{i}"),
+                    key(i),
+                    policy.clone(),
+                    committee.id(),
+                    authority_genesis(),
+                )
+            })
             .collect();
-        let committee =
-            Committee::new(authorities.iter().map(|a| (a.id().clone(), a.verifying_key())))
-                .unwrap();
 
         let auth_nets: Vec<TcpAuthorityNet> = authorities
             .iter()
@@ -135,7 +174,7 @@ fn tcp_honest_transfer_certifies_and_ledgers_agree() {
     assert_eq!(status, Certified::Ok, "honest path must certify over TCP");
     let verified = verified.expect("Verified");
     let cert = cert.expect("Certificate");
-    assert_eq!(verified.transfer(), &transfer);
+    assert_eq!(verified.transfer(), &transfer.transfer);
 
     // Independent ledger replicas apply via the same cert dissemination path.
     let results = disseminate_certificate_with_pause(

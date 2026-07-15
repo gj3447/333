@@ -1,92 +1,107 @@
 // KG: prom16-333-consensusless-frontier (C3, Q1),
 //     lesson-transfer333-seqnum-not-byzantine-safe-only-honest-owner-2026-07-13,
-//     consensus-prom16-333-no-blockchain-2026-07-12,
-//     assess-333-engine-fsm-2026-07-13 (action 9: type-state rail safety),
-//     verdict-user-333-coin-local-credit-first-gated-flip-2026-07-14 (real Ed25519 = this file)
+//     assess-333-engine-fsm-2026-07-13 (type-state rail safety)
 //
-// FastPay-style authority quorum-certificate layer — the Byzantine double-spend
-// defence that the bare sequence-number ledger (see `Ledger::apply`) lacks.
-//
-// WHY (PROM 16, 2026-07-13, Consensus C3)
-// ---------------------------------------
-// A per-account sequence number checked over a crash-fault CRDT protects only an
-// HONEST owner. A Byzantine / key-compromised owner can author two DIFFERENT
-// transfers at the SAME (account, seq) and hand them to disjoint replicas — a
-// double-spend (proved by `KNOWN_LIMITATION_equivocation_*` in lib.rs).
-//
-// The real FastPay defence (Baudet et al. 2020; Cachin-Guerraoui-Rodrigues
-// "Signed Echo Broadcast", Alg 3.17) is a Byzantine Consistent Broadcast over an
-// INDEPENDENT authority committee. Each authority signs at most ONE transfer per
-// (account, seq) slot (lock-on-first-seen) AND only for the account's NEXT
-// expected sequence (no seq-skipping). A transfer is final once it collects a
-// quorum of such signatures = a certificate.
-//
-// SAFETY (FastPay Lemma A.1): with quorum(n) = n - f (f = ⌊(n-1)/3⌋) any two
-// quorums intersect in n - 2f ≥ f+1 nodes, i.e. in ≥1 HONEST authority. That
-// honest authority signed at most one transfer for the slot, so at most one
-// transfer can ever assemble a certificate. Double-spend is barred WITHOUT any
-// global total order / consensus — single-owner transfer keeps consensus
-// number 1 (Guerraoui PODC 2019) while being Byzantine-safe.
-//
-// TYPE-STATE RAIL (assessment action 9, 2026-07-13): the only way to obtain a
-// `Verified` transfer is `Certificate::verify(&committee)`; `Ledger::apply_verified`
-// is the ONLY Byzantine-safe apply and it takes a `Verified`. So the unsafe
-// double-spend-vulnerable path is not merely discouraged — a caller cannot mint a
-// `Verified` without a valid quorum certificate. The verifier always owns the
-// `Committee` (never a caller-supplied size), and roster membership is enforced.
-//
-// AUTHENTICITY (2026-07-14, verdict-user-333-coin-local-credit-first-gated-flip):
-// a `Vote` now carries a REAL Ed25519 signature (RFC 8032) over the transfer's
-// canonical bytes, produced by the authority's secret `SigningKey`. `Committee`
-// binds each `AuthorityId` to its `VerifyingKey`, and `Certificate::is_valid`
-// verifies every vote's signature against that key. This closes the last gap the
-// prior stand-in `Vote` left open: uniqueness (one transfer per slot per honest
-// authority) was already enforced, but a vote was FORGEABLE — anyone knowing a
-// committee id could fabricate `Vote { authority, transfer }`. Now a vote is
-// unforgeable outside the holder of the authority's secret key, so an attacker
-// cannot manufacture the honest-authority votes a certificate needs. What remains
-// a follow-up is the gossip/broadcast TRANSPORT (this layer is still in-memory,
-// networking-free, unit-testable); the safety + authenticity CORE is complete.
+// FastPay-style authority quorum-certificate layer. The owner signs an order;
+// an independent authority committee then signs at most one state-valid order
+// per (account, sequence) slot. A verifier accepts only a quorum certificate
+// tied to its exact committee, owner policy, network, and transfer.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 
-use crate::{AccountId, Transfer};
+use crate::owner::{
+    put_network_transfer_body, NetworkId, OwnerAuthError, PolicyId, SignedTransfer,
+    TransferPolicy,
+};
+use crate::{AccountId, Ledger, Reject, Transfer};
 
-/// Identifier of an independent validation authority — DISTINCT from any account
-/// owner. Bound to an Ed25519 public key (identity333) by the `Committee`.
+const AUTHORITY_VOTE_DOMAIN: &[u8] = b"transfer333/authority-vote/v4\0";
+const COMMITTEE_ID_DOMAIN: &[u8] = b"transfer333/committee-id/v1\0";
+
+/// Wire and admission bound for one committee. This also bounds certificate
+/// validation work and decoded certificate allocation.
+pub const MAX_COMMITTEE_MEMBERS: usize = 1024;
+
+/// Authority ids are human-readable deployment aliases, not unbounded input.
+pub const MAX_AUTHORITY_ID_BYTES: usize = 256;
+
+/// Identifier of an independent validation authority, distinct from an account
+/// owner. A [`Committee`] binds this alias to an Ed25519 public key.
 pub type AuthorityId = String;
 
-/// Domain-separated, length-prefixed canonical bytes an authority signs to vote
-/// for `t`. Unambiguous (every variable-length field is length-prefixed) and
-/// domain-separated so a 333 authority vote can never be replayed as any other
-/// Ed25519 message. Binding the vote to the exact transfer (incl. `from_seq`) is
-/// what ties an authority's at-most-one-per-slot signature to a specific spend.
-pub fn signing_message(t: &Transfer) -> Vec<u8> {
-    let mut m = Vec::with_capacity(64 + t.from.len() + t.to.len());
-    m.extend_from_slice(b"transfer333/authority-vote/v1\0");
-    let from = t.from.as_bytes();
-    m.extend_from_slice(&(from.len() as u64).to_le_bytes());
-    m.extend_from_slice(from);
-    m.extend_from_slice(&t.from_seq.to_le_bytes());
-    let to = t.to.as_bytes();
-    m.extend_from_slice(&(to.len() as u64).to_le_bytes());
-    m.extend_from_slice(to);
-    m.extend_from_slice(&t.amount.to_le_bytes());
-    m
+/// Canonical digest of `(PolicyId, sorted AuthorityId -> authority key roster)`.
+///
+/// The roster binding is security-critical: a quorum of votes collected for a
+/// four-member committee must not be reusable as a certificate for a different
+/// three-member committee that happens to contain the same signers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommitteeId([u8; 32]);
+
+impl CommitteeId {
+    /// Construct an untrusted decoded id. Trust comes only from comparing this
+    /// value with [`Committee::id`], which is computed from verifier-owned data.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
-/// Byzantine quorum size for `n` authorities tolerating f = ⌊(n-1)/3⌋ faults.
+impl fmt::Display for CommitteeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Domain-separated bytes signed by one authority vote.
 ///
-/// Returned as `n - f`, NOT the naive `2f+1`. The two agree exactly when
-/// n = 3f+1 (n=4→3, n=7→5, n=10→7, matching `333-consensus`), but for other n
-/// `2f+1` is UNSAFE: safety needs any two quorums to intersect in an honest
-/// authority, i.e. 2q - n > f. With q = n - f that is n - 2f ≥ f+1 (since
-/// n ≥ 3f+1), holding for ALL n ≥ 1; with q = 2f+1 it fails whenever n > 3f+1
-/// (e.g. n=5,f=1: two size-3 quorums can meet only at the one Byzantine node).
-/// n=0 returns 1 so an empty committee can never yield a zero-vote quorum
-/// (defence in depth; `Committee` already forbids an empty roster).
+/// Every trust-domain discriminator is covered: authority alias, committee
+/// roster, owner policy, deployment/network, and the complete transfer. No vote
+/// can be transplanted between aliases or domains while retaining a valid
+/// signature.
+pub fn authority_signing_message(
+    authority: &AuthorityId,
+    committee_id: &CommitteeId,
+    policy_id: &PolicyId,
+    network_id: &NetworkId,
+    transfer: &Transfer,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        144 + network_id.as_str().len() + transfer.from.len() + transfer.to.len(),
+    );
+    message.extend_from_slice(AUTHORITY_VOTE_DOMAIN);
+    message.extend_from_slice(committee_id.as_bytes());
+    message.extend_from_slice(&(authority.len() as u64).to_le_bytes());
+    message.extend_from_slice(authority.as_bytes());
+    message.extend_from_slice(policy_id.as_bytes());
+    put_network_transfer_body(&mut message, network_id, transfer);
+    message
+}
+
+/// Compatibility name for callers that used `signing_message` directly.
+pub fn signing_message(
+    authority: &AuthorityId,
+    committee_id: &CommitteeId,
+    policy_id: &PolicyId,
+    network_id: &NetworkId,
+    transfer: &Transfer,
+) -> Vec<u8> {
+    authority_signing_message(authority, committee_id, policy_id, network_id, transfer)
+}
+
+/// Byzantine quorum size for `n` authorities tolerating f = floor((n-1)/3).
+///
+/// `n-f` is used rather than a naive `2f+1`: for committee sizes not exactly
+/// `3f+1`, `n-f` preserves an honest intersection between any two quorums.
 pub fn quorum(n: usize) -> usize {
     if n == 0 {
         return 1;
@@ -95,102 +110,258 @@ pub fn quorum(n: usize) -> usize {
     n - f
 }
 
-/// The trusted set of authorities, each bound to its Ed25519 public key. The
-/// VERIFIER owns this; certificates are checked against the committee the verifier
-/// knows, never against a size (or key) an untrusted caller supplies.
-/// Construction rejects an empty roster.
+fn committee_id(
+    policy_id: PolicyId,
+    members: &BTreeMap<AuthorityId, VerifyingKey>,
+) -> CommitteeId {
+    let mut digest = Sha256::new();
+    digest.update(COMMITTEE_ID_DOMAIN);
+    digest.update(policy_id.as_bytes());
+    digest.update((members.len() as u64).to_le_bytes());
+    for (authority, key) in members {
+        let id = authority.as_bytes();
+        digest.update((id.len() as u64).to_le_bytes());
+        digest.update(id);
+        digest.update(key.as_bytes());
+    }
+    CommitteeId(digest.finalize().into())
+}
+
+/// Verifier-owned authority roster plus the immutable owner/network policy.
+/// Construction fails closed for an empty, oversized, or malformed roster, as
+/// well as duplicate aliases or duplicate public keys. One physical signing key
+/// therefore cannot inflate quorum power by appearing under multiple aliases.
+/// Iteration order never affects [`CommitteeId`] because members are canonicalized
+/// in a `BTreeMap` before hashing.
 #[derive(Debug, Clone)]
 pub struct Committee {
     members: BTreeMap<AuthorityId, VerifyingKey>,
+    policy: TransferPolicy,
+    id: CommitteeId,
 }
 
 impl Committee {
-    /// Build from a roster of `(authority id, Ed25519 public key)` pairs. Returns
-    /// `None` for an empty roster.
-    pub fn new<I, S>(members: I) -> Option<Committee>
+    pub fn new<I, S>(members: I, policy: TransferPolicy) -> Option<Self>
     where
         I: IntoIterator<Item = (S, VerifyingKey)>,
         S: Into<AuthorityId>,
     {
-        let members: BTreeMap<AuthorityId, VerifyingKey> =
-            members.into_iter().map(|(id, k)| (id.into(), k)).collect();
-        if members.is_empty() {
-            None
-        } else {
-            Some(Committee { members })
+        let mut roster = BTreeMap::new();
+        let mut public_keys = HashSet::new();
+        for (authority, key) in members {
+            let authority = authority.into();
+            if authority.is_empty() || authority.len() > MAX_AUTHORITY_ID_BYTES {
+                return None;
+            }
+            if roster.len() == MAX_COMMITTEE_MEMBERS {
+                return None;
+            }
+            if !public_keys.insert(key.to_bytes()) {
+                return None;
+            }
+            if roster.insert(authority, key).is_some() {
+                return None;
+            }
         }
+        if roster.is_empty() {
+            return None;
+        }
+        let id = committee_id(policy.id(), &roster);
+        Some(Self {
+            members: roster,
+            policy,
+            id,
+        })
+    }
+
+    pub fn id(&self) -> CommitteeId {
+        self.id
     }
 
     pub fn size(&self) -> usize {
         self.members.len()
     }
 
-    /// The (n-f) quorum for this committee.
     pub fn quorum(&self) -> usize {
         quorum(self.size())
     }
 
-    pub fn contains(&self, a: &AuthorityId) -> bool {
-        self.members.contains_key(a)
+    pub fn contains(&self, authority: &AuthorityId) -> bool {
+        self.members.contains_key(authority)
     }
 
-    /// The trusted Ed25519 public key for `a`, or `None` if `a` is not a member.
-    pub fn key_of(&self, a: &AuthorityId) -> Option<&VerifyingKey> {
-        self.members.get(a)
+    pub fn key_of(&self, authority: &AuthorityId) -> Option<&VerifyingKey> {
+        self.members.get(authority)
+    }
+
+    pub fn policy(&self) -> &TransferPolicy {
+        &self.policy
     }
 }
 
-/// An authority's SIGNED vote binding it to one transfer at one slot. The
-/// `signature` is a real Ed25519 signature over `signing_message(&transfer)` by
-/// the authority's secret key; a vote is therefore unforgeable outside the key
-/// holder. Verified in `Certificate::is_valid` against the committee's key for
-/// `authority`.
+/// One authority's Ed25519 vote for one exact order in one exact trust domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vote {
     pub authority: AuthorityId,
+    pub committee_id: CommitteeId,
+    pub policy_id: PolicyId,
+    pub network_id: NetworkId,
     pub transfer: Transfer,
     pub signature: Signature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoteError {
+    WrongCommittee {
+        expected: CommitteeId,
+        got: CommitteeId,
+    },
+    WrongPolicy {
+        expected: PolicyId,
+        got: PolicyId,
+    },
+    WrongNetwork {
+        expected: NetworkId,
+        got: NetworkId,
+    },
+    WrongTransfer,
+    UnknownAuthority {
+        authority: AuthorityId,
+    },
+    InvalidAuthoritySignature {
+        authority: AuthorityId,
+    },
+}
+
+impl Vote {
+    pub fn validate_for(
+        &self,
+        order: &SignedTransfer,
+        committee: &Committee,
+    ) -> Result<(), VoteError> {
+        if self.committee_id != committee.id() {
+            return Err(VoteError::WrongCommittee {
+                expected: committee.id(),
+                got: self.committee_id,
+            });
+        }
+        if order.policy_id() != committee.policy().id() {
+            return Err(VoteError::WrongPolicy {
+                expected: committee.policy().id(),
+                got: order.policy_id(),
+            });
+        }
+        if self.policy_id != order.policy_id() {
+            return Err(VoteError::WrongPolicy {
+                expected: order.policy_id(),
+                got: self.policy_id,
+            });
+        }
+        if self.network_id != order.network_id {
+            return Err(VoteError::WrongNetwork {
+                expected: order.network_id.clone(),
+                got: self.network_id.clone(),
+            });
+        }
+        if self.transfer != order.transfer {
+            return Err(VoteError::WrongTransfer);
+        }
+        let key = committee
+            .key_of(&self.authority)
+            .ok_or_else(|| VoteError::UnknownAuthority {
+                authority: self.authority.clone(),
+            })?;
+        key.verify_strict(
+            &authority_signing_message(
+                &self.authority,
+                &self.committee_id,
+                &self.policy_id,
+                &self.network_id,
+                &self.transfer,
+            ),
+            &self.signature,
+        )
+        .map_err(|_| VoteError::InvalidAuthoritySignature {
+            authority: self.authority.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorityError {
-    /// Already signed a DIFFERENT transfer at the same (account, seq): the owner
-    /// is equivocating and is refused. This refusal, replicated across a quorum,
-    /// is the whole double-spend defence.
+    /// Owner proof is checked before reading or mutating pending state.
+    OwnerAuth(OwnerAuthError),
+    /// A different order already owns this pending account/sequence slot.
     Equivocation { account: AccountId, seq: u64 },
-    /// The transfer's sequence is not the account's next expected sequence — an
-    /// owner may not skip ahead (certify seq 2 before seq 1) nor replay a past
-    /// one. Closes the arbitrary-slot-lock ordering gap (assessment action 9).
-    OutOfOrder { account: AccountId, expected: u64, got: u64 },
+    /// Owner policy knows the sender but this authority's canonical ledger does
+    /// not. This is a deployment/genesis mismatch, not an owner-auth failure.
+    UnknownSender { account: AccountId },
+    /// Zero-value orders consume a sequence without moving value and are not
+    /// admitted to the transferable rail.
+    ZeroAmount,
+    /// The order must match the canonical ledger's exact next sequence.
+    OutOfOrder {
+        account: AccountId,
+        expected: u64,
+        got: u64,
+    },
+    /// State validity is checked before a slot lock is installed.
+    InsufficientBalance {
+        account: AccountId,
+        have: u128,
+        need: u128,
+    },
+    /// Incrementing this sender's sequence would wrap and make an old order
+    /// replayable. Rejected before the account/sequence slot is locked.
+    SequenceExhausted { account: AccountId },
+    /// Crediting the recipient would overflow its balance. Rejected before any
+    /// vote or pending-state mutation.
+    BalanceOverflow {
+        account: AccountId,
+        have: u128,
+        credit: u128,
+    },
 }
 
-/// The slot an authority locks on: (account, sequence).
-fn slot(t: &Transfer) -> (AccountId, u64) {
-    (t.from.clone(), t.from_seq)
+fn slot(transfer: &Transfer) -> (AccountId, u64) {
+    (transfer.from.clone(), transfer.from_seq)
 }
 
-/// An independent authority holding a secret Ed25519 signing key. Signs at most
-/// one transfer per (account, seq) slot (lock-on-first-seen) AND only for the
-/// account's next expected sequence. The secret key never leaves the authority;
-/// only `verifying_key()` (the public half) is published into a `Committee`.
-#[derive(Debug, Clone)]
+/// Independent authority state.
+///
+/// The ledger is the single source of truth for balance and next sequence. A
+/// separate speculative sequence counter is deliberately absent: confirmation
+/// advances only through an atomic [`Ledger::apply`].
+#[derive(Debug)]
 pub struct Authority {
     id: AuthorityId,
     signing: SigningKey,
-    locked: HashMap<(AccountId, u64), Transfer>,
-    /// Per-account next acceptable sequence. Advanced by `confirm` once a
-    /// certificate for the current slot is observed. Owners cannot skip.
-    next_expected: HashMap<AccountId, u64>,
+    policy: TransferPolicy,
+    committee_id: CommitteeId,
+    ledger: Ledger,
+    locked: HashMap<(AccountId, u64), SignedTransfer>,
+    confirmed: HashMap<(AccountId, u64), [u8; 32]>,
 }
 
 impl Authority {
-    /// Create an authority from its id and its secret Ed25519 signing key.
-    pub fn new(id: impl Into<AuthorityId>, signing: SigningKey) -> Self {
+    /// Construct from the deployment's canonical genesis ledger and committee
+    /// id. Callers build the public [`Committee`] first, then instantiate each
+    /// authority with `committee.id()` and an identical canonical genesis.
+    pub fn new(
+        id: impl Into<AuthorityId>,
+        signing: SigningKey,
+        policy: TransferPolicy,
+        committee_id: CommitteeId,
+        ledger: Ledger,
+    ) -> Self {
         Self {
             id: id.into(),
             signing,
+            policy,
+            committee_id,
+            ledger,
             locked: HashMap::new(),
-            next_expected: HashMap::new(),
+            confirmed: HashMap::new(),
         }
     }
 
@@ -198,183 +369,358 @@ impl Authority {
         &self.id
     }
 
-    /// This authority's PUBLIC key, to be registered in the `Committee`.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing.verifying_key()
     }
 
-    fn expected(&self, account: &AccountId) -> u64 {
-        self.next_expected.get(account).copied().unwrap_or(0)
+    pub fn ledger(&self) -> &Ledger {
+        &self.ledger
     }
 
-    /// Sign `t` (Ed25519 over its canonical bytes) as this authority.
-    fn sign(&self, t: &Transfer) -> Vote {
+    fn sign(&self, order: &SignedTransfer) -> Vote {
+        let committee_id = self.committee_id;
+        let policy_id = order.policy_id();
+        let network_id = order.network_id.clone();
+        let transfer = order.transfer.clone();
+        let signature = self.signing.sign(&authority_signing_message(
+            &self.id,
+            &committee_id,
+            &policy_id,
+            &network_id,
+            &transfer,
+        ));
         Vote {
             authority: self.id.clone(),
-            transfer: t.clone(),
-            signature: self.signing.sign(&signing_message(t)),
+            committee_id,
+            policy_id,
+            network_id,
+            transfer,
+            signature,
         }
     }
 
-    /// Handle a transfer order. Signs (returns a `Vote`) iff:
-    ///   * the transfer's seq is the account's next expected seq (no skip/replay), and
-    ///   * the (account, seq) slot is free, or already holds THIS exact transfer
-    ///     (idempotent re-vote).
-    /// Refuses with `OutOfOrder` on a skipped/stale seq, or `Equivocation` if a
-    /// DIFFERENT transfer already holds the slot. Ed25519 signing is deterministic
-    /// (RFC 8032), so an idempotent re-vote yields the identical signature.
-    pub fn handle(&mut self, t: &Transfer) -> Result<Vote, AuthorityError> {
-        let expected = self.expected(&t.from);
-        if t.from_seq != expected {
-            return Err(AuthorityError::OutOfOrder {
-                account: t.from.clone(),
-                expected,
-                got: t.from_seq,
+    /// Validate and vote using a deterministic guard order:
+    ///
+    /// 1. owner proof; 2. pending/idempotence/equivocation; 3. sender exists;
+    /// 4. amount is positive; 5. complete ledger preflight, including sequence
+    /// and balance arithmetic; 6. install the lock and sign.
+    ///
+    /// Every rejection before step 7 is mutation-free. In particular, an
+    /// overspend cannot poison the slot and block a later valid order.
+    pub fn handle(&mut self, order: &SignedTransfer) -> Result<Vote, AuthorityError> {
+        order
+            .verify(&self.policy)
+            .map_err(AuthorityError::OwnerAuth)?;
+
+        let transfer = &order.transfer;
+        let pending_slot = slot(transfer);
+        match self.locked.get(&pending_slot) {
+            Some(previous) if previous == order => return Ok(self.sign(order)),
+            Some(_) => {
+                return Err(AuthorityError::Equivocation {
+                    account: pending_slot.0,
+                    seq: pending_slot.1,
+                });
+            }
+            None => {}
+        }
+
+        if !self.ledger.contains_account(&transfer.from) {
+            return Err(AuthorityError::UnknownSender {
+                account: transfer.from.clone(),
             });
         }
-        let s = slot(t);
-        match self.locked.get(&s) {
-            Some(prev) if prev == t => Ok(self.sign(t)),
-            Some(_) => Err(AuthorityError::Equivocation { account: s.0, seq: s.1 }),
-            None => {
-                self.locked.insert(s, t.clone());
-                Ok(self.sign(t))
-            }
+        if transfer.amount == 0 {
+            return Err(AuthorityError::ZeroAmount);
         }
+        if let Err(reject) = self.ledger.preflight(transfer) {
+            return Err(match reject {
+                Reject::UnknownSender => AuthorityError::UnknownSender {
+                    account: transfer.from.clone(),
+                },
+                Reject::StaleSequence { expected, got } => AuthorityError::OutOfOrder {
+                    account: transfer.from.clone(),
+                    expected,
+                    got,
+                },
+                Reject::Insufficient { have, need } => AuthorityError::InsufficientBalance {
+                    account: transfer.from.clone(),
+                    have,
+                    need,
+                },
+                Reject::SequenceExhausted { account } => {
+                    AuthorityError::SequenceExhausted { account }
+                }
+                Reject::BalanceOverflow {
+                    account,
+                    have,
+                    credit,
+                } => AuthorityError::BalanceOverflow {
+                    account,
+                    have,
+                    credit,
+                },
+                Reject::NoCertificate => {
+                    unreachable!("ledger preflight never checks certificate admission")
+                }
+            });
+        }
+
+        self.locked.insert(pending_slot, order.clone());
+        Ok(self.sign(order))
     }
 
-    /// Advance this authority's next-expected sequence for the account once a
-    /// certificate is confirmed. Monotonic; idempotent for the same certificate.
-    pub fn confirm(&mut self, v: &Verified) {
-        let t = &v.0;
-        let e = self.next_expected.entry(t.from.clone()).or_insert(0);
-        if t.from_seq + 1 > *e {
-            *e = t.from_seq + 1;
+    /// Apply a verified certificate to this authority's canonical ledger.
+    ///
+    /// The supplied committee is not ambient authority: its computed id must
+    /// equal both the authority's configured trust root and the id carried by
+    /// `Verified`. Policy and owner proof are rechecked locally. `Ledger::apply`
+    /// performs all state checks before its commit, and lock/confirmation state
+    /// changes only after a successful apply.
+    pub fn confirm(
+        &mut self,
+        verified: &Verified,
+        committee: &Committee,
+    ) -> Result<ConfirmOutcome, ConfirmError> {
+        if verified.committee_id != self.committee_id {
+            return Err(ConfirmError::WrongCommittee {
+                expected: self.committee_id,
+                got: verified.committee_id,
+            });
         }
+        if committee.id() != self.committee_id {
+            return Err(ConfirmError::WrongCommittee {
+                expected: self.committee_id,
+                got: committee.id(),
+            });
+        }
+        if committee.policy().id() != self.policy.id() {
+            return Err(ConfirmError::WrongPolicy {
+                expected: self.policy.id(),
+                got: committee.policy().id(),
+            });
+        }
+        if verified.order.policy_id() != self.policy.id() {
+            return Err(ConfirmError::WrongPolicy {
+                expected: self.policy.id(),
+                got: verified.order.policy_id(),
+            });
+        }
+        verified
+            .order
+            .verify(&self.policy)
+            .map_err(ConfirmError::OwnerAuth)?;
+
+        // A matching CommitteeId already commits to this exact roster and key,
+        // but checking the local member binding catches constructor/configuration
+        // mistakes without relying only on the digest comparison.
+        if committee.key_of(&self.id) != Some(&self.verifying_key()) {
+            return Err(ConfirmError::WrongCommittee {
+                expected: self.committee_id,
+                got: committee.id(),
+            });
+        }
+
+        let transfer = verified.transfer();
+        let confirmed_slot = slot(transfer);
+        let order_id = verified.order.order_id();
+        if let Some(previous) = self.confirmed.get(&confirmed_slot) {
+            if previous == &order_id {
+                return Ok(ConfirmOutcome::AlreadyApplied);
+            }
+            return Err(ConfirmError::State(Reject::StaleSequence {
+                expected: self.ledger.next_seq(&transfer.from),
+                got: transfer.from_seq,
+            }));
+        }
+
+        self.ledger.apply(transfer).map_err(ConfirmError::State)?;
+        self.confirmed.insert(confirmed_slot.clone(), order_id);
+        self.locked.remove(&confirmed_slot);
+        Ok(ConfirmOutcome::Applied)
     }
 }
 
-/// A quorum certificate: enough SIGNED votes from DISTINCT committee authorities,
-/// all for the SAME transfer, to reach the committee's quorum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    Applied,
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmError {
+    WrongCommittee {
+        expected: CommitteeId,
+        got: CommitteeId,
+    },
+    WrongPolicy {
+        expected: PolicyId,
+        got: PolicyId,
+    },
+    OwnerAuth(OwnerAuthError),
+    State(Reject),
+}
+
+/// Quorum certificate for one owner-signed order.
 #[derive(Debug, Clone)]
 pub struct Certificate {
-    pub transfer: Transfer,
+    pub order: SignedTransfer,
     pub votes: Vec<Vote>,
 }
 
-/// A transfer proven final by a valid quorum certificate. UNFORGEABLE outside
-/// this module: the field is private and the only constructor is
-/// `Certificate::verify`. `Ledger::apply_verified` accepts only this, so the
-/// unsafe rail is unrepresentable on the Byzantine-safe path (type-state).
+/// Type-state proof minted only by [`Certificate::verify`]. The committee id is
+/// retained so later consumers cannot accidentally apply proof from a foreign
+/// trust root.
 #[derive(Debug, Clone)]
-pub struct Verified(Transfer);
+pub struct Verified {
+    order: SignedTransfer,
+    committee_id: CommitteeId,
+}
 
 impl Verified {
     pub fn transfer(&self) -> &Transfer {
-        &self.0
+        &self.order.transfer
     }
+
+    pub fn order(&self) -> &SignedTransfer {
+        &self.order
+    }
+
+    pub fn committee_id(&self) -> CommitteeId {
+        self.committee_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertificateError {
+    OwnerAuth(OwnerAuthError),
+    EmptyVotes,
+    InvalidVote {
+        authority: AuthorityId,
+        source: VoteError,
+    },
+    DuplicateAuthority {
+        authority: AuthorityId,
+    },
+    InsufficientQuorum {
+        have: usize,
+        need: usize,
+    },
 }
 
 impl Certificate {
-    /// Assemble a certificate for `transfer` from collected `votes`, validated
-    /// against the trusted `committee`. `Some` iff `is_valid`.
-    pub fn assemble(transfer: Transfer, votes: Vec<Vote>, committee: &Committee) -> Option<Certificate> {
-        let cert = Certificate { transfer, votes };
-        if cert.is_valid(committee) {
-            Some(cert)
-        } else {
-            None
-        }
+    pub fn assemble(
+        order: SignedTransfer,
+        votes: Vec<Vote>,
+        committee: &Committee,
+    ) -> Option<Self> {
+        let certificate = Self { order, votes };
+        certificate
+            .is_valid(committee)
+            .then_some(certificate)
     }
 
-    /// Valid against `committee` iff: at least one vote; every vote is for this
-    /// transfer, from a committee member (roster check rejects unknown / fabricated
-    /// authorities), AND carries a valid Ed25519 signature under that member's
-    /// public key (authenticity: a vote cannot be forged without the authority's
-    /// secret key); and DISTINCT signers reach `committee.quorum()`.
-    pub fn is_valid(&self, committee: &Committee) -> bool {
+    pub fn validate(&self, committee: &Committee) -> Result<(), CertificateError> {
+        self.order
+            .verify(committee.policy())
+            .map_err(CertificateError::OwnerAuth)?;
         if self.votes.is_empty() {
-            return false;
+            return Err(CertificateError::EmptyVotes);
         }
-        let message = signing_message(&self.transfer);
-        let mut distinct: HashSet<&AuthorityId> = HashSet::new();
-        for v in &self.votes {
-            if v.transfer != self.transfer {
-                return false;
+
+        let mut distinct = HashSet::new();
+        for vote in &self.votes {
+            vote.validate_for(&self.order, committee)
+                .map_err(|source| CertificateError::InvalidVote {
+                    authority: vote.authority.clone(),
+                    source,
+                })?;
+            if !distinct.insert(vote.authority.clone()) {
+                return Err(CertificateError::DuplicateAuthority {
+                    authority: vote.authority.clone(),
+                });
             }
-            let key = match committee.key_of(&v.authority) {
-                Some(k) => k,
-                None => return false, // not on the roster
-            };
-            if key.verify(&message, &v.signature).is_err() {
-                return false; // forged / wrong-key signature
-            }
-            distinct.insert(&v.authority);
         }
-        distinct.len() >= committee.quorum()
+        if distinct.len() < committee.quorum() {
+            return Err(CertificateError::InsufficientQuorum {
+                have: distinct.len(),
+                need: committee.quorum(),
+            });
+        }
+        Ok(())
     }
 
-    /// The ONLY way to mint a `Verified`. Returns `Some(Verified)` iff this
-    /// certificate is valid against `committee`.
+    pub fn is_valid(&self, committee: &Committee) -> bool {
+        self.validate(committee).is_ok()
+    }
+
     pub fn verify(&self, committee: &Committee) -> Option<Verified> {
-        if self.is_valid(committee) {
-            Some(Verified(self.transfer.clone()))
-        } else {
-            None
-        }
+        self.is_valid(committee).then(|| Verified {
+            order: self.order.clone(),
+            committee_id: committee.id(),
+        })
     }
 }
 
-/// Outcome of one certification round against a committee of authorities: either
-/// a `Verified` transfer, or the reason it could not certify. Makes a
-/// contested / stuck slot OBSERVABLE (assessment action 9) instead of a silent
-/// failure.
+/// Observable result of a synchronous certification helper round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Certified {
-    /// Reached quorum and verified.
     Ok,
-    /// Some authorities refused (equivocation / out-of-order); quorum unreachable.
-    /// If `contested` is true, opposing locks make a certificate impossible for
-    /// this slot — a permanent liveness fault needing account recovery, not a
-    /// transient sub-quorum.
-    Failed { votes: usize, refusals: usize, contested: bool },
+    Failed {
+        votes: usize,
+        refusals: usize,
+        contested: bool,
+    },
 }
 
-/// Run one synchronous certification round: present `t` to every authority,
-/// collect votes, and try to assemble+verify a certificate against `committee`.
-/// Returns `(maybe_verified, Certified)`. `contested` is set when refusals came
-/// from Equivocation (an opposing transfer holds the slot) so no certificate can
-/// ever assemble for this slot — the FastPay account-recovery trigger.
+/// Present one order to every authority, assemble a certificate, then confirm
+/// it on each authority. Production transports use the same individual methods;
+/// this helper keeps deterministic unit and in-memory tests concise.
 pub fn certify(
-    t: &Transfer,
+    order: &SignedTransfer,
     authorities: &mut [Authority],
     committee: &Committee,
 ) -> (Option<Verified>, Certified) {
     let mut votes = Vec::new();
-    let mut refusals = 0usize;
-    let mut equivocation_seen = false;
-    for a in authorities.iter_mut() {
-        match a.handle(t) {
-            Ok(v) => votes.push(v),
+    let mut refusals = 0;
+    let mut contested = false;
+
+    for authority in authorities.iter_mut() {
+        match authority.handle(order) {
+            Ok(vote) => votes.push(vote),
             Err(AuthorityError::Equivocation { .. }) => {
                 refusals += 1;
-                equivocation_seen = true;
+                contested = true;
             }
-            Err(AuthorityError::OutOfOrder { .. }) => refusals += 1,
+            Err(
+                AuthorityError::OwnerAuth(_)
+                | AuthorityError::UnknownSender { .. }
+                | AuthorityError::ZeroAmount
+                | AuthorityError::OutOfOrder { .. }
+                | AuthorityError::InsufficientBalance { .. }
+                | AuthorityError::SequenceExhausted { .. }
+                | AuthorityError::BalanceOverflow { .. },
+            ) => refusals += 1,
         }
     }
-    match Certificate::assemble(t.clone(), votes.clone(), committee) {
-        Some(cert) => {
-            let verified = cert.verify(committee).expect("assembled cert verifies");
-            // Advance every authority's next-expected sequence on confirmation.
-            for a in authorities.iter_mut() {
-                a.confirm(&verified);
+
+    match Certificate::assemble(order.clone(), votes.clone(), committee) {
+        Some(certificate) => {
+            let verified = certificate
+                .verify(committee)
+                .expect("an assembled certificate must verify");
+            for authority in authorities.iter_mut() {
+                let _ = authority.confirm(&verified, committee);
             }
             (Some(verified), Certified::Ok)
         }
         None => (
             None,
-            Certified::Failed { votes: votes.len(), refusals, contested: equivocation_seen },
+            Certified::Failed {
+                votes: votes.len(),
+                refusals,
+                contested,
+            },
         ),
     }
 }
@@ -382,205 +728,584 @@ pub fn certify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owner::{NetworkId, OwnerRegistry};
 
-    fn tx(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
-        Transfer { from: from.into(), from_seq: seq, to: to.into(), amount }
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
     }
 
-    /// Deterministic per-index secret key for tests (seed = [i; 32]). Distinct
-    /// per authority; the seed is secret-in-test, NOT derived from the public id.
-    fn key(i: u8) -> SigningKey {
-        SigningKey::from_bytes(&[i; 32])
+    fn owner_key(account: &str) -> SigningKey {
+        match account {
+            "alice" => key(200),
+            "bob" => key(201),
+            "carol" => key(202),
+            _ => key(250),
+        }
     }
 
-    /// n authorities `a0..a{n-1}` with seeded keys, plus a committee binding each
-    /// id to its public key.
-    fn setup(n: u8) -> (Committee, Vec<Authority>) {
-        let auth: Vec<Authority> = (0..n).map(|i| Authority::new(format!("a{i}"), key(i))).collect();
-        let committee = Committee::new(auth.iter().map(|a| (a.id().clone(), a.verifying_key()))).unwrap();
-        (committee, auth)
+    fn policy() -> TransferPolicy {
+        TransferPolicy::new(
+            NetworkId::new("authority-testnet").unwrap(),
+            OwnerRegistry::new([
+                ("alice", owner_key("alice").verifying_key()),
+                ("bob", owner_key("bob").verifying_key()),
+                ("carol", owner_key("carol").verifying_key()),
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn genesis() -> Ledger {
+        Ledger::genesis([
+            ("alice".into(), 100),
+            ("bob".into(), 0),
+            ("carol".into(), 0),
+        ])
+    }
+
+    fn transfer(from: &str, seq: u64, to: &str, amount: u128) -> Transfer {
+        Transfer {
+            from: from.into(),
+            from_seq: seq,
+            to: to.into(),
+            amount,
+        }
+    }
+
+    fn order(
+        policy: &TransferPolicy,
+        from: &str,
+        seq: u64,
+        to: &str,
+        amount: u128,
+    ) -> SignedTransfer {
+        SignedTransfer::sign(
+            policy,
+            transfer(from, seq, to, amount),
+            &owner_key(from),
+        )
+    }
+
+    fn setup(n: u8) -> (Committee, Vec<Authority>, TransferPolicy) {
+        let policy = policy();
+        let committee = Committee::new(
+            (0..n).map(|i| (format!("a{i}"), key(i).verifying_key())),
+            policy.clone(),
+        )
+        .unwrap();
+        let committee_id = committee.id();
+        let authorities = (0..n)
+            .map(|i| {
+                Authority::new(
+                    format!("a{i}"),
+                    key(i),
+                    policy.clone(),
+                    committee_id,
+                    genesis(),
+                )
+            })
+            .collect();
+        (committee, authorities, policy)
     }
 
     #[test]
-    fn quorum_matches_333_consensus_at_3f_plus_1_and_stays_safe_elsewhere() {
-        assert_eq!(quorum(4), 3);
-        assert_eq!(quorum(7), 5);
-        assert_eq!(quorum(10), 7);
-        assert_eq!(quorum(1), 1);
+    fn quorum_has_honest_intersection_for_all_small_committee_sizes() {
         assert_eq!(quorum(0), 1);
-        assert_eq!(quorum(5), 4); // f=1; unsafe 2f+1=3
-        assert_eq!(quorum(6), 5);
-        for n in 1..=30 {
+        assert_eq!(quorum(4), 3);
+        assert_eq!(quorum(5), 4);
+        assert_eq!(quorum(7), 5);
+        for n in 1..=64 {
             let f = (n - 1) / 3;
-            assert!(2 * quorum(n) as isize - n as isize > f as isize, "n={n}");
+            assert!(2 * quorum(n) as isize - n as isize > f as isize);
         }
     }
 
     #[test]
-    fn empty_committee_is_unconstructible() {
-        let empty: Vec<(String, VerifyingKey)> = Vec::new();
-        assert!(Committee::new(empty).is_none());
+    fn committee_id_is_sorted_policy_and_roster_bound() {
+        let policy = policy();
+        let first = Committee::new(
+            [
+                ("a1", key(1).verifying_key()),
+                ("a0", key(0).verifying_key()),
+            ],
+            policy.clone(),
+        )
+        .unwrap();
+        let reversed = Committee::new(
+            [
+                ("a0", key(0).verifying_key()),
+                ("a1", key(1).verifying_key()),
+            ],
+            policy.clone(),
+        )
+        .unwrap();
+        let changed_roster = Committee::new(
+            [
+                ("a0", key(0).verifying_key()),
+                ("a1", key(9).verifying_key()),
+            ],
+            policy.clone(),
+        )
+        .unwrap();
+        let changed_policy = TransferPolicy::new(
+            NetworkId::new("other-testnet").unwrap(),
+            policy.owners().clone(),
+        );
+        let changed_policy = Committee::new(
+            [
+                ("a0", key(0).verifying_key()),
+                ("a1", key(1).verifying_key()),
+            ],
+            changed_policy,
+        )
+        .unwrap();
+
+        assert_eq!(first.id(), reversed.id());
+        assert_ne!(first.id(), changed_roster.id());
+        assert_ne!(first.id(), changed_policy.id());
     }
 
     #[test]
-    fn honest_transfer_assembles_and_verifies() {
-        let t = tx("alice", 0, "bob", 30);
-        let (c, mut auth) = setup(4);
-        let votes: Vec<Vote> = auth.iter_mut().take(3).map(|a| a.handle(&t).unwrap()).collect();
-        let cert = Certificate::assemble(t.clone(), votes, &c).expect("3/4 = quorum, all signed");
-        assert!(cert.verify(&c).is_some());
+    fn malformed_or_oversized_committee_is_unconstructible() {
+        let policy = policy();
+        assert!(Committee::new(
+            Vec::<(String, VerifyingKey)>::new(),
+            policy.clone()
+        )
+        .is_none());
+        assert!(Committee::new(
+            [
+                ("a0", key(0).verifying_key()),
+                ("a0", key(1).verifying_key()),
+            ],
+            policy.clone(),
+        )
+        .is_none());
+        assert!(Committee::new(
+            [
+                ("a0", key(0).verifying_key()),
+                ("a1", key(0).verifying_key()),
+            ],
+            policy.clone(),
+        )
+        .is_none());
+        assert!(Committee::new(
+            [("x".repeat(MAX_AUTHORITY_ID_BYTES + 1), key(0).verifying_key())],
+            policy.clone(),
+        )
+        .is_none());
+        let oversized = (0..=MAX_COMMITTEE_MEMBERS).map(|i| {
+            let mut seed = [0_u8; 32];
+            seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            (
+                format!("a{i}"),
+                SigningKey::from_bytes(&seed).verifying_key(),
+            )
+        });
+        assert!(Committee::new(oversized, policy).is_none());
     }
 
     #[test]
-    fn equivocation_barred_by_quorum_certificate() {
-        // A Byzantine owner tries to double-spend seq-0: T1->bob AND T2->carol.
-        let t1 = tx("alice", 0, "bob", 100);
-        let t2 = tx("alice", 0, "carol", 100);
-        let (c, mut a) = setup(4);
-        let v_t1: Vec<Vote> = vec![
-            a[0].handle(&t1).unwrap(),
-            a[1].handle(&t1).unwrap(),
-            a[2].handle(&t1).unwrap(),
-        ];
-        assert_eq!(a[1].handle(&t2), Err(AuthorityError::Equivocation { account: "alice".into(), seq: 0 }));
-        assert_eq!(a[2].handle(&t2), Err(AuthorityError::Equivocation { account: "alice".into(), seq: 0 }));
-        let v_t2: Vec<Vote> = vec![a[3].handle(&t2).unwrap()];
-        assert!(Certificate::assemble(t1, v_t1, &c).is_some());
-        assert!(Certificate::assemble(t2, v_t2, &c).is_none(), "conflicting transfer can NEVER certify");
-    }
+    fn one_signature_cannot_be_cloned_across_authority_aliases() {
+        let policy = policy();
+        let shared_signing_key = key(7);
+        let shared_public_key = shared_signing_key.verifying_key();
 
-    #[test]
-    fn byzantine_authority_double_signing_still_cannot_double_certify() {
-        // n=5, quorum=4. Byzantine a4 double-signs BOTH transfers (it holds its
-        // own key, so both signatures are valid); honest a0..a3 split 2/2.
-        let t1 = tx("alice", 0, "bob", 100);
-        let t2 = tx("alice", 0, "carol", 100);
-        let (c, mut a) = setup(5);
-        let a4_key = key(4); // a4's real secret key (it is a committee member)
-        let a4_vote = |t: &Transfer| Vote {
-            authority: "a4".into(),
-            transfer: t.clone(),
-            signature: a4_key.sign(&signing_message(t)),
+        // `Committee::new` now rejects this alias-inflated roster. Construct
+        // the historical malformed shape directly to prove the signing
+        // preimage independently binds the alias as defence in depth.
+        let members: BTreeMap<AuthorityId, VerifyingKey> = ["a0", "a1", "a2", "a3"]
+            .into_iter()
+            .map(|alias| (alias.to_owned(), shared_public_key.clone()))
+            .collect();
+        let committee_id = committee_id(policy.id(), &members);
+        let committee = Committee {
+            members,
+            policy: policy.clone(),
+            id: committee_id,
         };
-        let mut v_t1 = vec![a[0].handle(&t1).unwrap(), a[1].handle(&t1).unwrap()];
-        let mut v_t2 = vec![a[2].handle(&t2).unwrap(), a[3].handle(&t2).unwrap()];
-        v_t1.push(a4_vote(&t1));
-        v_t2.push(a4_vote(&t2));
-        // Each side has only 3 distinct signers < quorum 4.
-        assert!(Certificate::assemble(t1, v_t1, &c).is_none());
-        assert!(Certificate::assemble(t2, v_t2, &c).is_none());
-    }
-
-    #[test]
-    fn certificate_requires_distinct_authorities_not_repeated_votes() {
-        let t = tx("alice", 0, "bob", 10);
-        let (c, mut a) = setup(4);
-        let v = a[0].handle(&t).unwrap();
-        let padded = vec![v.clone(), v.clone(), v.clone()];
-        assert!(Certificate::assemble(t, padded, &c).is_none());
-    }
-
-    #[test]
-    fn votes_from_non_committee_authorities_are_rejected() {
-        // Outsiders sign with their own (valid) keys but are not on the roster.
-        let t = tx("alice", 0, "bob", 10);
-        let (c, _) = setup(4);
-        let outsiders: Vec<Vote> = (0..3u8)
-            .map(|i| {
-                let rogue = key(100 + i);
-                Vote { authority: format!("x{i}"), transfer: t.clone(), signature: rogue.sign(&signing_message(&t)) }
+        let mut authority = Authority::new(
+            "a0",
+            shared_signing_key,
+            policy.clone(),
+            committee_id,
+            genesis(),
+        );
+        let order = order(&policy, "alice", 0, "bob", 10);
+        let signed_vote = authority.handle(&order).unwrap();
+        let aliased_votes = ["a0", "a1", "a2"]
+            .into_iter()
+            .map(|alias| {
+                let mut vote = signed_vote.clone();
+                vote.authority = alias.to_owned();
+                vote
             })
             .collect();
-        assert!(Certificate::assemble(t, outsiders, &c).is_none());
+        let certificate = Certificate {
+            order: order.clone(),
+            votes: aliased_votes,
+        };
+
+        assert_eq!(committee.quorum(), 3);
+        assert!(matches!(
+            certificate.validate(&committee),
+            Err(CertificateError::InvalidVote {
+                authority,
+                source: VoteError::InvalidAuthoritySignature { .. },
+            }) if authority == "a1"
+        ));
     }
 
     #[test]
-    fn forged_vote_with_wrong_key_is_rejected() {
-        // AUTHENTICITY: an attacker forges votes claiming REAL committee ids
-        // a0/a1/a2 (roster + distinct-quorum would otherwise pass) but signs them
-        // with a rogue key it controls. Per-authority Ed25519 verification fails,
-        // so no certificate assembles — the gap the stand-in `Vote` left open.
-        let t = tx("alice", 0, "bob", 10);
-        let (c, _) = setup(4);
-        let rogue = key(200);
-        let forged: Vec<Vote> = ["a0", "a1", "a2"]
-            .iter()
-            .map(|id| Vote { authority: (*id).into(), transfer: t.clone(), signature: rogue.sign(&signing_message(&t)) })
+    fn honest_certificate_applies_and_replay_is_idempotent() {
+        let (committee, mut authorities, policy) = setup(4);
+        let order = order(&policy, "alice", 0, "bob", 30);
+        let votes = authorities
+            .iter_mut()
+            .take(3)
+            .map(|authority| authority.handle(&order).unwrap())
             .collect();
-        assert!(
-            Certificate::assemble(t, forged, &c).is_none(),
-            "forged (wrong-key) signatures must fail per-authority Ed25519 verification"
-        );
+        let certificate = Certificate::assemble(order, votes, &committee).unwrap();
+        let verified = certificate.verify(&committee).unwrap();
+        assert_eq!(verified.committee_id(), committee.id());
+
+        for authority in &mut authorities {
+            assert_eq!(
+                authority.confirm(&verified, &committee),
+                Ok(ConfirmOutcome::Applied)
+            );
+            assert_eq!(authority.ledger().balance(&"alice".into()), 70);
+            assert_eq!(authority.ledger().balance(&"bob".into()), 30);
+            assert_eq!(
+                authority.confirm(&verified, &committee),
+                Ok(ConfirmOutcome::AlreadyApplied)
+            );
+        }
     }
 
     #[test]
-    fn vote_signature_does_not_transfer_to_a_different_transfer() {
-        // A valid signature for T1 cannot be replayed onto T2: the message binds
-        // the full transfer (recipient/amount/seq), so swapping the transfer while
-        // keeping the signature fails verification.
-        let t1 = tx("alice", 0, "bob", 10);
-        let t2 = tx("alice", 0, "carol", 10);
-        let (c, mut a) = setup(4);
-        let good = a[0].handle(&t1).unwrap();
-        let spliced = Vote { authority: good.authority.clone(), transfer: t2.clone(), signature: good.signature };
-        // is_valid checks v.transfer == cert.transfer first, but even a cert built
-        // FOR t2 with this spliced vote fails the signature check.
-        assert!(Certificate::assemble(t2, vec![spliced], &c).is_none());
+    fn equivocation_is_barred_by_quorum_intersection() {
+        let (committee, mut authorities, policy) = setup(4);
+        let first = order(&policy, "alice", 0, "bob", 100);
+        let conflict = order(&policy, "alice", 0, "carol", 100);
+        let first_votes = vec![
+            authorities[0].handle(&first).unwrap(),
+            authorities[1].handle(&first).unwrap(),
+            authorities[2].handle(&first).unwrap(),
+        ];
+        assert!(matches!(
+            authorities[1].handle(&conflict),
+            Err(AuthorityError::Equivocation { .. })
+        ));
+        assert!(matches!(
+            authorities[2].handle(&conflict),
+            Err(AuthorityError::Equivocation { .. })
+        ));
+        let conflict_votes = vec![authorities[3].handle(&conflict).unwrap()];
+
+        assert!(Certificate::assemble(first, first_votes, &committee).is_some());
+        assert!(Certificate::assemble(conflict, conflict_votes, &committee).is_none());
     }
 
     #[test]
-    fn authority_refuses_out_of_order_sequence() {
-        // seq must be the account's next expected (0 first). Skipping is refused.
-        let mut a0 = Authority::new("a0", key(0));
-        let skip = tx("alice", 2, "bob", 10);
+    fn vote_cannot_be_reassembled_under_a_different_roster() {
+        let policy = policy();
+        let committee_four = Committee::new(
+            (0..4).map(|i| (format!("a{i}"), key(i).verifying_key())),
+            policy.clone(),
+        )
+        .unwrap();
+        let committee_three = Committee::new(
+            (0..3).map(|i| (format!("a{i}"), key(i).verifying_key())),
+            policy.clone(),
+        )
+        .unwrap();
+        let mut authorities: Vec<_> = (0..4)
+            .map(|i| {
+                Authority::new(
+                    format!("a{i}"),
+                    key(i),
+                    policy.clone(),
+                    committee_four.id(),
+                    genesis(),
+                )
+            })
+            .collect();
+        let order = order(&policy, "alice", 0, "bob", 10);
+        let votes = authorities
+            .iter_mut()
+            .take(3)
+            .map(|authority| authority.handle(&order).unwrap())
+            .collect();
+
+        assert_ne!(committee_four.id(), committee_three.id());
+        assert!(Certificate::assemble(order, votes, &committee_three).is_none());
+    }
+
+    #[test]
+    fn overspend_rejection_does_not_lock_or_brick_the_account() {
+        let (committee, mut authorities, policy) = setup(4);
+        let overspend = order(&policy, "alice", 0, "bob", 101);
+        for authority in &mut authorities {
+            assert_eq!(
+                authority.handle(&overspend),
+                Err(AuthorityError::InsufficientBalance {
+                    account: "alice".into(),
+                    have: 100,
+                    need: 101,
+                })
+            );
+        }
+
+        let valid = order(&policy, "alice", 0, "bob", 40);
+        let (verified, result) = certify(&valid, &mut authorities, &committee);
+        assert_eq!(result, Certified::Ok);
+        assert!(verified.is_some(), "overspend must not poison the seq-0 slot");
+        for authority in &authorities {
+            assert_eq!(authority.ledger().balance(&"alice".into()), 60);
+            assert_eq!(authority.ledger().balance(&"bob".into()), 40);
+            assert_eq!(authority.ledger().next_seq(&"alice".into()), 1);
+        }
+    }
+
+    #[test]
+    fn arithmetic_overflow_orders_get_zero_votes_and_never_lock() {
+        let (committee, mut authorities, policy) = setup(4);
+
+        // Simulate corrupt recovered state that canonical genesis construction
+        // forbids. Authority admission must still run the ledger's complete
+        // arithmetic preflight before producing a vote or installing a lock.
+        for authority in &mut authorities {
+            authority
+                .ledger
+                .accounts
+                .get_mut("bob")
+                .unwrap()
+                .balance = u128::MAX;
+        }
+        let balance_overflow = order(&policy, "alice", 0, "bob", 1);
         assert_eq!(
-            a0.handle(&skip),
-            Err(AuthorityError::OutOfOrder { account: "alice".into(), expected: 0, got: 2 })
+            authorities[0].handle(&balance_overflow),
+            Err(AuthorityError::BalanceOverflow {
+                account: "bob".into(),
+                have: u128::MAX,
+                credit: 1,
+            })
         );
-        // seq 0 is accepted.
-        assert!(a0.handle(&tx("alice", 0, "bob", 10)).is_ok());
+        let (verified, result) = certify(&balance_overflow, &mut authorities, &committee);
+        assert!(verified.is_none());
+        assert_eq!(
+            result,
+            Certified::Failed {
+                votes: 0,
+                refusals: 4,
+                contested: false,
+            }
+        );
+        assert!(authorities.iter().all(|authority| authority.locked.is_empty()));
+
+        for authority in &mut authorities {
+            authority
+                .ledger
+                .accounts
+                .get_mut("bob")
+                .unwrap()
+                .balance = 0;
+            authority
+                .ledger
+                .accounts
+                .get_mut("alice")
+                .unwrap()
+                .next_seq = u64::MAX;
+        }
+        let sequence_overflow = order(&policy, "alice", u64::MAX, "bob", 1);
+        assert_eq!(
+            authorities[0].handle(&sequence_overflow),
+            Err(AuthorityError::SequenceExhausted {
+                account: "alice".into(),
+            })
+        );
+        let (verified, result) = certify(&sequence_overflow, &mut authorities, &committee);
+        assert!(verified.is_none());
+        assert_eq!(
+            result,
+            Certified::Failed {
+                votes: 0,
+                refusals: 4,
+                contested: false,
+            }
+        );
+        assert!(authorities.iter().all(|authority| authority.locked.is_empty()));
     }
 
     #[test]
-    fn certify_round_and_confirm_advance_sequence() {
-        let (c, mut auth) = setup(4);
-        let (v0, r0) = certify(&tx("alice", 0, "bob", 10), &mut auth, &c);
-        assert_eq!(r0, Certified::Ok);
-        assert!(v0.is_some());
-        // seq 2 now (skipping seq 1) -> all authorities OutOfOrder -> Failed, not contested.
-        let (v_skip, r_skip) = certify(&tx("alice", 2, "bob", 10), &mut auth, &c);
-        assert!(v_skip.is_none());
-        assert!(matches!(r_skip, Certified::Failed { contested: false, .. }));
-        // seq 1 certifies.
-        let (v1, r1) = certify(&tx("alice", 1, "bob", 10), &mut auth, &c);
-        assert_eq!(r1, Certified::Ok);
-        assert!(v1.is_some());
+    fn zero_and_skipped_sequence_are_mutation_free_rejections() {
+        let (committee, mut authorities, policy) = setup(1);
+        assert_eq!(
+            authorities[0].handle(&order(&policy, "alice", 0, "bob", 0)),
+            Err(AuthorityError::ZeroAmount)
+        );
+        assert_eq!(
+            authorities[0].handle(&order(&policy, "alice", 2, "bob", 1)),
+            Err(AuthorityError::OutOfOrder {
+                account: "alice".into(),
+                expected: 0,
+                got: 2,
+            })
+        );
+        assert!(authorities[0]
+            .handle(&order(&policy, "alice", 0, "bob", 1))
+            .is_ok());
+        assert_eq!(authorities[0].ledger().next_seq(&"alice".into()), 0);
+        assert_eq!(committee.quorum(), 1);
     }
 
     #[test]
-    fn certify_flags_contested_slot_on_equivocation() {
-        let (c, mut auth) = setup(4);
-        let (v1, _) = certify(&tx("alice", 0, "bob", 100), &mut auth, &c);
-        assert!(v1.is_some()); // T1 certified (all 4 lock it, then confirm advances)
-        // After confirm, seq 0 is now past -> T2 at seq 0 is OutOfOrder, not contested.
-        let (v2, r2) = certify(&tx("alice", 0, "carol", 100), &mut auth, &c);
-        assert!(v2.is_none());
-        assert!(matches!(r2, Certified::Failed { .. }));
+    fn failed_confirm_never_advances_ledger_or_releases_pending_lock() {
+        let (committee, mut authorities, policy) = setup(4);
+        let first = order(&policy, "alice", 0, "bob", 30);
+        let votes = authorities
+            .iter_mut()
+            .skip(1)
+            .take(3)
+            .map(|authority| authority.handle(&first).unwrap())
+            .collect();
+        let verified = Certificate::assemble(first.clone(), votes, &committee)
+            .unwrap()
+            .verify(&committee)
+            .unwrap();
+
+        // The certificate is valid, but this authority's local canonical state
+        // cannot fund it. Ledger::apply rejects before commit, and confirm must
+        // not maintain a separate sequence counter that advances anyway.
+        let mut underfunded = Authority::new(
+            "a0",
+            key(0),
+            policy.clone(),
+            committee.id(),
+            Ledger::genesis([
+                ("alice".into(), 10),
+                ("bob".into(), 0),
+                ("carol".into(), 0),
+            ]),
+        );
+        let balance_before = underfunded.ledger().balances();
+        let seq_before = underfunded.ledger().next_seq(&"alice".into());
+        assert_eq!(
+            underfunded.confirm(&verified, &committee),
+            Err(ConfirmError::State(Reject::Insufficient {
+                have: 10,
+                need: 30,
+            }))
+        );
+        assert_eq!(underfunded.ledger().balances(), balance_before);
+        assert_eq!(underfunded.ledger().next_seq(&"alice".into()), seq_before);
+
+        // Also exercise the lock side of atomicity. Simulate a state-plane drift
+        // after this authority locked the certified order: confirm now fails as
+        // stale, and the pre-existing lock must remain to reject a conflicting
+        // order rather than silently reopening the slot.
+        let mut locked = Authority::new(
+            "a0",
+            key(0),
+            policy.clone(),
+            committee.id(),
+            genesis(),
+        );
+        locked.handle(&first).unwrap();
+        locked
+            .ledger
+            .apply(&transfer("alice", 0, "carol", 1))
+            .unwrap();
+        let drifted_balance = locked.ledger().balances();
+        assert_eq!(
+            locked.confirm(&verified, &committee),
+            Err(ConfirmError::State(Reject::StaleSequence {
+                expected: 1,
+                got: 0,
+            }))
+        );
+        assert_eq!(locked.ledger().balances(), drifted_balance);
+        assert_eq!(
+            locked.handle(&order(&policy, "alice", 0, "carol", 1)),
+            Err(AuthorityError::Equivocation {
+                account: "alice".into(),
+                seq: 0,
+            })
+        );
     }
 
     #[test]
-    fn contested_when_locks_split_before_any_certificate() {
-        let (c, mut auth) = setup(4);
-        let t1 = tx("alice", 0, "bob", 100);
-        let t2 = tx("alice", 0, "carol", 100);
-        auth[0].handle(&t1).unwrap();
-        auth[1].handle(&t1).unwrap();
-        auth[2].handle(&t2).unwrap();
-        auth[3].handle(&t2).unwrap();
-        // Certifying T1 over the full committee: a0,a1 re-vote T1 (idempotent),
-        // a2,a3 refuse (Equivocation) -> 2 votes < quorum 3 -> Failed+contested.
-        let (v, r) = certify(&t1, &mut auth, &c);
-        assert!(v.is_none());
-        assert_eq!(r, Certified::Failed { votes: 2, refusals: 2, contested: true });
+    fn foreign_committee_verified_is_rejected_without_state_change() {
+        let (local, mut local_authorities, policy) = setup(4);
+        let foreign = Committee::new(
+            (0..4).map(|i| (format!("x{i}"), key(100 + i).verifying_key())),
+            policy.clone(),
+        )
+        .unwrap();
+        let mut foreign_authorities: Vec<_> = (0..4)
+            .map(|i| {
+                Authority::new(
+                    format!("x{i}"),
+                    key(100 + i),
+                    policy.clone(),
+                    foreign.id(),
+                    genesis(),
+                )
+            })
+            .collect();
+        let order = order(&policy, "alice", 0, "bob", 10);
+        let votes = foreign_authorities
+            .iter_mut()
+            .take(3)
+            .map(|authority| authority.handle(&order).unwrap())
+            .collect();
+        let foreign_verified = Certificate::assemble(order, votes, &foreign)
+            .unwrap()
+            .verify(&foreign)
+            .unwrap();
+
+        let before = local_authorities[0].ledger().balances();
+        assert_eq!(
+            local_authorities[0].confirm(&foreign_verified, &local),
+            Err(ConfirmError::WrongCommittee {
+                expected: local.id(),
+                got: foreign.id(),
+            })
+        );
+        assert_eq!(local_authorities[0].ledger().balances(), before);
+        assert_eq!(local_authorities[0].ledger().next_seq(&"alice".into()), 0);
+    }
+
+    #[test]
+    fn duplicate_or_wrong_key_votes_do_not_make_a_certificate() {
+        let (committee, mut authorities, policy) = setup(4);
+        let order = order(&policy, "alice", 0, "bob", 10);
+        let vote = authorities[0].handle(&order).unwrap();
+        assert!(Certificate::assemble(
+            order.clone(),
+            vec![vote.clone(), vote.clone(), vote],
+            &committee,
+        )
+        .is_none());
+
+        let forged = Vote {
+            authority: "a0".into(),
+            committee_id: committee.id(),
+            policy_id: order.policy_id(),
+            network_id: order.network_id.clone(),
+            transfer: order.transfer.clone(),
+            signature: key(99).sign(&authority_signing_message(
+                &"a0".to_owned(),
+                &committee.id(),
+                &order.policy_id(),
+                &order.network_id,
+                &order.transfer,
+            )),
+        };
+        assert!(matches!(
+            forged.validate_for(&order, &committee),
+            Err(VoteError::InvalidAuthoritySignature { .. })
+        ));
     }
 }

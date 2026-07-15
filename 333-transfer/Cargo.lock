@@ -391,6 +391,8 @@ dependencies = [
  "ed25519-dalek",
  "gossip333",
  "identity333",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]

@@ -14,14 +14,74 @@ target:
   root: ooptdd
 
 requirements:
+  - id: REQ-FORGED-OWNER-REJECTED
+    description: a wrong-key Alice order is rejected by all 4 authorities before slot admission
+    gate:
+      - {event: forged_owner_rejected, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-forged-owner-rejected-20260715
+      source: node_conformance_adapter.py
+      symbol: _emit_forged_owner_rejected
+      must_emit: forged_owner_rejected
+
+  - id: REQ-FORGED-ORDER-ZERO-VOTES
+    description: the forged Alice order receives zero authority votes and causes zero certificate applications
+    gate:
+      - {event: forged_order_zero_votes, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-forged-order-zero-votes-20260715
+      source: node_conformance_adapter.py
+      symbol: _emit_forged_order_zero_votes
+      must_emit: forged_order_zero_votes
+
+  - id: REQ-OVERSPEND-REJECTED
+    description: a valid Alice signature cannot certify an amount above her balance or consume sequence 0
+    gate:
+      - {event: overspend_rejected, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-overspend-rejected-20260715
+      source: node_conformance_adapter.py
+      symbol: _emit_overspend_rejected
+      must_emit: overspend_rejected
+
+  - id: REQ-DUPLICATE-AUTHORITY-KEY-REJECTED
+    description: one physical authority key cannot be registered under four aliases to inflate quorum power
+    gate:
+      - {event: duplicate_authority_key_rejected, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-duplicate-authority-key-rejected-20260715
+      source: node_conformance_adapter.py
+      symbol: _emit_duplicate_authority_key_rejected
+      must_emit: duplicate_authority_key_rejected
+
+  - id: REQ-INVALID-GENESIS-REJECTED
+    description: a premint allocation whose total supply exceeds u128 is rejected before authority startup
+    gate:
+      - {event: invalid_genesis_rejected, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-invalid-genesis-rejected-20260715
+      source: node_conformance_adapter.py
+      symbol: _emit_invalid_genesis_rejected
+      must_emit: invalid_genesis_rejected
+
+  - id: REQ-FORGERY-NO-SLOT-POISON
+    description: after a forge-first rejection, valid Alice seed 42 certifies and applies the same alice sequence-0 slot
+    gate:
+      - {event: forgery_did_not_poison_slot, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-forgery-no-slot-poison-20260715
+      source: node_conformance_adapter.py
+      symbol: _emit_forgery_did_not_poison_slot
+      must_emit: forgery_did_not_poison_slot
+
   - id: REQ-CERTIFY-OVER-TCP
     description: an honest transfer certifies across 4 separate TCP authority processes
     gate:
       - {event: node_certifies_over_tcp, op: "==", count: 1}
     longinus:
-      kg_anchor: transfer333-node-conformance-20260714
+      kg_anchor: transfer333-req-certify-over-tcp-20260715
       source: node_conformance_adapter.py
-      symbol: run_node_probe
+      symbol: _emit_node_certifies_over_tcp
       must_emit: node_certifies_over_tcp
 
   - id: REQ-LEDGERS-CONVERGE
@@ -29,9 +89,9 @@ requirements:
     gate:
       - {event: authority_ledgers_converge, op: "==", count: 1}
     longinus:
-      kg_anchor: transfer333-node-conformance-20260714
+      kg_anchor: transfer333-req-ledgers-converge-20260715
       source: node_conformance_adapter.py
-      symbol: run_node_probe
+      symbol: _emit_authority_ledgers_converge
       must_emit: authority_ledgers_converge
 
   - id: REQ-DOUBLE-SPEND-REJECTED
@@ -39,9 +99,9 @@ requirements:
     gate:
       - {event: double_spend_rejected, op: "==", count: 1}
     longinus:
-      kg_anchor: transfer333-node-conformance-20260714
+      kg_anchor: transfer333-req-double-spend-rejected-20260715
       source: node_conformance_adapter.py
-      symbol: run_node_probe
+      symbol: _emit_double_spend_rejected
       must_emit: double_spend_rejected
 
   - id: REQ-OUT-OF-ORDER-REJECTED
@@ -49,7 +109,7 @@ requirements:
     gate:
       - {event: out_of_order_rejected, op: "==", count: 1}
     longinus:
-      kg_anchor: transfer333-node-conformance-20260714
+      kg_anchor: transfer333-req-out-of-order-rejected-20260715
       source: node_conformance_adapter.py
-      symbol: run_node_probe
+      symbol: _emit_out_of_order_rejected
       must_emit: out_of_order_rejected

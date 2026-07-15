@@ -23,15 +23,41 @@ asset-transfer theorem (Guerraoui et al., PODC 2019).
     signatures over domain-separated, length-prefixed canonical transfer bytes;
     `Committee` binds `AuthorityId → VerifyingKey`; `Certificate::is_valid` verifies
     every vote per authority key. A vote is unforgeable outside the secret-key holder.
-  - `cargo test` → **24 green** (21 lib incl. `authority` module + 3 e2e integration),
-    incl. `forged_vote_with_wrong_key_is_rejected` and
-    `vote_signature_does_not_transfer_to_a_different_transfer`.
+  - **Owner authorization (2026-07-15):** every certified-rail order is a
+    policy-bound `SignedTransfer`. `PolicyId` commits to the deployment id and
+    sorted owner roster; `CommitteeId` additionally commits to the sorted authority
+    roster. Authorities verify the registered sender key **before** sequence
+    inspection or slot locking, and certificates re-check both owner proof and
+    authority quorum. Public committee/owner rosters are separated from private
+    `--key-file` loading; debug-only `--dev-seed` is rejected by release builds.
+  - **Authority FSM/state validity (2026-07-15):** each authority owns one canonical
+    `(balance, next_seq, pending)` state. Admission checks owner proof, pending-slot
+    conflict, sender existence, positive amount, exact sequence, and sufficient
+    balance before voting. Certificate confirmation debits, credits, and advances
+    sequence in one ledger transition; a failed confirmation changes none of them.
+  - Transport is implemented behind one `AuthorityNet` boundary: deterministic
+    in-memory mesh, real framed TCP, and Plumtree-style epidemic dissemination.
+    Wire v2 rejects legacy unsigned orders, bounds decoded identity fields, and
+    caps decoded certificate votes at the committee limit.
+  - `cargo test --all-targets` → **89 green, 0 ignored**. OOPTDD executes **10/10**
+    independently bound gates: duplicate authority-key and invalid-genesis config
+    rejection plus live-TCP forge-first rejection/zero votes, signed overspend
+    rejection, same-slot recovery, certification, four-ledger convergence,
+    double-spend rejection, and skipped-sequence rejection.
+  - Machine-readable boundary/FSM contract: `333-transfer/OWNER_AUTH_ENGINE_SPEC.json`.
+    Longinus local hash/line baseline: `333-transfer/LONGINUS_REFERENCE_SITES.json`
+    (`LOCAL_EXTRACTED_KG_UNVERIFIED` while Neo4j is unreachable).
   - Depends only on `333-crdt` (`crdt333`, standalone).
-  - Follow-up: gossip/broadcast **transport** (this layer is in-memory, unit-testable).
+  - **Promotion boundary:** the kernel and multi-process harness are verified, but
+    the node is not production-ready until authority state has WAL/snapshot restart
+    recovery and TCP ingress has authenticated admission plus bounded peers/readers/
+    inboxes. Human-readable aliases also still need self-certifying identities or an
+    explicit registration/key-rotation protocol.
 
 KG: `SA_333_Platform`, `consensus-prom16-333-no-blockchain-2026-07-12`,
 `vp-prom16-333-coin-transferable-vs-local-credit-2026-07-12` (verdict: local-credit
-first, gated flip to transferable once Ed25519 + transport land — Ed25519 now done),
+first, gated flip to transferable once Ed25519 + transport land — both are now
+implemented on the owner-authenticated certified rail),
 `vp-prom16-333-coin-premint-vs-runtime-issuance-2026-07-12` (verdict: PREMINT),
 `buildprogress-333-consensusless-transfer-2026-07-13`.
 
