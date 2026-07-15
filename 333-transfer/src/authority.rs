@@ -13,7 +13,7 @@ use std::fmt;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use crate::journal::{Journal, JournalError, JournalRecord, NullJournal};
+use crate::journal::{Journal, JournalError, JournalRecord, NullJournal, SnapshotData};
 use crate::owner::{
     put_network_transfer_body, NetworkId, OwnerAuthError, PolicyId, SignedTransfer,
     TransferPolicy,
@@ -419,6 +419,30 @@ impl Authority {
         let mut me = Self::with_journal(id, signing, policy, committee_id, genesis, journal);
         for record in &records {
             match record {
+                // A snapshot *replaces* state: it already accounts for every
+                // record the compaction discarded. Applying it as a delta would
+                // double-count. Compaction writes it at the head of a fresh log,
+                // so any Locked/Confirmed that follows is genuinely later.
+                JournalRecord::Snapshot(sn) => {
+                    me.ledger = Ledger::restore(
+                        sn.accounts
+                            .iter()
+                            .map(|(id, bal, seq)| (id.clone(), *bal, *seq)),
+                    )
+                    .map_err(|e| {
+                        JournalError::Corrupt(format!("snapshot ledger invalid: {e:?}"))
+                    })?;
+                    me.locked = sn
+                        .locked
+                        .iter()
+                        .map(|o| (slot(&o.transfer), o.clone()))
+                        .collect();
+                    me.confirmed = sn
+                        .confirmed
+                        .iter()
+                        .map(|(account, seq, order_id)| ((account.clone(), *seq), *order_id))
+                        .collect();
+                }
                 JournalRecord::Locked(order) => {
                     me.locked.insert(slot(&order.transfer), order.clone());
                 }
@@ -435,6 +459,49 @@ impl Authority {
             }
         }
         Ok(me)
+    }
+
+    /// Capture complete state for a journal snapshot.
+    ///
+    /// `confirmed` stores only an order id per slot, but a snapshot must be able
+    /// to rebuild that map, so the full orders are kept in `locked`/`confirmed`
+    /// and the ids are re-derived on recovery. That keeps the snapshot
+    /// self-describing: it cannot disagree with itself.
+    pub fn snapshot_data(&self) -> SnapshotData {
+        let accounts = self
+            .ledger
+            .balances()
+            .into_iter()
+            .map(|(id, balance)| {
+                let next_seq = self.ledger.next_seq(&id);
+                (id, balance, next_seq)
+            })
+            .collect();
+        SnapshotData {
+            accounts,
+            locked: self.locked.values().cloned().collect(),
+            confirmed: self
+                .confirmed
+                .iter()
+                .map(|((account, seq), order_id)| (account.clone(), *seq, *order_id))
+                .collect(),
+        }
+    }
+
+    /// Snapshot current state and discard the log it subsumes.
+    ///
+    /// Safe to call at any quiescent point; the snapshot is taken from live
+    /// state, so it is consistent by construction. A failure fail-stops for the
+    /// same reason `append` does: the log on disk may no longer describe us.
+    pub fn compact_journal(&mut self) -> Result<(), AuthorityError> {
+        let snapshot = self.snapshot_data();
+        if let Err(e) = self.journal.compact(&snapshot) {
+            self.poisoned = true;
+            return Err(AuthorityError::JournalFailed {
+                reason: e.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// True once a durability failure has fail-stopped this authority.
@@ -586,6 +653,17 @@ impl Authority {
         verified: &Verified,
         committee: &Committee,
     ) -> Result<ConfirmOutcome, ConfirmError> {
+        // Fail-stop applies here exactly as in `handle`. Without this guard a
+        // *transient* durability failure (a full disk the operator then clears)
+        // punches a permanent hole in the log: the failed append leaves
+        // `Confirmed(seq N)` unwritten while the in-memory ledger has already
+        // advanced, and the next certificate journals `Confirmed(seq N+1)` on top
+        // of the gap. Recovery then folds N+1 onto a ledger still at N, rejects
+        // it, and the authority never starts again — a recoverable disk blip
+        // turned into a bricked node.
+        if self.poisoned {
+            return Err(ConfirmError::Poisoned);
+        }
         if verified.committee_id != self.committee_id {
             return Err(ConfirmError::WrongCommittee {
                 expected: self.committee_id,
@@ -675,6 +753,8 @@ pub enum ConfirmError {
     State(Reject),
     /// A durability barrier failed after the ledger moved; fail-stop.
     Journal(String),
+    /// A prior durability failure fail-stopped this authority.
+    Poisoned,
 }
 
 /// Quorum certificate for one owner-signed order.

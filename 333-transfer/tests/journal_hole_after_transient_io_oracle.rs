@@ -10,13 +10,14 @@
 //! returns `Corrupt("replay: confirmed record ... does not apply")`. The node
 //! never starts again, and there is no repair tool.
 //!
-//! A transient ENOSPC is not exotic here: journal.rs:30-32 states the log has
-//! "no compaction, no snapshot, no segment rotation. A confirmed slot's records
-//! stay in the log forever." A full disk is the design's own end state; freeing
-//! space is the operator's obvious response, and that is exactly what opens the
-//! hole.
+//! A transient ENOSPC is not exotic here: the log grows with transfer volume and
+//! compaction (added later, same day) only cuts the constant — it does not bound
+//! growth. A full disk is a reachable end state; freeing space is the operator's
+//! obvious response, and that is exactly what opens the hole.
 //!
-//! Independent adversarial check of `a088cd2`. Read-only w.r.t. the crate.
+//! Independent adversarial check of `a088cd2`; the defect it found was real and
+//! is fixed by the poisoned guard now at the head of `confirm()`. The assertions
+//! below were flipped from documenting the bug to pinning the fixed contract.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -106,6 +107,10 @@ impl Journal for FlakyJournal {
     fn replay(&self) -> Result<Vec<JournalRecord>, JournalError> {
         Ok(self.records.lock().unwrap().clone())
     }
+    fn compact(&mut self, snapshot: &transfer333::SnapshotData) -> Result<(), JournalError> {
+        *self.records.lock().unwrap() = vec![JournalRecord::Snapshot(snapshot.clone())];
+        Ok(())
+    }
 }
 
 fn certify(auth: &mut Authority, order: &SignedTransfer, c: &Committee) -> transfer333::Verified {
@@ -115,7 +120,6 @@ fn certify(auth: &mut Authority, order: &SignedTransfer, c: &Committee) -> trans
 }
 
 #[test]
-#[ignore = "RED: documents defect-333-transient-journal-io-permanently-bricks-authority-2026-07-15 (P1). Un-ignore with the fix."]
 fn transient_journal_failure_must_not_brick_the_authority() {
     let (p, c, g) = (policy(), committee(), genesis());
 
@@ -156,13 +160,16 @@ fn transient_journal_failure_must_not_brick_the_authority() {
     healthy.confirm(&peer_v0, &c).expect("peer confirm seq0");
     let v1 = certify(&mut healthy, &v1_order, &c);
 
+    // FIXED 2026-07-15: confirm() now carries the same poisoned guard as handle().
+    // The authority refuses rather than journalling seq1 over the gap left by the
+    // failed seq0 append.
     let r1 = auth.confirm(&v1, &c);
     assert!(
-        r1.is_ok(),
-        "confirm has no poisoned guard, so it accepts and journals seq1: {r1:?}"
+        matches!(r1, Err(transfer333::ConfirmError::Poisoned)),
+        "a poisoned authority must refuse to confirm, not journal past the hole: {r1:?}"
     );
 
-    // The log now records seq1 but never recorded seq0.
+    // NO HOLE: nothing was written after the failure.
     let durable = probe.replay().expect("replay");
     let confirmed: Vec<_> = durable
         .iter()
@@ -171,19 +178,26 @@ fn transient_journal_failure_must_not_brick_the_authority() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        confirmed,
-        vec![1],
-        "THE HOLE: seq0 is missing, seq1 is durable"
+    assert!(
+        confirmed.is_empty(),
+        "the failed seq0 append left no Confirmed record, and the guard stopped \
+         seq1 from being written on top of the gap — got {confirmed:?}"
     );
 
     // Restart. This is the whole point of the journal.
     let recovered = Authority::recover("a0", key(0), p, c.id(), g, probe.reopen());
-    assert!(
-        recovered.is_ok(),
-        "a transient disk-full must not permanently brick the authority — \
-         recover() folds seq1 onto a genesis ledger still at seq0 and gives up: \
-         {:?}",
-        recovered.err()
+    let auth = recovered.expect(
+        "a transient disk-full must not permanently brick the authority: the log \
+         has no hole, so recovery folds cleanly",
     );
+    // seq0's ledger.apply was in-memory only and correctly did not survive. The
+    // certificate is public evidence and can simply be re-presented.
+    assert_eq!(
+        auth.ledger().balance(&"bob".to_string()),
+        0,
+        "the un-journalled apply must not resurrect: recovery restores the durable \
+         state, and the cert can be replayed"
+    );
+    assert_eq!(auth.ledger().total_supply(), 100);
+    assert!(!auth.is_poisoned(), "a fresh process starts clean");
 }

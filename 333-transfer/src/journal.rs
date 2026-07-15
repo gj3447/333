@@ -27,9 +27,17 @@
 // * `NullJournal` is the default and preserves the pre-existing (non-durable)
 //   behaviour exactly, so the existing suite is an unchanged regression baseline.
 //   Durability is opt-in via `Authority::with_journal` / `Authority::recover`.
-// * Not a general log: no compaction, no snapshot, no segment rotation. A
-//   confirmed slot's records stay in the log forever. Bounded by transfer volume,
-//   not by time. Snapshotting is left open.
+// * Compaction exists (`Journal::compact`) but only cuts the constant, it does
+//   NOT bound growth. Measured 2026-07-15: log ~441 B per confirmed transfer,
+//   compacted ~53 B — an ~8x cut, both still O(transfers). The residual is
+//   `SnapshotData::confirmed`, one `(account, seq, order_id)` per slot ever
+//   applied. Collapsing it to O(accounts) is possible — certificate uniqueness
+//   means `seq < next_seq` already implies "this is the one we applied" — but
+//   that trades away today's detector for a conflicting certificate on a spent
+//   slot, so it is a deliberate call, not a cleanup. See
+//   `tests/journal_compaction.rs::compaction_cuts_the_constant_but_does_not_bound_growth`.
+// * No segment rotation: compaction rewrites the single file whole. Fine while
+//   the file is small; a large one makes compaction O(state) and blocking.
 // * `FileJournal` is native-only (`std::fs`). wasm32 targets keep `NullJournal`
 //   until an IndexedDB-backed port exists.
 
@@ -40,7 +48,7 @@ use sha2::{Digest, Sha256};
 use crate::owner::SignedTransfer;
 use crate::wire::{decode_transfer, encode_transfer, WireError};
 
-const JOURNAL_MAGIC: &[u8] = b"transfer333/journal/v2\0";
+const JOURNAL_MAGIC: &[u8] = b"transfer333/journal/v3\0";
 
 /// Tag 0 is reserved and never written.
 ///
@@ -52,6 +60,7 @@ const JOURNAL_MAGIC: &[u8] = b"transfer333/journal/v2\0";
 const TAG_TORN: u8 = 0;
 const TAG_LOCKED: u8 = 1;
 const TAG_CONFIRMED: u8 = 2;
+const TAG_SNAPSHOT: u8 = 3;
 
 /// `tag(1) || len(4, BE) || crc(4, BE)`.
 const HEADER_LEN: usize = 9;
@@ -73,6 +82,38 @@ pub enum JournalRecord {
     Locked(SignedTransfer),
     /// This authority applied a quorum certificate for the slot.
     Confirmed(SignedTransfer),
+    /// Complete authority state as of some point. Replaying it *replaces* state
+    /// rather than adding to it; see [`SnapshotData`].
+    Snapshot(SnapshotData),
+}
+
+/// Authority state captured whole, so the log before it can be discarded.
+///
+/// Why this is a log *frame* and not a sidecar file: compaction replaces the
+/// journal by writing a new file and renaming it over the old one, which is
+/// atomic. A snapshot in a separate file would create a window where both the
+/// snapshot and the un-truncated log exist, and recovery would apply the log's
+/// records *on top of* a state that already contains them — silently doubling
+/// every transfer. With one file there is no such intermediate state: recovery
+/// sees either the old journal or the new one.
+///
+/// `accounts` carries `next_seq` as well as the balance, which is why
+/// [`Ledger::restore`] exists — `try_genesis` can only produce `next_seq = 0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotData {
+    /// `(account, balance, next_seq)` for every account.
+    pub accounts: Vec<(String, u128, u64)>,
+    /// Slots locked but not yet confirmed. These are the live promises — dropping
+    /// one reopens the equivocation window this module exists to close.
+    pub locked: Vec<SignedTransfer>,
+    /// `(account, seq, order_id)` for slots already applied. Retained so a
+    /// re-delivered certificate still gets `AlreadyApplied` instead of a
+    /// stale-sequence error; gossip re-delivers certificates routinely.
+    ///
+    /// Only the order id, because that is all the live state holds — snapshotting
+    /// whole orders here would invent data the authority does not have and bloat
+    /// the file for nothing.
+    pub confirmed: Vec<(String, u64, [u8; 32])>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +152,12 @@ pub trait Journal: fmt::Debug + Send {
     fn append(&mut self, record: &JournalRecord) -> Result<(), JournalError>;
     /// Every record ever appended, in append order.
     fn replay(&self) -> Result<Vec<JournalRecord>, JournalError>;
+    /// Replace the whole log with a single snapshot frame, discarding the
+    /// records it subsumes.
+    ///
+    /// Must be atomic: a crash leaves either the old log or the new one, never a
+    /// state where the snapshot and the records it already contains coexist.
+    fn compact(&mut self, snapshot: &SnapshotData) -> Result<(), JournalError>;
 }
 
 /// Truncated SHA-256 over `tag || len || body`. `sha2` is already a dependency;
@@ -129,11 +176,11 @@ fn frame_crc(tag: u8, body: &[u8]) -> [u8; 4] {
 
 /// Encode one record as `tag || u32-BE len || crc(4) || encode_transfer(order)`.
 pub fn encode_record(record: &JournalRecord) -> Vec<u8> {
-    let (tag, order) = match record {
-        JournalRecord::Locked(o) => (TAG_LOCKED, o),
-        JournalRecord::Confirmed(o) => (TAG_CONFIRMED, o),
+    let (tag, body) = match record {
+        JournalRecord::Locked(o) => (TAG_LOCKED, encode_transfer(o)),
+        JournalRecord::Confirmed(o) => (TAG_CONFIRMED, encode_transfer(o)),
+        JournalRecord::Snapshot(sn) => (TAG_SNAPSHOT, encode_snapshot(sn)),
     };
-    let body = encode_transfer(order);
     let crc = frame_crc(tag, &body);
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.push(tag);
@@ -187,15 +234,118 @@ pub fn decode_records(mut bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalErr
                 "frame checksum mismatch: complete frame with bad data".into(),
             ));
         }
-        let order = decode_transfer(body)?;
         out.push(match tag {
-            TAG_LOCKED => JournalRecord::Locked(order),
-            TAG_CONFIRMED => JournalRecord::Confirmed(order),
+            TAG_LOCKED => JournalRecord::Locked(decode_transfer(body)?),
+            TAG_CONFIRMED => JournalRecord::Confirmed(decode_transfer(body)?),
+            TAG_SNAPSHOT => JournalRecord::Snapshot(decode_snapshot(body)?),
             other => return Err(JournalError::Corrupt(format!("unknown tag: {other}"))),
         });
         bytes = &bytes[HEADER_LEN + len..];
     }
     Ok(out)
+}
+
+
+// --- snapshot body codec -------------------------------------------------
+//
+// Hand-rolled, like `wire.rs`: the crate has no serde dependency and a durable
+// on-disk format is exactly where an implicit derive would be a liability.
+// Layout: u32 counts + length-prefixed items, all big-endian.
+
+fn put_u32(out: &mut Vec<u8>, v: usize) {
+    out.extend_from_slice(&(v as u32).to_be_bytes());
+}
+
+fn take_u32(bytes: &mut &[u8]) -> Result<usize, JournalError> {
+    if bytes.len() < 4 {
+        return Err(JournalError::Corrupt("snapshot: truncated u32".into()));
+    }
+    let v = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    *bytes = &bytes[4..];
+    Ok(v)
+}
+
+fn take_slice<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], JournalError> {
+    if bytes.len() < n {
+        return Err(JournalError::Corrupt("snapshot: truncated field".into()));
+    }
+    let (head, rest) = bytes.split_at(n);
+    *bytes = rest;
+    Ok(head)
+}
+
+pub fn encode_snapshot(sn: &SnapshotData) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, sn.accounts.len());
+    for (id, balance, next_seq) in &sn.accounts {
+        put_u32(&mut out, id.len());
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(&balance.to_be_bytes());
+        out.extend_from_slice(&next_seq.to_be_bytes());
+    }
+    put_u32(&mut out, sn.locked.len());
+    for order in &sn.locked {
+        let b = encode_transfer(order);
+        put_u32(&mut out, b.len());
+        out.extend_from_slice(&b);
+    }
+    put_u32(&mut out, sn.confirmed.len());
+    for (account, seq, order_id) in &sn.confirmed {
+        put_u32(&mut out, account.len());
+        out.extend_from_slice(account.as_bytes());
+        out.extend_from_slice(&seq.to_be_bytes());
+        out.extend_from_slice(order_id);
+    }
+    out
+}
+
+pub fn decode_snapshot(mut bytes: &[u8]) -> Result<SnapshotData, JournalError> {
+    let n = take_u32(&mut bytes)?;
+    let mut accounts = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let len = take_u32(&mut bytes)?;
+        let id = String::from_utf8(take_slice(&mut bytes, len)?.to_vec())
+            .map_err(|_| JournalError::Corrupt("snapshot: account id not utf-8".into()))?;
+        let balance = u128::from_be_bytes(
+            take_slice(&mut bytes, 16)?
+                .try_into()
+                .expect("16 bytes checked"),
+        );
+        let next_seq = u64::from_be_bytes(
+            take_slice(&mut bytes, 8)?
+                .try_into()
+                .expect("8 bytes checked"),
+        );
+        accounts.push((id, balance, next_seq));
+    }
+    let n = take_u32(&mut bytes)?;
+    let mut locked = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let len = take_u32(&mut bytes)?;
+        locked.push(decode_transfer(take_slice(&mut bytes, len)?)?);
+    }
+    let n = take_u32(&mut bytes)?;
+    let mut confirmed = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let len = take_u32(&mut bytes)?;
+        let account = String::from_utf8(take_slice(&mut bytes, len)?.to_vec())
+            .map_err(|_| JournalError::Corrupt("snapshot: confirmed account not utf-8".into()))?;
+        let seq = u64::from_be_bytes(
+            take_slice(&mut bytes, 8)?.try_into().expect("8 bytes checked"),
+        );
+        let order_id: [u8; 32] = take_slice(&mut bytes, 32)?
+            .try_into()
+            .expect("32 bytes checked");
+        confirmed.push((account, seq, order_id));
+    }
+    if !bytes.is_empty() {
+        return Err(JournalError::Corrupt("snapshot: trailing bytes".into()));
+    }
+    Ok(SnapshotData {
+        accounts,
+        locked,
+        confirmed,
+    })
 }
 
 /// Non-durable journal. Preserves the crate's original behaviour: locks live only
@@ -216,6 +366,10 @@ impl Journal for NullJournal {
     }
     fn replay(&self) -> Result<Vec<JournalRecord>, JournalError> {
         Ok(Vec::new())
+    }
+    fn compact(&mut self, _snapshot: &SnapshotData) -> Result<(), JournalError> {
+        // Nothing is retained, so there is nothing to compact.
+        Ok(())
     }
 }
 
@@ -245,6 +399,10 @@ impl Journal for MemJournal {
     }
     fn replay(&self) -> Result<Vec<JournalRecord>, JournalError> {
         Ok(self.records.clone())
+    }
+    fn compact(&mut self, snapshot: &SnapshotData) -> Result<(), JournalError> {
+        self.records = vec![JournalRecord::Snapshot(snapshot.clone())];
+        Ok(())
     }
 }
 
@@ -334,6 +492,54 @@ mod file {
 
         fn replay(&self) -> Result<Vec<JournalRecord>, JournalError> {
             decode_records(&self.read_body()?)
+        }
+
+        /// Rewrite the journal as `magic || snapshot`, atomically.
+        ///
+        /// The temp-file-then-rename dance is the whole crash-safety argument:
+        /// `rename(2)` within a directory is atomic, so a power loss leaves either
+        /// the complete old journal or the complete new one. Truncating in place
+        /// would expose a window where the file holds a snapshot *and* the records
+        /// it already accounts for, and recovery would apply those records on top
+        /// of a state that contains them — doubling every transfer in the window.
+        ///
+        /// The tmp file is fsynced before the rename so the rename cannot publish
+        /// a name that points at unwritten blocks. The directory is fsynced after,
+        /// so the rename itself survives.
+        fn compact(&mut self, snapshot: &SnapshotData) -> Result<(), JournalError> {
+            let tmp = self.path.with_extension("compact-tmp");
+            {
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)
+                    .map_err(|e| JournalError::Io(format!("open tmp: {e}")))?;
+                f.write_all(JOURNAL_MAGIC)
+                    .map_err(|e| JournalError::Io(format!("tmp magic: {e}")))?;
+                f.write_all(&encode_record(&JournalRecord::Snapshot(snapshot.clone())))
+                    .map_err(|e| JournalError::Io(format!("tmp snapshot: {e}")))?;
+                f.sync_all()
+                    .map_err(|e| JournalError::Io(format!("sync tmp: {e}")))?;
+            }
+            std::fs::rename(&tmp, &self.path)
+                .map_err(|e| JournalError::Io(format!("rename compacted journal: {e}")))?;
+            if let Some(dir) = self.path.parent() {
+                // Best-effort: a missing dir fsync loses the rename on a power cut,
+                // but the old journal is still intact in that case, so recovery is
+                // correct either way. Not worth failing compaction over.
+                if let Ok(d) = File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+            // The old handle points at the unlinked inode; reopen for appends.
+            self.file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(|e| JournalError::Io(format!("reopen after compact: {e}")))?;
+            Ok(())
         }
     }
 }

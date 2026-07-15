@@ -92,7 +92,7 @@ pub use epidemic::{
     mesh_all_eager, mesh_with_dropped_eager_edge, msg_id_of, peer_node_id, pump, EpidemicEndpoint,
     EpidemicNetwork,
 };
-pub use journal::{Journal, JournalError, JournalRecord, MemJournal, NullJournal};
+pub use journal::{Journal, JournalError, JournalRecord, MemJournal, NullJournal, SnapshotData};
 #[cfg(not(target_arch = "wasm32"))]
 pub use journal::FileJournal;
 pub use net::{
@@ -217,6 +217,37 @@ impl Ledger {
             accounts.insert(id, Account { balance, next_seq: 0 });
         }
         let _ = total;
+        Ok(Self { accounts })
+    }
+
+    /// Rebuild a ledger from a durable journal snapshot: `(account, balance,
+    /// next_seq)` per account.
+    ///
+    /// This is **not** genesis and deliberately bypasses the "value only enters
+    /// at genesis" rule, because the state it restores was itself *produced* by a
+    /// genesis plus a sequence of applies that a quorum already certified. It
+    /// exists so `journal.rs` can compact a log without replaying it from the
+    /// beginning forever.
+    ///
+    /// Feeding it hand-written numbers mints supply out of nothing. The only
+    /// legitimate caller is snapshot recovery.
+    pub fn restore<I>(entries: I) -> Result<Self, GenesisError>
+    where
+        I: IntoIterator<Item = (AccountId, Amount, u64)>,
+    {
+        let mut accounts = BTreeMap::new();
+        let mut total: Amount = 0;
+        for (id, balance, next_seq) in entries {
+            total = total
+                .checked_add(balance)
+                .ok_or(GenesisError::TotalSupplyOverflow)?;
+            if accounts
+                .insert(id.clone(), Account { balance, next_seq })
+                .is_some()
+            {
+                return Err(GenesisError::DuplicateAccount { account: id });
+            }
+        }
         Ok(Self { accounts })
     }
 

@@ -569,6 +569,7 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                                     ConfirmError::OwnerAuth(_) => "owner_auth",
                                     ConfirmError::State(_) => "state",
                                     ConfirmError::Journal(_) => "durability",
+                                    ConfirmError::Poisoned => "poisoned",
                                 };
                                 emit(&format!(
                                     "{{\"event\":\"cert_state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"{}\"}}",
