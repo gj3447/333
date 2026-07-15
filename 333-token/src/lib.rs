@@ -1,7 +1,13 @@
 // KG: SPAN_333_L11plus_Token, plan-333-p2p-os-synthesis-execution-2026-04-18,
 //     queue-p10-testnet-token-2026-04-18
 //
-// 333 P2P OS L11+ Token — ledger + staking primitives for the testnet economy.
+// 333 P2P OS L11+ Token — simulation/policy primitives for the testnet economy.
+//
+// CANONICALITY NOTE (PROM 4, 2026-07-15): `InMemoryLedger` is NOT a production
+// settlement source of truth. ORRR/333 value-bearing code must use
+// `payment333::PaymentLedger`, which composes authenticated FastPay transfers
+// and BFT-ordered escrow/reward state under one supply invariant. This crate is
+// retained for isolated staking/emission experiments and compatibility tests.
 //
 // Scope:
 //   - TokenLedger trait (balance / mint / burn / transfer) with conservation check.

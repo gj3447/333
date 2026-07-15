@@ -1,7 +1,13 @@
 // KG: SPAN_333_L14_Incentive, plan-333-p2p-os-synthesis-execution-2026-04-18,
 //     queue-p11-super-peer-incentive-2026-04-18
 //
-// 333 P2P OS L14 Incentive — super-peer selection and reward distribution.
+// 333 P2P OS L14 Incentive — super-peer selection and reward simulation.
+//
+// CANONICALITY NOTE (PROM 4, 2026-07-15): direct `TokenLedger::mint` distribution
+// is not the ORRR settlement path. Production reward allocations must become a
+// `payment333::ControlOperation::DistributeReward`, be BFT-certified once per
+// epoch, and settle through one-shot reserve-backed vouchers. This crate remains
+// useful for selecting peers and calculating candidate weights.
 //
 // Composition:
 //   - reputation333::PeerScorer  → observed behaviour (bandwidth, latency, uptime).
