@@ -56,3 +56,15 @@ it. OMD also remains safety-oriented rather than throughput-optimal: task choice
 is priority/FIFO plus overlap avoidance, SQLite has one writer, and the repo-wide
 merge token serializes all connect operations. No committed scale benchmark
 currently proves linear multi-agent speedup.
+
+Task A ultimately passed strict write-set commit and fenced connect:
+
+- task commit: `977016ee6ddd14eb5c3935ebaabc2c039b22108b`
+- OMD merge commit: `444f32b5e041720258a269b4ae4293c9473ad6fc`
+- integration generation: `1`
+- stale reads: `[]`
+
+The second receipt task also exposed stale-base creation: `start()` used the
+coordinator repo's detached HEAD instead of the newer declared integration tip.
+It was cleanly rebased before evidence edits. See
+`OMD_PARALLELISM_APPRAISAL_2026-07-15.md` for the optimization verdict.

@@ -1,0 +1,63 @@
+{
+  "schema": "payment333-omd-execution-receipt-v1",
+  "generated_at": "2026-07-15T03:50:00Z",
+  "coordinator": {
+    "name": "OMD",
+    "source_revision": "b124bfa306fd5626b336dde5d0f7a05e1c272962",
+    "strict_writeset": true,
+    "database_mode": "SQLite WAL",
+    "integration_branch": "codex/prom-333-safety"
+  },
+  "task": {
+    "task_id": "prom4-payment-ooptdd-omd",
+    "agent_id": "codex-root-v2",
+    "orbit_id": "orb-8215fb030d05",
+    "fence": 1,
+    "state": "MERGED",
+    "task_commit": "977016ee6ddd14eb5c3935ebaabc2c039b22108b",
+    "merge_commit": "444f32b5e041720258a269b4ae4293c9473ad6fc",
+    "integration_generation": 1,
+    "stale_reads": []
+  },
+  "write_set": [
+    "ooptdd/payment_*",
+    "333-payment/OOPTDD_*",
+    "333-payment/OMD_*",
+    "333-payment/KG_UPSERT_PROM4_PAYMENT_SAFETY.cypher",
+    "333-payment/PROM_4_PAYMENT_SAFETY_2026-07-15.md",
+    "333-payment/README.md",
+    "README.md"
+  ],
+  "ooptdd": {
+    "receipt": "333-payment/OOPTDD_RECEIPT_PROM4_PAYMENT_2026-07-15.json",
+    "receipt_sha256": "13f653f3d77ee6aacfcb89913d7efd34097744ea52b095b87dbbdba19d69b256",
+    "complete": true,
+    "requirements_done": 7,
+    "requirements_total": 7,
+    "methodology_checks_passed": 14,
+    "longinus_bindings_bound": 7
+  },
+  "observed_fail_loud_events": [
+    {
+      "event": "invalid_state_transition_rejected",
+      "detail": "PENDING to IN_ORBIT was rejected until next_task produced READY"
+    },
+    {
+      "event": "dirty_worktree_destroyed_on_agent_expiry",
+      "detail": "the default 90-second agent TTL retired the agent and force-removed its uncommitted worktree"
+    },
+    {
+      "event": "integration_branch_in_use_misclassified",
+      "detail": "git worktree branch-in-use was reported as merge conflict; detaching the clean integration worktree allowed retry"
+    },
+    {
+      "event": "stale_orbit_base_created",
+      "detail": "a second task started from the coordinator repo HEAD rather than the declared integration branch tip and required an explicit rebase"
+    },
+    {
+      "event": "multi_orbit_single_fence_mismatch",
+      "detail": "two valid write orbits had fences 4 and 5 while commit accepted one fence argument; after both were released and paths were reclaimed under fence 6, released historical orbits still poisoned every commit as stale, so recovery required a fresh task"
+    }
+  ],
+  "verdict": "MERGED_WITH_CRITICAL_OMD_OPERATIONAL_DEFECT_RECORDED"
+}
