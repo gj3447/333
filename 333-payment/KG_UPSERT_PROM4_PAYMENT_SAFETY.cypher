@@ -138,3 +138,102 @@ FOREACH (_ IN CASE WHEN anchor IS NULL THEN [] ELSE [1] END |
 
 MATCH (tree:LakatosTree {name: 'LakatosTree_333PaymentSafety_20260715'})
 RETURN tree.name AS tree, tree.status AS status, tree.source_commit AS commit;
+
+MATCH (tree:LakatosTree {name: 'LakatosTree_333PaymentSafety_20260715'}),
+      (cycle:PrometheusCycle {name: 'prom4-333-payment-safety-2026-07-15'}),
+      (method:Methodology {name: 'OOPTDD_methodology_v1'})
+MERGE (run:OOPTDDRun:VerifiedArtifact {name: 'ooptdd-payment333-prom4-20260715'})
+SET run.status = 'COMPLETE',
+    run.cid = 'payment333-prom4-ooptdd-20260715',
+    run.requirements_done = 7,
+    run.requirements_total = 7,
+    run.methodology_checks_passed = 14,
+    run.longinus_bindings_bound = 7,
+    run.runtime_revision = '11c2e1a9c42b29d3440b1c21e650a4021c2d590d',
+    run.execution_revision = '0106098f64465066eefd0d1e82be3a8990377672',
+    run.execution_host = 'lagyeongjun@bhgman.iptime.org',
+    run.sourcePath = '333-payment/OOPTDD_RECEIPT_PROM4_PAYMENT_2026-07-15.json',
+    run.minioPath = 's3://docs/333/payment-safety/2026-07-15/OOPTDD_RECEIPT_PROM4_PAYMENT_2026-07-15.json',
+    run.receipt_sha256 = '13f653f3d77ee6aacfcb89913d7efd34097744ea52b095b87dbbdba19d69b256',
+    run.verifiedAt = '2026-07-15T12:45:33+09:00'
+MERGE (tree)-[:APPLIES_METHODOLOGY]->(method)
+MERGE (tree)-[:HAS_OOPTDD_RUN]->(run)
+MERGE (cycle)-[:VERIFIED_BY]->(run)
+MERGE (run)-[:USES_METHODOLOGY]->(method);
+
+MATCH (tree:LakatosTree {name: 'LakatosTree_333PaymentSafety_20260715'}),
+      (run:OOPTDDRun {name: 'ooptdd-payment333-prom4-20260715'})
+UNWIND [
+  {id:'REQ-PAY-OWNER-AUTH', event:'payment_owner_auth_verified', anchor:'ooptdd-payment333-owner-auth-20260715'},
+  {id:'REQ-PAY-RESTART-LOCK', event:'payment_restart_safety_verified', anchor:'ooptdd-payment333-restart-lock-20260715'},
+  {id:'REQ-PAY-DURABLE-REOPEN', event:'payment_durable_reopen_verified', anchor:'ooptdd-payment333-durable-reopen-20260715'},
+  {id:'REQ-PAY-CONTEXT-EPOCH', event:'payment_context_epoch_binding_verified', anchor:'ooptdd-payment333-context-epoch-20260715'},
+  {id:'REQ-PAY-ROTATION-LOCK-FENCE', event:'payment_rotation_lock_fence_verified', anchor:'ooptdd-payment333-rotation-lock-fence-20260715'},
+  {id:'REQ-PAY-ROTATION-ESCROW', event:'payment_rotation_escrow_continuity_verified', anchor:'ooptdd-payment333-rotation-escrow-20260715'},
+  {id:'REQ-PAY-UNIFIED-LANES', event:'payment_unified_lanes_supply_verified', anchor:'ooptdd-payment333-unified-lanes-20260715'}
+] AS row
+MERGE (req:OOPTDDRequirement:AbstractNode {name: row.id})
+SET req.status = 'DONE',
+    req.expected_event = row.event,
+    req.gate_result = 'GREEN',
+    req.cycle_id = run.cid,
+    req.sourcePath = 'ooptdd/payment_requirements.yaml'
+MERGE (site:ReferenceSite:Longinus {kg_anchor: row.anchor})
+SET site.source_path = 'ooptdd/payment_conformance_adapter.py',
+    site.symbol = 'run_payment_probe',
+    site.emits = row.event,
+    site.bound = true,
+    site.blob_oid = '66fda9d7f0106cec274cbcd8cfbdb4889d36cde5',
+    site.sha256 = 'e1bcb56bb4d7fa9d',
+    site.cycle_id = run.cid
+MERGE (run)-[:HAS_REQUIREMENT]->(req)
+MERGE (req)-[:BOUND_AT]->(site)
+MERGE (tree)-[:HAS_OOPTDD_REQUIREMENT]->(req);
+
+MATCH (tree:LakatosTree {name: 'LakatosTree_333PaymentSafety_20260715'}),
+      (cycle:PrometheusCycle {name: 'prom4-333-payment-safety-2026-07-15'})
+MERGE (execution:OMDExecution:VerifiedArtifact {name: 'omd-payment333-prom4-task-a-20260715'})
+SET execution.status = 'MERGED',
+    execution.task_id = 'prom4-payment-ooptdd-omd',
+    execution.agent_id = 'codex-root-v2',
+    execution.orbit_id = 'orb-8215fb030d05',
+    execution.fence = 1,
+    execution.strict_writeset = true,
+    execution.source_revision = 'b124bfa306fd5626b336dde5d0f7a05e1c272962',
+    execution.task_commit = '977016ee6ddd14eb5c3935ebaabc2c039b22108b',
+    execution.merge_commit = '444f32b5e041720258a269b4ae4293c9473ad6fc',
+    execution.integration_generation = 1,
+    execution.sourcePath = '333-payment/OMD_EXECUTION_RECEIPT_PROM4_PAYMENT_2026-07-15.json',
+    execution.minioPath = 's3://docs/333/payment-safety/2026-07-15/OMD_EXECUTION_RECEIPT_PROM4_PAYMENT_2026-07-15.json',
+    execution.verdict = 'MERGED_WITH_CRITICAL_OPERATIONAL_DEFECT_RECORDED'
+MERGE (appraisal:OMDAppraisal:AbstractNode {name: 'omd-payment333-parallelism-appraisal-20260715'})
+SET appraisal.verdict = 'SAFETY_PROGRESSIVE_THROUGHPUT_UNPROVEN',
+    appraisal.highest_severity_problem = 'Default agent lease expiry force-removed a dirty worktree and destroyed uncommitted changes.',
+    appraisal.optimization_status = 'Conflict-aware admission only; no cost/critical-path/agent-capability optimization or committed scaling benchmark.',
+    appraisal.sourcePath = '333-payment/OMD_PARALLELISM_APPRAISAL_2026-07-15.md',
+    appraisal.minioPath = 's3://docs/333/payment-safety/2026-07-15/OMD_PARALLELISM_APPRAISAL_2026-07-15.md'
+MERGE (defect:OperationalDefect:AbstractNode {name: 'omd-dirty-worktree-destructive-reclaim-20260715'})
+SET defect.status = 'OPEN',
+    defect.severity = 'CRITICAL',
+    defect.problem = 'A legitimate long-running agent exceeded the default 90-second TTL; reclaim retired the agent and force-removed its dirty worktree.',
+    defect.required_fix = 'Quarantine or checkpoint dirty worktrees on expiry and expose recovery; never silently delete uncommitted state.',
+    defect.falsifier = 'An expiry regression test preserves and recovers a dirty worktree without data loss.',
+    defect.sourcePath = '333-payment/OMD_PARALLELISM_APPRAISAL_2026-07-15.md'
+MERGE (tree)-[:EXECUTED_VIA]->(execution)
+MERGE (cycle)-[:VERIFIED_BY]->(execution)
+MERGE (tree)-[:HAS_METHOD_APPRAISAL]->(appraisal)
+MERGE (appraisal)-[:EVALUATES]->(execution)
+MERGE (appraisal)-[:IDENTIFIES]->(defect)
+MERGE (execution)-[:EXPOSED]->(defect);
+
+MATCH (execution:OMDExecution {name: 'omd-payment333-prom4-task-a-20260715'}),
+      (concept {name: 'omd-dempsey-roll-2026-07-11'})
+MERGE (execution)-[:APPLIES_CONCEPT]->(concept);
+
+MATCH (tree:LakatosTree {name: 'LakatosTree_333PaymentSafety_20260715'})
+SET tree.methodologies = ['PROM', 'Lakatos', 'OOPTDD_methodology_v1', 'OMD'],
+    tree.updatedAt = '2026-07-15T12:50:00+09:00'
+RETURN tree.name AS tree,
+       size([(tree)-[:HAS_OOPTDD_RUN]->() | 1]) AS ooptdd_runs,
+       size([(tree)-[:EXECUTED_VIA]->() | 1]) AS omd_executions,
+       size([(tree)-[:HAS_METHOD_APPRAISAL]->() | 1]) AS method_appraisals;

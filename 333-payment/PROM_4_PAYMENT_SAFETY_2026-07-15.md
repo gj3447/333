@@ -148,6 +148,14 @@ Implementation work uses OMD revision `b124bfa306fd5626b336dde5d0f7a05e1c272962`
 an explicit HELD write-set lease, `strict_writeset=true`, a dedicated worktree and
 the coordinator's connect fence.
 
+Final OOPTDD result: **7/7 DONE, 14/14 methodology rules, 7/7 Longinus
+bindings**. OMD Task A reached `MERGED` at `444f32b5e041720258a269b4ae4293c9473ad6fc`.
+The run also falsified the stronger claim that OMD is already a production-safe,
+throughput-optimal scheduler: default lease expiry destroyed a dirty worktree,
+orbit creation could start from a stale repo HEAD, all DB mutations retain one
+SQLite writer, and all connects retain one repo-wide merge token. These findings
+do not weaken payment333 safety; they define a new OMD protective-belt frontier.
+
 Evidence:
 
 - `ooptdd/payment_requirements.yaml`
