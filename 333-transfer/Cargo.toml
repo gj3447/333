@@ -9,6 +9,16 @@ description = "333 P2P OS — consensusless single-owner asset transfer (FastPay
 #     vp-prom16-333-coin-transferable-vs-local-credit-2026-07-12,
 #     vp-prom16-333-coin-premint-vs-runtime-issuance-2026-07-12
 
+# The node binary is a native process: real TCP sockets, threads, a filesystem
+# journal, argv. None of that exists on wasm32-unknown-unknown, so it is excluded
+# from that target rather than cfg-littered. The *library* is what must build for
+# the browser (333's "P2P browser base" identity); the binary is the native
+# deployment of it.
+[[bin]]
+name = "node"
+path = "src/bin/node.rs"
+required-features = []
+
 [dependencies]
 crdt333 = { path = "../333-crdt" }
 # Step 4: Plumtree epidemic (orphaned L12 crate — first real consumer).
@@ -23,3 +33,14 @@ ed25519-dalek = "2"
 sha2 = "0.10"
 # Scrub private-key file buffers after constructing an Ed25519 SigningKey.
 zeroize = "1"
+
+# wasm32 needs an explicit entropy backend. `getrandom` 0.2 arrives transitively
+# (ed25519-dalek -> rand_core, identity333 -> rand 0.8) and refuses to compile for
+# wasm*-unknown-unknown unless its "js" feature is on. This is a *build* gate, not
+# a runtime one: even a verify-only browser build fails without it, because the
+# feature is what selects a backend at all. We do not call getrandom directly —
+# this entry exists purely to unify the feature across the tree.
+# NOTE: 333-platform pins getrandom 0.3 (feature "wasm_js"); this tree is on 0.2,
+# whose equivalent feature is "js". They are different majors, not a discrepancy.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

@@ -48,7 +48,23 @@ pub enum NetError {
 /// - `broadcast_vote`  — authority → mesh (signed vote)
 /// - `broadcast_cert`  — optional cert fan-out after assembly
 /// - `poll`            — drain this endpoint's inbox
-pub trait AuthorityNet: Send + Sync {
+/// `Send + Sync` on native, no bound on wasm32.
+///
+/// A browser endpoint holds JS handles (`RtcDataChannel` and friends) which are
+/// neither `Send` nor `Sync`, and wasm32 is single-threaded anyway. Requiring the
+/// bound there would make a `WasmEndpoint` impossible to write while buying
+/// nothing. Native keeps the bound unchanged: authorities are shared across
+/// reader/listener threads there, so dropping it would be a real regression.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSendSync: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> MaybeSendSync for T {}
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSendSync {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MaybeSendSync for T {}
+
+pub trait AuthorityNet: MaybeSendSync {
     fn broadcast_order(&self, order: SignedTransfer) -> Result<(), NetError>;
     fn broadcast_vote(&self, v: Vote) -> Result<(), NetError>;
     fn broadcast_cert(&self, c: Certificate) -> Result<(), NetError>;

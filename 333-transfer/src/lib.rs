@@ -75,6 +75,11 @@ pub mod epidemic;
 pub mod journal;
 pub mod net;
 pub mod owner;
+// Native-only: real sockets and reader/listener threads. It *does* compile for
+// wasm32 (std::net types exist there) but can never function, so gating it keeps
+// the browser API surface honest instead of offering a TcpAuthorityNet that
+// silently fails at runtime.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tcp;
 pub mod wire;
 
@@ -101,6 +106,7 @@ pub use owner::{
     OwnerRegistryError, PolicyId, SignedTransfer, TransferPolicy, MAX_ACCOUNT_ID_BYTES,
     MAX_NETWORK_ID_BYTES,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use tcp::{TcpAuthorityNet, TcpEndpoint};
 pub use wire::{
     decode_authority_msg, decode_certificate, decode_transfer, decode_vote, encode_authority_msg,

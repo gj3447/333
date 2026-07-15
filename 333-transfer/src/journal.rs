@@ -35,12 +35,26 @@
 
 use std::fmt;
 
+use sha2::{Digest, Sha256};
+
 use crate::owner::SignedTransfer;
 use crate::wire::{decode_transfer, encode_transfer, WireError};
 
-const JOURNAL_MAGIC: &[u8] = b"transfer333/journal/v1\0";
-const TAG_LOCKED: u8 = 0;
-const TAG_CONFIRMED: u8 = 1;
+const JOURNAL_MAGIC: &[u8] = b"transfer333/journal/v2\0";
+
+/// Tag 0 is reserved and never written.
+///
+/// A power loss can extend a file's length while the data blocks never land
+/// (ext4 `data=ordered`), leaving a run of zeros past the last good record. With
+/// a zero tag that tail would parse as a well-formed zero-length frame — a
+/// phantom record invented by the crash. Reserving 0 makes a zero-filled tail
+/// self-identifying as "not a record".
+const TAG_TORN: u8 = 0;
+const TAG_LOCKED: u8 = 1;
+const TAG_CONFIRMED: u8 = 2;
+
+/// `tag(1) || len(4, BE) || crc(4, BE)`.
+const HEADER_LEN: usize = 9;
 
 /// Upper bound on one encoded record, mirroring the wire framing guard. A
 /// corrupt or hostile length prefix must not drive an unbounded allocation.
@@ -99,45 +113,87 @@ pub trait Journal: fmt::Debug + Send {
     fn replay(&self) -> Result<Vec<JournalRecord>, JournalError>;
 }
 
-/// Encode one record as `tag || u32-BE len || encode_transfer(order)`.
+/// Truncated SHA-256 over `tag || len || body`. `sha2` is already a dependency;
+/// four bytes is enough to catch a torn or rotted frame, which is all this needs
+/// to do — it is an integrity check, not an authentication tag (the body carries
+/// its own Ed25519 owner signature).
+fn frame_crc(tag: u8, body: &[u8]) -> [u8; 4] {
+    let mut d = Sha256::new();
+    d.update(JOURNAL_MAGIC);
+    d.update([tag]);
+    d.update((body.len() as u32).to_be_bytes());
+    d.update(body);
+    let full = d.finalize();
+    [full[0], full[1], full[2], full[3]]
+}
+
+/// Encode one record as `tag || u32-BE len || crc(4) || encode_transfer(order)`.
 pub fn encode_record(record: &JournalRecord) -> Vec<u8> {
     let (tag, order) = match record {
         JournalRecord::Locked(o) => (TAG_LOCKED, o),
         JournalRecord::Confirmed(o) => (TAG_CONFIRMED, o),
     };
     let body = encode_transfer(order);
-    let mut out = Vec::with_capacity(1 + 4 + body.len());
+    let crc = frame_crc(tag, &body);
+    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.push(tag);
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&crc);
     out.extend_from_slice(&body);
     out
 }
 
 /// Decode a full log body (after the magic header) into records.
+///
+/// Tear vs corruption, following etcd's WAL stance:
+///
+/// * An **incomplete** trailing frame — short header, short body, or the
+///   reserved zero tag from a zero-filled tail — is a *tear*. `append` fsyncs
+///   every record, so only the last frame can be partial: it never became
+///   durable, so the decision it carried never became externally visible.
+///   Recovery stops cleanly at that point.
+/// * A **complete** frame whose CRC does not match is *corruption*, not a tear,
+///   and is a hard error. Silently truncating there would drop durable locks —
+///   precisely the equivocation this module exists to prevent — so it fails
+///   closed and lets an operator look.
+///
+/// Known limitation: without a chained hash this cannot detect corruption that
+/// destroys a frame *and* everything after it. Append-plus-fsync makes that
+/// shape unreachable in practice, but it is not proven away.
 pub fn decode_records(mut bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> {
     let mut out = Vec::new();
     while !bytes.is_empty() {
-        if bytes.len() < 5 {
-            return Err(JournalError::Corrupt("truncated record header".into()));
+        // Torn header: fewer bytes than one frame header.
+        if bytes.len() < HEADER_LEN {
+            break;
         }
         let tag = bytes[0];
+        // Zero-filled tail (or any reserved tag): not a record.
+        if tag == TAG_TORN {
+            break;
+        }
         let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
         if len > MAX_RECORD_BYTES {
             return Err(JournalError::Corrupt(format!("record too large: {len}")));
         }
-        if bytes.len() < 5 + len {
-            // A torn tail is expected after a crash mid-append: the record never
-            // became durable, so the decision it carried never became visible.
-            // Stop cleanly rather than failing the whole recovery.
+        let crc = [bytes[5], bytes[6], bytes[7], bytes[8]];
+        // Torn body.
+        if bytes.len() < HEADER_LEN + len {
             break;
         }
-        let order = decode_transfer(&bytes[5..5 + len])?;
+        let body = &bytes[HEADER_LEN..HEADER_LEN + len];
+        if frame_crc(tag, body) != crc {
+            return Err(JournalError::Corrupt(
+                "frame checksum mismatch: complete frame with bad data".into(),
+            ));
+        }
+        let order = decode_transfer(body)?;
         out.push(match tag {
             TAG_LOCKED => JournalRecord::Locked(order),
             TAG_CONFIRMED => JournalRecord::Confirmed(order),
             other => return Err(JournalError::Corrupt(format!("unknown tag: {other}"))),
         });
-        bytes = &bytes[5 + len..];
+        bytes = &bytes[HEADER_LEN + len..];
     }
     Ok(out)
 }
