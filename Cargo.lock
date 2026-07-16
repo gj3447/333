@@ -520,6 +520,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2696,6 +2705,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p333-wal"
+version = "0.0.0"
+dependencies = [
+ "crc32c",
+ "rustix",
+ "tempfile",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3778,6 +3796,19 @@ name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "thiserror"
