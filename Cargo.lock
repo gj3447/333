@@ -2709,7 +2709,6 @@ name = "p333-wal"
 version = "0.0.0"
 dependencies = [
  "crc32c",
- "rustix",
  "tempfile",
 ]
 

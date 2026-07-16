@@ -176,6 +176,150 @@ fn zero_sector_tail_is_torn_not_fatal() {
     assert_eq!(entries[0].payload, b"survivor");
 }
 
+/// Review #0 regression: an oversized payload must be rejected at append()
+/// time (write/read symmetry) — never acked and then unreadable — and the
+/// rejection must NOT poison the handle (nothing was written).
+#[test]
+fn oversized_append_rejected_wal_still_usable() {
+    let td = tmpdir();
+    let dir = td.path().join("wal");
+    let mut wal = Wal::create(&dir, META, WalOptions::default()).unwrap();
+    match wal.append(&vec![0u8; p333_wal::MAX_PAYLOAD + 1]) {
+        Err(WalError::RecordTooLarge { .. }) => {}
+        other => panic!("expected RecordTooLarge, got {other:?}"),
+    }
+    wal.append(b"still-works").unwrap();
+    let receipt = wal.sync().unwrap();
+    assert_eq!(receipt.last_seq, 1);
+    drop(wal);
+    let (entries, _wal) = Wal::open(&dir, META, WalOptions::default()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].payload, b"still-works");
+}
+
+/// Review #1 regression: a corrupted KIND byte mid-stream (complete frame,
+/// non-zero surroundings, valid records after it) is real corruption — it
+/// must be fatal CorruptFrame, NOT reclassified as a repairable torn tail
+/// that silently discards the later synced records.
+#[test]
+fn midstream_kind_corruption_is_fatal() {
+    let td = tmpdir();
+    let dir = td.path().join("wal");
+    let mut wal = Wal::create(&dir, META, WalOptions::default()).unwrap();
+    let sizes = [
+        {
+            wal.append(&[0x11; 64]).unwrap();
+            wal.sync().unwrap();
+            fs::metadata(wal_files(&dir).pop().unwrap()).unwrap().len()
+        },
+        {
+            wal.append(&[0x22; 64]).unwrap();
+            wal.append(&[0x33; 64]).unwrap();
+            wal.sync().unwrap();
+            0
+        },
+    ];
+    drop(wal);
+
+    let tail = wal_files(&dir).pop().unwrap();
+    let mut bytes = fs::read(&tail).unwrap();
+    let r2_kind = sizes[0] as usize + 8; // R2 frame starts after R1; kind byte after lenField
+    assert_eq!(bytes[r2_kind], 3, "sanity: we are flipping the Entry kind byte");
+    bytes[r2_kind] = 7;
+    fs::write(&tail, &bytes).unwrap();
+
+    match Wal::open(&dir, META, WalOptions::default()) {
+        Err(WalError::CorruptFrame) => {}
+        other => panic!(
+            "mid-stream kind corruption must be fatal CorruptFrame, got {other:?}",
+            other = other.map(|(e, _)| e.len())
+        ),
+    }
+}
+
+/// Review #2 regression (false-positive leg): a bit flip in a synced record
+/// must stay fatal even when a LATER intact record legitimately contains
+/// long runs of zeros — the torn heuristic may only scan the failing
+/// record's own extent, so later zeros can no longer launder corruption.
+#[test]
+fn zeros_in_later_record_do_not_mask_corruption() {
+    let td = tmpdir();
+    let dir = td.path().join("wal");
+    let mut wal = Wal::create(&dir, META, WalOptions::default()).unwrap();
+    wal.append(&[0x11; 64]).unwrap();
+    let r1_end = {
+        wal.sync().unwrap();
+        fs::metadata(wal_files(&dir).pop().unwrap()).unwrap().len()
+    };
+    wal.append(&vec![0u8; 2048]).unwrap(); // legitimate all-zero payload
+    wal.sync().unwrap();
+    drop(wal);
+
+    let tail = wal_files(&dir).pop().unwrap();
+    let mut bytes = fs::read(&tail).unwrap();
+    bytes[r1_end as usize - 20] ^= 0xFF; // flip inside R1's synced payload
+    fs::write(&tail, &bytes).unwrap();
+
+    match Wal::open(&dir, META, WalOptions::default()) {
+        Err(WalError::CrcMismatch { .. }) => {}
+        other => panic!(
+            "corruption before a zero-heavy record must stay fatal, got {other:?}",
+            other = other.map(|(e, _)| e.len())
+        ),
+    }
+}
+
+/// Review #2 regression (true-torn leg): zeroing the tail record's own bytes
+/// through EOF (a real power-cut shape: its extent contains all-zero
+/// sectors) must repair by truncation to the previous record.
+#[test]
+fn zeroed_tail_record_extent_repairs_to_prefix() {
+    let td = tmpdir();
+    let dir = td.path().join("wal");
+    let mut wal = Wal::create(&dir, META, WalOptions::default()).unwrap();
+    wal.append(b"survivor").unwrap();
+    let r1_end = {
+        wal.sync().unwrap();
+        fs::metadata(wal_files(&dir).pop().unwrap()).unwrap().len()
+    };
+    wal.append(&vec![0xCD; 3000]).unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    let tail = wal_files(&dir).pop().unwrap();
+    let mut bytes = fs::read(&tail).unwrap();
+    // zero the record's data from 100 bytes into its frame through EOF —
+    // guaranteed to cover at least one aligned 512-byte sector
+    let from = r1_end as usize + 100;
+    for b in &mut bytes[from..] {
+        *b = 0;
+    }
+    fs::write(&tail, &bytes).unwrap();
+
+    let (entries, _wal) = Wal::open(&dir, META, WalOptions::default()).unwrap();
+    assert_eq!(entries.len(), 1, "zeroed tail record must truncate away");
+    assert_eq!(entries[0].payload, b"survivor");
+}
+
+/// Review #9 regression: foreign files in the WAL directory (.DS_Store,
+/// editor backups) must be ignored, not fail the whole open.
+#[test]
+fn foreign_files_in_dir_are_ignored() {
+    let td = tmpdir();
+    let dir = td.path().join("wal");
+    let mut wal = Wal::create(&dir, META, WalOptions::default()).unwrap();
+    wal.append(b"x").unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    fs::write(dir.join(".DS_Store"), b"finder junk").unwrap();
+    fs::write(dir.join("notes.txt~"), b"editor junk").unwrap();
+    fs::create_dir(dir.join("subdir")).unwrap();
+
+    let (entries, _wal) = Wal::open(&dir, META, WalOptions::default()).unwrap();
+    assert_eq!(entries.len(), 1);
+}
+
 /// NEGATIVE ORACLE (the RED that proves the gate can fail): flip one byte
 /// inside a SYNCED record that has valid records after it. This is real
 /// corruption, not a torn tail — reopen must refuse with CrcMismatch and must

@@ -8,12 +8,11 @@ description = "333 v2 substrate durability: write-ahead log ported as *design-in
 # Deliberately tiny dependency surface (absorption doc API-14): the WAL must compile fast,
 # stay deterministic, and never drag substrate deps into the durability core.
 #   crc32c — Castagnoli polynomial, same as etcd's rolling record chain (FMT-3).
-#   rustix — flock only (single-writer enforcement, API-7). fdatasync itself goes through
-#            std File::sync_data (on apple targets std already issues F_FULLFSYNC — verified
-#            against rustc 1.97 std source during absorption, DUR-1 verify).
+# Locking uses std File::try_lock (stable since 1.89) — no flock crate needed; fdatasync
+# goes through std File::sync_data (on apple targets std already issues F_FULLFSYNC —
+# verified against rustc 1.97 std source during absorption, DUR-1 verify).
 [target.'cfg(unix)'.dependencies]
 crc32c = "0.6"
-rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -17,12 +17,22 @@
 //! p333 has no consensus layer behind it, so it is always sync-then-send;
 //! etcd's leader-parallel optimization is deliberately not ported).
 //!
+//! After ANY I/O failure in `append`/`sync`/segment cut, the handle is
+//! **poisoned** and refuses further work: a Linux fdatasync error can mark
+//! dirty pages clean, so a retried sync would hand out a receipt for data
+//! that never reached disk (fsyncgate — etcd panics here for the same
+//! reason; we return [`WalError::Poisoned`] instead and the caller decides).
+//!
 //! ## Recovery model (DUR-8)
 //!
 //! Reopening a WAL can lose **only the un-synced suffix**. A torn tail is
-//! detected (partial record, or zero-sector heuristic FMT-7) and truncated;
-//! a broken crc chain inside the synced region is fatal `CrcMismatch` and is
-//! never auto-repaired (FMT-8).
+//! repaired by truncation only when the evidence says "torn": genuinely
+//! partial bytes at EOF, or a failing record whose own extent contains an
+//! all-zero disk sector (etcd's `isTornEntry`, FMT-7 — the scan covers the
+//! failing record only, on absolute 512-byte sector boundaries, so zeros
+//! inside *later intact records* can never launder real corruption). A
+//! broken crc chain or structurally corrupt frame in the synced region is
+//! fatal (`CrcMismatch` / `CorruptFrame`, FMT-8) and never auto-repaired.
 //!
 //! ## Mode FSM (API-1)
 //!
@@ -34,23 +44,31 @@
 //! Deliberate v1 deltas from etcd (recorded in the absorption doc §3):
 //! no HardState in segment headers, no preallocation/filePipeline (torn-tail
 //! detection does not depend on it), single directory-level `LOCK` flock
-//! instead of per-segment locks, snapshots/release_older deferred.
+//! instead of per-segment locks (via std `File::try_lock`), snapshots /
+//! release_older / read-only verify deferred.
 #![cfg(unix)]
 
 mod error;
 mod record;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub use error::WalError;
-use record::{Decoded, RecordKind};
+use record::{Decoded, DecodeFailure, RecordKind, ENVELOPE_HEADER, MAX_ENVELOPE_LEN};
 
 /// Default segment roll-over size, same order as etcd's SegmentSizeBytes.
 pub const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Largest payload `append()` accepts — chosen so the decoder's
+/// [`MAX_ENVELOPE_LEN`] gate can never reject a record that was acked
+/// (write/read symmetry; review finding #0).
+pub const MAX_PAYLOAD: usize = MAX_ENVELOPE_LEN as usize - ENVELOPE_HEADER - 8;
+
 const LOCK_FILE: &str = "LOCK";
+/// Zero-sector scan cap when a garbage length field hides the frame extent.
+const UNKNOWN_EXTENT_SCAN: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct WalOptions {
@@ -73,7 +91,7 @@ pub struct Entry {
 
 /// Proof that everything up to `last_seq` is on stable storage.
 ///
-/// Externalization APIs should demand this token (typestate court of the
+/// Externalization APIs should demand this token (typestate form of the
 /// DUR-6 contract): a function that signs/answers/forwards takes a
 /// `&DurableReceipt` whose `last_seq` covers the state it externalizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,23 +112,31 @@ pub struct Wal {
     segment_seq: u64,
     next_seq: u64,
     last_synced: u64,
+    dirty: bool,
+    poisoned: bool,
     opts: WalOptions,
 }
 
 impl Wal {
     /// Create a fresh WAL directory. Fails if `dir` already exists.
     ///
-    /// Atomicity (LIF-1/API-2): the directory is fully built under a `.tmp`
-    /// sibling — initial segment with CrcSeed(0)+Metadata already fsynced —
-    /// then renamed into place, and the parent directory is fsynced. A crash
-    /// anywhere before the rename leaves only a `.tmp` husk, never a
-    /// half-initialized WAL.
+    /// Atomicity (LIF-1/API-2): the directory is fully built under a
+    /// `<name>.waltmp` sibling — initial segment with CrcSeed(0)+Metadata
+    /// already fsynced — then renamed into place, and the parent directory
+    /// is fsynced. A crash anywhere before the rename leaves only a tmp
+    /// husk, never a half-initialized WAL.
     pub fn create(dir: &Path, metadata: &[u8], opts: WalOptions) -> Result<Wal, WalError> {
         if dir.exists() {
             return Err(WalError::NotAWal(format!("{} already exists", dir.display())));
         }
         let parent = dir.parent().ok_or_else(|| WalError::NotAWal("no parent dir".into()))?;
-        let tmp = dir.with_extension("waltmp");
+        let dir_name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| WalError::NotAWal("unusable dir name".into()))?;
+        // NOT with_extension(): that would *replace* an existing extension
+        // ("wal.v2" → "wal.waltmp") and collide across sibling WALs.
+        let tmp = parent.join(format!("{dir_name}.waltmp"));
         if tmp.exists() {
             fs::remove_dir_all(&tmp)?;
         }
@@ -118,7 +144,7 @@ impl Wal {
 
         // Lock file exists from birth so open() always finds it.
         let lock = File::create(tmp.join(LOCK_FILE))?;
-        flock_exclusive(&lock)?;
+        lock_exclusive(&lock)?;
 
         let seg_path = tmp.join(segment_name(0, 0));
         let mut seg = OpenOptions::new().create_new(true).read(true).write(true).open(&seg_path)?;
@@ -145,27 +171,35 @@ impl Wal {
             segment_seq: 0,
             next_seq: 1,
             last_synced: 0,
+            dirty: false,
+            poisoned: false,
             opts,
         })
     }
 
-    /// Open an existing WAL: replay everything, repair a torn tail if the
-    /// zero-sector heuristic proves one (FMT-7), and return the surviving
-    /// entries plus the appendable handle positioned after the last valid
-    /// record.
+    /// Open an existing WAL: replay everything, repair a proven torn tail,
+    /// and return the surviving entries plus the appendable handle
+    /// positioned after the last valid record.
     pub fn open(dir: &Path, metadata: &[u8], opts: WalOptions) -> Result<(Vec<Entry>, Wal), WalError> {
         let lock = File::options()
             .read(true)
             .write(true)
             .open(dir.join(LOCK_FILE))
             .map_err(|_| WalError::NotAWal(format!("{} has no LOCK file", dir.display())))?;
-        flock_exclusive(&lock)?;
+        lock_exclusive(&lock)?;
 
+        // Foreign files (.DS_Store, editor droppings, subdirs) are ignored —
+        // only `*.wal` names participate (review finding #9; etcd does the
+        // same). A malformed `*.wal` name is still fatal: real ambiguity.
         let mut segs: Vec<(u64, u64, PathBuf)> = Vec::new();
         for ent in fs::read_dir(dir)? {
-            let p = ent?.path();
+            let ent = ent?;
+            if !ent.file_type()?.is_file() {
+                continue;
+            }
+            let p = ent.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name == LOCK_FILE || name.ends_with(".tmp") {
+            if !name.ends_with(".wal") {
                 continue;
             }
             let (seq, first) = parse_segment_name(name)?;
@@ -195,65 +229,102 @@ impl Wal {
             let mut chain_at_entry = crc; // state we arrived with (handoff gate)
             let mut first_record = true;
 
-            loop {
-                let res = record::decode_record(&mut crc, &mut f);
-                match res {
-                    Ok(Decoded::Record(rec, consumed)) => {
-                        match rec.kind {
-                            RecordKind::CrcSeed => {
-                                // FMT-4 handoff gate: a seed must equal the
-                                // chain state we carried in — except the very
-                                // first record of the whole log, which defines it.
-                                if !(i == 0 && first_record) && rec.crc != chain_at_entry {
-                                    return Err(WalError::CrcMismatch {
-                                        expected: rec.crc,
-                                        actual: chain_at_entry,
-                                    });
-                                }
-                            }
-                            RecordKind::Metadata => {
-                                if rec.data != metadata {
-                                    return Err(WalError::MetadataConflict);
-                                }
-                            }
-                            RecordKind::Entry => {
-                                let (seq, payload) = record::decode_entry_data(&rec.data)?;
-                                if let Some(last) = entries.last() {
-                                    if seq != last.seq + 1 {
-                                        return Err(WalError::EntrySeqGap {
-                                            expected: last.seq + 1,
-                                            found: seq,
+            enum End {
+                Clean,
+                ZeroTail,
+                Fail(DecodeFailure),
+            }
+
+            let end = {
+                let mut rd = BufReader::new(&mut f);
+                loop {
+                    match record::decode_record(&mut crc, &mut rd) {
+                        Ok(Decoded::Record(rec, consumed)) => {
+                            match rec.kind {
+                                RecordKind::CrcSeed => {
+                                    // FMT-4 handoff gate. A complete-but-wrong
+                                    // seed is fatal by design: segment headers
+                                    // are fsynced before the file becomes
+                                    // visible (create/cut protocol), so a seed
+                                    // can be corrupt but never torn.
+                                    if !(i == 0 && first_record) && rec.crc != chain_at_entry {
+                                        return Err(WalError::CrcMismatch {
+                                            expected: rec.crc,
+                                            actual: chain_at_entry,
                                         });
                                     }
                                 }
-                                entries.push(Entry { seq, payload });
+                                RecordKind::Metadata => {
+                                    if rec.data != metadata {
+                                        return Err(WalError::MetadataConflict);
+                                    }
+                                }
+                                RecordKind::Entry => {
+                                    let (seq, payload) = record::decode_entry_data(&rec.data)?;
+                                    if let Some(last) = entries.last() {
+                                        if seq != last.seq + 1 {
+                                            return Err(WalError::EntrySeqGap {
+                                                expected: last.seq + 1,
+                                                found: seq,
+                                            });
+                                        }
+                                    }
+                                    entries.push(Entry { seq, payload });
+                                }
                             }
+                            valid_off += consumed as u64;
+                            chain_at_entry = crc;
+                            first_record = false;
                         }
-                        valid_off += consumed as u64;
-                        chain_at_entry = crc;
-                        first_record = false;
+                        Ok(Decoded::Eof) => break End::Clean,
+                        Ok(Decoded::ZeroLen) => {
+                            break if is_last { End::ZeroTail } else { End::Clean }
+                            // Non-last note: we never preallocate, so zeros in
+                            // a sealed segment can only be trailing garbage a
+                            // repair once left behind — data past a zero field
+                            // is unreachable by construction, matching etcd's
+                            // decoder which also stops at the first zero field.
+                        }
+                        Err(df) => break End::Fail(df),
                     }
-                    Ok(Decoded::ZeroLen) | Ok(Decoded::Eof) => break, // clean end (FMT-5)
-                    Err(e) => {
-                        if is_last && torn_tail(&mut f, valid_off, file_len, &e)? {
-                            // Repairable torn tail: drop the un-synced suffix
-                            // (DUR-8 — the only thing recovery may destroy).
-                            f.set_len(valid_off)?;
-                            f.sync_data()?;
-                            break;
+                }
+            };
+
+            match end {
+                End::Clean => {}
+                End::ZeroTail => {} // torn zero tail of the last file → truncated below
+                End::Fail(df) => {
+                    if !is_last {
+                        return Err(df.error);
+                    }
+                    let repair = match &df.error {
+                        // Genuinely partial bytes at EOF = torn by definition.
+                        WalError::TornRecord => true,
+                        // Complete-but-invalid record: repair ONLY when its own
+                        // extent contains an all-zero disk sector (FMT-7).
+                        WalError::CrcMismatch { .. } | WalError::CorruptFrame => {
+                            let scan_end = match df.frame_len {
+                                Some(fl) => (valid_off + fl).min(file_len),
+                                None => (valid_off + 8 + UNKNOWN_EXTENT_SCAN).min(file_len),
+                            };
+                            // Skip the 8-byte lenField; a frame's own trailing
+                            // pad (≤7B) can never fill a 512B sector alone.
+                            zero_sector_in_window(&mut f, valid_off + 8, scan_end)?
                         }
-                        return Err(e);
+                        _ => false,
+                    };
+                    if !repair {
+                        return Err(df.error);
                     }
                 }
             }
 
             if is_last {
-                f.seek(SeekFrom::Start(valid_off))?;
-                // Also drop any trailing zero-fill so appends continue at the
-                // last valid record (etcd ZeroToEnd equivalent, FMT-11 delta:
-                // we truncate instead of zero-filling since we don't prealloc).
+                // Drop the un-synced/torn suffix and persist the truncation —
+                // sync_all: the size change is metadata (absorption DUR-8 note).
                 f.set_len(valid_off)?;
-                f.sync_data()?;
+                f.sync_all()?;
+                f.seek(SeekFrom::Start(valid_off))?;
                 tail = Some((f, valid_off));
             }
         }
@@ -276,6 +347,8 @@ impl Wal {
                 segment_seq: segs[last_idx].0,
                 next_seq,
                 last_synced,
+                dirty: false,
+                poisoned: false,
                 opts,
             },
         ))
@@ -283,14 +356,33 @@ impl Wal {
 
     /// Append one record. **No durability claim** — the record is in the OS
     /// page cache at best until [`Wal::sync`] returns.
+    ///
+    /// Oversized payloads are rejected up front (`RecordTooLarge`, no state
+    /// touched, handle stays usable). Any actual I/O failure poisons the
+    /// handle: the in-memory crc chain may no longer match the file.
     pub fn append(&mut self, payload: &[u8]) -> Result<u64, WalError> {
+        self.guard()?;
+        if payload.len() > MAX_PAYLOAD {
+            return Err(WalError::RecordTooLarge { len: payload.len(), max: MAX_PAYLOAD });
+        }
+        match self.append_inner(payload) {
+            Ok(seq) => Ok(seq),
+            Err(e) => {
+                self.poisoned = true;
+                Err(e)
+            }
+        }
+    }
+
+    fn append_inner(&mut self, payload: &[u8]) -> Result<u64, WalError> {
         let seq = self.next_seq;
         let data = record::encode_entry_data(seq, payload);
         let mut buf = Vec::with_capacity(16 + data.len() + 8);
         record::encode_record(&mut self.crc, RecordKind::Entry, &data, &mut buf);
         self.tail.write_all(&buf)?;
         self.tail_offset += buf.len() as u64;
-        self.next_seq += 1;
+        self.next_seq = seq + 1;
+        self.dirty = true;
         if self.tail_offset >= self.opts.segment_size {
             self.cut()?; // implies a full sync of the old tail (DUR-4)
         }
@@ -298,9 +390,21 @@ impl Wal {
     }
 
     /// The ack boundary: fdatasync the tail. Everything appended so far is on
-    /// stable storage when this returns Ok (DUR-1).
+    /// stable storage when this returns Ok (DUR-1). A no-op (receipt only)
+    /// when nothing was appended since the last sync.
+    ///
+    /// On failure the handle is poisoned permanently — see the fsyncgate
+    /// note in the crate docs.
     pub fn sync(&mut self) -> Result<DurableReceipt, WalError> {
-        self.tail.sync_data()?;
+        self.guard()?;
+        if !self.dirty {
+            return Ok(DurableReceipt { last_seq: self.last_synced });
+        }
+        if let Err(e) = self.tail.sync_data() {
+            self.poisoned = true;
+            return Err(WalError::Io(e));
+        }
+        self.dirty = false;
         self.last_synced = self.next_seq - 1;
         Ok(DurableReceipt { last_seq: self.last_synced })
     }
@@ -315,6 +419,13 @@ impl Wal {
         self.sync()
     }
 
+    fn guard(&self) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        Ok(())
+    }
+
     /// Roll to a new segment (LIF-3 / API-8, inline — no filePipeline):
     /// finish + fsync the old tail, build the new segment **fully in a .tmp
     /// file** (CrcSeed handoff + Metadata, fsynced), then rename + dir fsync.
@@ -322,6 +433,7 @@ impl Wal {
     /// header.
     fn cut(&mut self) -> Result<(), WalError> {
         self.tail.sync_data()?;
+        self.dirty = false;
         self.last_synced = self.next_seq - 1;
 
         let new_seq = self.segment_seq + 1;
@@ -347,26 +459,36 @@ impl Wal {
 
 impl Drop for Wal {
     fn drop(&mut self) {
-        let _ = self.tail.sync_data();
+        if !self.poisoned {
+            let _ = self.tail.sync_data();
+        }
     }
 }
 
-/// FMT-7: a decode failure at the tail of the LAST segment is a repairable
-/// torn write iff it is a partial record, or the bytes after the last valid
-/// record contain at least one all-zero 512-byte sector. A failure that is a
-/// complete-but-mismatching record surrounded by fully non-zero bytes is
-/// treated as real corruption (fatal).
-fn torn_tail(f: &mut File, valid_off: u64, file_len: u64, err: &WalError) -> Result<bool, WalError> {
-    if matches!(err, WalError::TornRecord) {
-        return Ok(true);
-    }
-    if !matches!(err, WalError::CrcMismatch { .. }) {
+/// Scan `[start, end)` of `f` for one all-zero chunk on **absolute file
+/// offset** 512-byte sector boundaries (etcd `isTornEntry`). The window is
+/// the failing record's own extent — never the whole remaining file — so
+/// legitimate zeros in later intact records cannot launder corruption, and a
+/// real torn sector cannot hide by straddling a misaligned grid.
+fn zero_sector_in_window(f: &mut File, start: u64, end: u64) -> Result<bool, WalError> {
+    if end <= start {
         return Ok(false);
     }
-    f.seek(SeekFrom::Start(valid_off))?;
-    let mut rest = vec![0u8; (file_len - valid_off) as usize];
-    f.read_exact(&mut rest)?;
-    Ok(rest.chunks(512).any(|c| c.iter().all(|b| *b == 0)))
+    f.seek(SeekFrom::Start(start))?;
+    let mut win = vec![0u8; (end - start) as usize];
+    f.read_exact(&mut win)?;
+    let mut pos = start;
+    while pos < end {
+        let sector_end = ((pos / 512) + 1) * 512;
+        let chunk_end = sector_end.min(end);
+        let a = (pos - start) as usize;
+        let b = (chunk_end - start) as usize;
+        if win[a..b].iter().all(|x| *x == 0) {
+            return Ok(true);
+        }
+        pos = chunk_end;
+    }
+    Ok(false)
 }
 
 fn segment_name(seq: u64, first: u64) -> String {
@@ -383,9 +505,12 @@ fn parse_segment_name(name: &str) -> Result<(u64, u64), WalError> {
     Ok((u64::from_str_radix(a, 16).map_err(|_| bad())?, u64::from_str_radix(b, 16).map_err(|_| bad())?))
 }
 
-fn flock_exclusive(f: &File) -> Result<(), WalError> {
-    rustix::fs::flock(f, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(|_| WalError::Locked)
+fn lock_exclusive(f: &File) -> Result<(), WalError> {
+    match f.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(WalError::Locked),
+        Err(std::fs::TryLockError::Error(e)) => Err(WalError::Io(e)),
+    }
 }
 
 #[cfg(test)]
@@ -423,9 +548,42 @@ mod codec_tests {
         // decoder arriving with a different chain state must reject
         let mut dec_state = 0xDEAD_BEEFu32;
         let mut cur = std::io::Cursor::new(buf);
-        assert!(matches!(
-            record::decode_record(&mut dec_state, &mut cur),
-            Err(crate::WalError::CrcMismatch { .. })
-        ));
+        match record::decode_record(&mut dec_state, &mut cur) {
+            Err(df) => assert!(matches!(df.error, crate::WalError::CrcMismatch { .. })),
+            Ok(_) => panic!("chain break must be rejected"),
+        }
+    }
+
+    #[test]
+    fn unknown_kind_is_corrupt_frame_with_extent() {
+        let mut enc_state = 0u32;
+        let mut buf = Vec::new();
+        let n = record::encode_record(&mut enc_state, RecordKind::Entry, b"payload!", &mut buf);
+        buf[8] = 7; // kind byte → unknown
+        let mut dec_state = 0u32;
+        let mut cur = std::io::Cursor::new(buf);
+        match record::decode_record(&mut dec_state, &mut cur) {
+            Err(df) => {
+                assert!(matches!(df.error, crate::WalError::CorruptFrame));
+                assert_eq!(df.frame_len, Some(n as u64), "extent known for complete frames");
+            }
+            Ok(_) => panic!("unknown kind must be CorruptFrame"),
+        }
+    }
+
+    #[test]
+    fn bogus_len_field_is_corrupt_frame_without_extent() {
+        // reserved bits set without the pad flag
+        let mut buf = (0x40u64 << 56 | 32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&[0u8; 64]);
+        let mut dec_state = 0u32;
+        let mut cur = std::io::Cursor::new(buf);
+        match record::decode_record(&mut dec_state, &mut cur) {
+            Err(df) => {
+                assert!(matches!(df.error, crate::WalError::CorruptFrame));
+                assert_eq!(df.frame_len, None);
+            }
+            Ok(_) => panic!("garbage lenField must be CorruptFrame"),
+        }
     }
 }
