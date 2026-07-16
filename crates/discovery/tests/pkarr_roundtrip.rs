@@ -38,7 +38,12 @@ fn pkarr_key_shares_the_did_ed25519_root() {
 /// Announce a Super-Peer multiaddr, then resolve it back from the DHT.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_then_resolve_superpeer_multiaddr() {
-    let testnet = mainline::Testnet::new(3).expect("local dht testnet");
+    // The builder binds the bootstrap addresses to 127.0.0.1. `Testnet::new`
+    // keeps the legacy 0.0.0.0 bind, which is not a routable bootstrap address
+    // on macOS even though it happens to work on Linux.
+    let testnet = mainline::Testnet::builder(3)
+        .build()
+        .expect("local dht testnet");
     // Two independent clients sharing only the testnet: publishing from one and
     // resolving from the OTHER forces a real DHT put+get (no local-cache shortcut),
     // which is what makes this a genuine round-trip receipt, not a serialize-then-read.

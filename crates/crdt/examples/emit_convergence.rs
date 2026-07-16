@@ -8,7 +8,10 @@ use p333_crdt::{gossip, record_states, GCounter};
 use p333_ltdd::{to_ooptdd_jsonl, MemoryStore, Store};
 
 fn main() {
-    let cid = "doc-demo";
+    let cid = std::env::var("P333_CID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "doc-demo".to_owned());
     let mut s = MemoryStore::default();
     let mut r = [
         ("a", GCounter::default()),
@@ -19,6 +22,6 @@ fn main() {
     r[1].1.increment("b", 3);
     r[2].1.increment("c", 4);
     gossip(&mut r);
-    record_states(&mut s, cid, &r);
-    println!("{}", to_ooptdd_jsonl(&s.query(cid)));
+    record_states(&mut s, &cid, &r);
+    println!("{}", to_ooptdd_jsonl(&s.query(&cid)));
 }

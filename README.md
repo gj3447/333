@@ -12,12 +12,19 @@ Every block lands as: write the failing receipt → make it green → adversaria
 probe → commit. Receipts are real `cargo test` runs.
 
 ## Toolchain
-This box has no local C linker, so receipts run in Docker:
+Native Rust builds are supported when a C linker is available. The reproducible
+receipt route uses the committed lockfile:
+
+```sh
+cargo test --locked
+```
+
+On a host without the native toolchain, run the same locked build in Docker:
 
 ```sh
 docker run --rm \
   -v "$PWD":/work -v p333_cargo:/usr/local/cargo/registry -v p333_target:/work/target \
-  -w /work rust:1-slim cargo test
+  -w /work rust:1-slim cargo test --locked
 ```
 
 ## Crates / build blocks
@@ -53,11 +60,20 @@ trace (must be GREEN, exit 0) **and** over an injected adversary (must be RED, e
 forbid/`invariant` gates are proven to fire — not merely shipped against their own green input.
 
 ```sh
-sh verify/run_gates.sh   # emits every trace (Docker) → judges with ooptdd → asserts GREEN green + RED red
+sh verify/run_gates.sh   # emits every trace (container) → judges with ooptdd → asserts GREEN green + RED red
 ```
 
-Honest scope: `run_gates.sh` is the cross-language gate suite (needs Docker + the `ooptdd`
-package); it is not wired into `cargo test` (that container has no Python). The conservation/
+The verifier discovers an `ooptdd` checkout at `../ooptdd`. For a different
+layout, pass `OOPTDD_PATH=/absolute/path/to/ooptdd`. The declared container route
+defaults to `docker`; alternate compatible CLIs can be selected with
+`P333_CONTAINER_RUNTIME`. Missing runtimes and failed/empty Rust producers stop
+the suite before RED checks, so an infrastructure failure cannot masquerade as
+a successful injected-negative oracle. Each run assigns the focal CRDT trace a
+unique correlation ID; set `P333_CRDT_CID` only when a caller-provided stable ID
+is needed for receipt collection.
+
+Honest scope: `run_gates.sh` is the cross-language gate suite (needs a compatible container
+runtime + the `ooptdd` package); it is not wired into `cargo test` (that container has no Python). The conservation/
 correspondence invariants also guard against a future refactor that decouples the emits — on the
 current happy path a correct call can't violate them, which is exactly why the RED suite (a
 free-riding forward, a double-finalize, a desynced replica) is what proves the gate discriminates.
