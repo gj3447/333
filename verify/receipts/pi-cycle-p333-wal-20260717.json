@@ -1,0 +1,66 @@
+{
+  "schema_version": "pi-cycle/v1",
+  "template_only": false,
+  "cycle_id": "pi-p333-wal-20260717",
+  "mode": "write",
+  "kind": "behavior",
+  "repo": {
+    "name": "p333",
+    "logical_path": "PI/p333",
+    "resolved_root": "/Users/lagyeongjun/CD/SYMPOSIUM/GIT/p333-allgreen-20260716",
+    "git_head": "5d43f0f57062f155e198d6970e4a4b72e4c90cb9",
+    "instructions_read": [
+      "PI/AGENTS.md",
+      "GIT/p333-allgreen-20260716/README.md"
+    ]
+  },
+  "roles": {
+    "coordinator": "root",
+    "implementer": "fable-cc50c5b8",
+    "judge": "not_applicable"
+  },
+  "coordination": {
+    "task_id": "p333-wal-crate-p0-1",
+    "agent_id": "fable-cc50c5b8",
+    "writes": [
+      "p333/crates/wal/**",
+      "p333/Cargo.toml",
+      "p333/Cargo.lock",
+      "p333/verify/receipts/**",
+      "p333/README.md"
+    ],
+    "claim_status": "HELD",
+    "orbit_id": "orb-36456ce0cb4a (+orb-7459c2bfcbaa, orb-0fda414c9309, orb-2675b492b599)",
+    "fence": 116,
+    "heartbeat_at": "2026-07-17T08:52:34+09:00",
+    "released": true,
+    "cancelled": true
+  },
+  "measurement": {
+    "receipt_path": "verify/receipts/ooptdd-p333-wal-p0-1-20260717.json",
+    "receipt_sha256": "89545e8791760b0c829f9a0e9cbb0de29f78e9c4de97bdf19452e65c707ca7e6",
+    "test_command": "cargo test -p p333-wal (LXC 300 codekg-01, rust 1.97.1; tree sha-matched to git_head)",
+    "positive_verdict": "green",
+    "negative_verdict": "red"
+  },
+  "verification": [
+    {
+      "command": "cargo test -p p333-wal (positive v2, post-review fixes)",
+      "exit_code": 0,
+      "output_sha256": "aa3bbfd512bc58686f7b7ab5e5cc4d04fbb16b5ccefa1de8c2d7276c34881cfd"
+    },
+    {
+      "command": "cargo test (full workspace, 38 suites, 53 passed 0 failed) + cargo build -p p333-relay-client-wasm --target wasm32-unknown-unknown",
+      "exit_code": 0,
+      "output_sha256": "c4ee59533579fc12e74cc73d7d7984812e668c9b91df9c82abb7d4d403d89b66"
+    }
+  ],
+  "unresolved_risks": [
+    "Kill/abort-based crash receipt proves process-crash recovery, not physical power loss (page cache survives SIGKILL); torn shapes are simulated at byte level, same oracle family as etcd TestOpenOnTornWrite.",
+    "Poisoned-handle path (fsyncgate) has no runtime fault-injection test — real fdatasync failure is not portably injectable; behavior verified by code review only.",
+    "sh verify/run_gates.sh not exercised this cycle (legacy Dell/DGX absolute paths per pi-test-routing note); CI route is cargo test --locked.",
+    "Deferred review findings (read-only open/Verify, allocation micro-opts, first_index unused) recorded in KG plan-p333-wal-crate-2026-07-17.",
+    "Steps 2-4 of the design (WalStore for ltdd, DurableReceipt typestate wiring into consensus/billing, release_older) remain PENDING_USER_VERDICT."
+  ],
+  "judge_note": "kind=behavior: no scientific/programme progress claimed — implementation + ooptdd receipt only; LakatoTree judge reserved for progress_claim cycles"
+}

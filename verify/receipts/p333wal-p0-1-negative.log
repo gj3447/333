@@ -1,0 +1,30 @@
+     Running tests/durability.rs (target/debug/deps/durability-0a820b1f347931d0)
+
+running 9 tests
+test crash_child_body ... ignored
+
+running 1 test
+test single_writer_flock ... ok
+test metadata_conflict_detected ... ok
+test zero_sector_tail_is_torn_not_fatal ... ok
+test append_continues_after_reopen ... ok
+test corrupt_synced_record_is_fatal ... FAILED
+test crash_receipt_synced_prefix_survives ... ok
+test roundtrip_across_segments ... ok
+test torn_tail_truncation_at_every_offset ... ok
+
+failures:
+
+---- corrupt_synced_record_is_fatal stdout ----
+
+thread 'corrupt_synced_record_is_fatal' (30926) panicked at crates/wal/tests/durability.rs:205:18:
+corruption inside the synced region must be fatal, got Ok(2)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    corrupt_synced_record_is_fatal
+
+test result: FAILED. 7 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+error: test failed, to rerun pass `-p p333-wal --test durability`
