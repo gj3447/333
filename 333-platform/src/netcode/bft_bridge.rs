@@ -22,7 +22,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::bft::crypto::{
-    NodeId, QuorumCert, ValidatorSet, verify,
+    NodeId, QuorumCert, ValidatorSet, phase_tag, verify_vote,
 };
 use crate::observability; // KG: sprint6C-observability-2026-04-15
 use crate::bft::state::HotStuffState;
@@ -303,11 +303,23 @@ impl BftCheckpointProvider for HotStuffCheckpointProvider {
             return false;
         }
 
-        // Verify every signature with Ed25519 via the registered keyring.
-        // Any invalid signature (tampered bytes, wrong signer, unknown key) → reject.
+        // A checkpoint QC is proof of a COMMIT: `propose_checkpoint` returns the
+        // high_qc formed from Commit-phase votes. Accepting a Prepare/PreCommit
+        // QC here would let 2f+1 captured Prepare votes stand in as proof of a
+        // commit that never happened — the same attack the vote phase-binding
+        // closes, one layer up. Reject any non-Commit phase outright.
+        // # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+        if qc.phase != Phase::Commit {
+            return false;
+        }
+
+        // Verify every signature with Ed25519 via the registered keyring, bound
+        // to the phase the QC's votes were cast in (Commit, enforced above).
+        // Any invalid signature (tampered bytes, wrong signer, unknown key,
+        // vote signed for a different phase) → reject.
         let block_hash = qc.block_hash;
         for sig in &qc.signatures {
-            if !verify(sig, block_hash, &state.keyring) {
+            if !verify_vote(sig, block_hash, phase_tag(qc.phase), &state.keyring) {
                 return false;
             }
         }
@@ -321,7 +333,7 @@ impl BftCheckpointProvider for HotStuffCheckpointProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bft::crypto::sign_with_identity;
+    use crate::bft::crypto::{sign_vote, Signature};
     use crate::crypto_real::Identity;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -330,6 +342,13 @@ mod tests {
         let mut seed = [0u8; 32];
         seed[..4].copy_from_slice(&node_id.to_be_bytes());
         Identity::from_seed(&seed)
+    }
+
+    /// Sign a Commit-phase vote the way a real validator does — checkpoint QCs
+    /// are Commit QCs, so hand-rolled test QCs must carry Commit-bound sigs.
+    /// # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+    fn sign_commit_vote(node_id: NodeId, block_hash: u64, identity: &Identity) -> Signature {
+        sign_vote(node_id, block_hash, phase_tag(Phase::Commit), identity)
     }
 
     fn make_single_node_provider(node_id: NodeId) -> HotStuffCheckpointProvider {
@@ -380,12 +399,13 @@ mod tests {
         let qc_result = provider.propose_checkpoint(&handle);
         assert!(qc_result.is_ok(), "proposal must succeed first");
 
-        // Build a QC with a valid Ed25519 signature from node 1
+        // Build a QC with a valid Commit-phase-bound Ed25519 signature from node 1
         let block_hash: u64 = 0xDEAD_BEEF_1234_5678;
-        let sig = sign_with_identity(node_id, block_hash, &identity);
+        let sig = sign_commit_vote(node_id, block_hash, &identity);
         let honest_qc = QuorumCert {
             block_hash,
             view: 1,
+            phase: Phase::Commit,
             signatures: vec![sig],
         };
 
@@ -414,7 +434,7 @@ mod tests {
 
         // Create a signature and then corrupt it
         let identity = test_identity(node_id);
-        let mut sig = sign_with_identity(node_id, block_hash, &identity);
+        let mut sig = sign_commit_vote(node_id, block_hash, &identity);
         // Flip the first byte of the signature — forgery
         if let Some(b) = sig.sig_bytes.first_mut() {
             *b ^= 0xFF;
@@ -423,6 +443,7 @@ mod tests {
         let tampered_qc = QuorumCert {
             block_hash,
             view: 1,
+            phase: Phase::Commit,
             signatures: vec![sig],
         };
 
@@ -483,7 +504,7 @@ mod tests {
         let provider = make_single_node_provider(1);
         let handle = sample_handle(6000);
 
-        let empty_qc = QuorumCert { block_hash: 0xDEAD, view: 1, signatures: vec![] };
+        let empty_qc = QuorumCert { block_hash: 0xDEAD, view: 1, phase: Phase::Commit, signatures: vec![] };
         assert!(
             !provider.verify_checkpoint_qc(&handle, &empty_qc),
             "QC with no signatures must be rejected"
@@ -515,13 +536,13 @@ mod tests {
         }
 
         let block_hash: u64 = 0xCAFE_BABE_0000_0001;
-        let mut sig = sign_with_identity(node_id, block_hash, &identity);
+        let mut sig = sign_commit_vote(node_id, block_hash, &identity);
         // Corrupt: flip every bit of the first byte.
         if let Some(b) = sig.sig_bytes.first_mut() {
             *b ^= 0xFF;
         }
 
-        let tampered_qc = QuorumCert { block_hash, view: 1, signatures: vec![sig] };
+        let tampered_qc = QuorumCert { block_hash, view: 1, phase: Phase::Commit, signatures: vec![sig] };
         assert!(
             !provider.verify_checkpoint_qc(&handle, &tampered_qc),
             "QC with tampered signature bytes must be rejected"
@@ -553,13 +574,13 @@ mod tests {
         }
 
         let block_hash: u64 = 0x1234_5678_ABCD_EF00;
-        // Collect 3 valid signatures (nodes 1, 2, 3) — satisfies quorum=3.
+        // Collect 3 valid Commit-bound signatures (nodes 1, 2, 3) — satisfies quorum=3.
         let signatures: Vec<_> = [1u32, 2, 3]
             .iter()
-            .map(|&nid| sign_with_identity(nid, block_hash, &test_identity(nid)))
+            .map(|&nid| sign_commit_vote(nid, block_hash, &test_identity(nid)))
             .collect();
 
-        let valid_qc = QuorumCert { block_hash, view: 1, signatures };
+        let valid_qc = QuorumCert { block_hash, view: 1, phase: Phase::Commit, signatures };
         assert!(
             provider.verify_checkpoint_qc(&handle, &valid_qc),
             "QC with 3 valid sigs from 4-node set must be accepted"
@@ -568,9 +589,9 @@ mod tests {
         // Below-quorum: only 2 signatures → must be rejected.
         let insufficient_sigs: Vec<_> = [1u32, 2]
             .iter()
-            .map(|&nid| sign_with_identity(nid, block_hash, &test_identity(nid)))
+            .map(|&nid| sign_commit_vote(nid, block_hash, &test_identity(nid)))
             .collect();
-        let weak_qc = QuorumCert { block_hash, view: 1, signatures: insufficient_sigs };
+        let weak_qc = QuorumCert { block_hash, view: 1, phase: Phase::Commit, signatures: insufficient_sigs };
         assert!(
             !provider.verify_checkpoint_qc(&handle, &weak_qc),
             "QC with only 2 sigs from 4-node set (quorum=3) must be rejected"

@@ -12,7 +12,7 @@ use crate::observability::BFT_VOTE_REJECTED_TOTAL;
 
 // KG: TASK_333_B_BFTCrypto, lesson-333-bft-keyring-exchange-2026-04-14
 // Ed25519 real signatures via Identity + ValidatorKeyring for peer verification
-use super::crypto::{hash_block, sign_with_identity,
+use super::crypto::{hash_block, phase_tag, sign_with_identity, sign_vote, verify_vote,
     NodeId, QuorumCert, Signature, ValidatorSet, ValidatorKeyring};
 use super::leader::leader_for_view;
 use super::types::*;
@@ -39,8 +39,16 @@ pub struct HotStuffState {
     pub high_qc: QuorumCert,
     /// Pending block for current view
     pub pending_block: Option<Block>,
-    /// Collected votes for current phase (block_hash → signatures)
-    pub votes: HashMap<u64, Vec<Signature>>,
+    /// Collected votes, keyed by (block_hash, phase) → signatures.
+    ///
+    /// Keying by block_hash alone let a late vote from a PREVIOUS phase (e.g. the
+    /// 4th Prepare vote arriving after the Prepare QC already formed) share a
+    /// bucket with the next phase's votes and be aggregated into that phase's QC.
+    /// Phase-bound signatures exposed the mix: such a QC carries signatures that
+    /// don't verify under its phase. A vote may only ever count toward the exact
+    /// (block, phase) it was signed for.
+    /// # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+    pub votes: HashMap<(u64, Phase), Vec<Signature>>,
     /// # KG: taliban2-H2-fix-2026-04-15
     /// FIX HIGH #9: track (signer, phase, view) → block_hash to prevent replay across views.
     /// Formerly keyed by (NodeId, Phase) — stale votes from a previous view could replay.
@@ -195,9 +203,13 @@ impl HotStuffState {
         if !justify.has_quorum(self.validators.n()) {
             return false;
         }
+        // Vote signatures bind the phase they were cast in (`sign_vote`), so a
+        // justify QC must be checked against ITS recorded phase — otherwise a
+        // bag of relabeled votes could masquerade as a quorum certificate.
+        // # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
         justify.signatures.iter().all(|s| {
             self.validators.contains(&s.signer)
-                && super::crypto::verify(s, justify.block_hash, &self.keyring)
+                && verify_vote(s, justify.block_hash, phase_tag(justify.phase), &self.keyring)
         })
     }
 
@@ -250,6 +262,9 @@ impl HotStuffState {
             self.locked_qc = QuorumCert {
                 block_hash: block.hash,
                 view: self.view,
+                // Local bookkeeping only (compared by view/block_hash, never
+                // signature-verified): keep the phase the cloned sigs came from.
+                phase: block.justify.phase,
                 signatures: block.justify.signatures.clone(),
             };
         }
@@ -262,8 +277,8 @@ impl HotStuffState {
         // # KG: sprint4A-gap-C-fix-2026-04-15
         let advance_view_after_vote = phase == Phase::Commit;
 
-        // Vote for this block
-        let sig = sign_with_identity(self.node_id, block.hash, &self.identity);
+        // Vote for this block — sign binds the phase (see phase_tag).
+        let sig = sign_vote(self.node_id, block.hash, phase_tag(phase), &self.identity);
         let vote = ProcessResult::SendToLeader(HotStuffMsg::Vote {
             block_hash: block.hash,
             view: self.view,
@@ -300,7 +315,7 @@ impl HotStuffState {
         }
 
         // KG: lesson-333-bft-keyring-exchange-2026-04-14 — verify with keyring
-        if !super::crypto::verify(&sig, block_hash, &self.keyring) {
+        if !verify_vote(&sig, block_hash, phase_tag(phase), &self.keyring) {
             BFT_VOTE_REJECTED_TOTAL.inc();
             return ProcessResult::None;
         }
@@ -323,8 +338,10 @@ impl HotStuffState {
         }
         self.vote_tracker.insert(tracker_key, block_hash);
 
-        // Collect vote
-        let sigs = self.votes.entry(block_hash).or_default();
+        // Collect vote — bucketed per (block, phase) so a vote can only count
+        // toward the phase its signature was verified for (see field doc).
+        // # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+        let sigs = self.votes.entry((block_hash, phase)).or_default();
 
         // Deduplicate within same block
         if sigs.iter().any(|s| s.signer == sig.signer) {
@@ -332,10 +349,14 @@ impl HotStuffState {
         }
         sigs.push(sig);
 
-        // Check quorum
+        // Check quorum. The QC records the phase its votes were cast in — every
+        // signature inside was verified phase-bound above, so this QC can never
+        // be re-validated under a different phase.
+        // # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
         let qc = QuorumCert {
             block_hash,
             view: self.view,
+            phase,
             signatures: sigs.clone(),
         };
 
@@ -548,6 +569,14 @@ mod tests {
         Identity::from_seed(&seed)
     }
 
+    /// Hand-roll a vote signature the way an honest validator does: bound to the
+    /// phase the vote is cast in. Plain `sign_standalone` (block_hash only) no
+    /// longer verifies as a vote — that asymmetry IS the security fix under test.
+    /// # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+    fn sign_vote_as(node_id: u32, block_hash: u64, phase: Phase) -> Signature {
+        sign_vote(node_id, block_hash, phase_tag(phase), &test_identity(node_id))
+    }
+
     fn make_validators() -> ValidatorSet {
         ValidatorSet::new(vec![1, 2, 3, 4, 5, 6, 7])
     }
@@ -622,7 +651,7 @@ mod tests {
                 block_hash: block.hash,
                 view: 0,
                 phase: Phase::Prepare,
-                signature: sign(1, block.hash),
+                signature: sign_vote_as(1, block.hash, Phase::Prepare),
             });
         }
 
@@ -650,7 +679,7 @@ mod tests {
                 block_hash: block.hash,
                 view: 0,
                 phase: Phase::PreCommit,
-                signature: sign(1, block.hash),
+                signature: sign_vote_as(1, block.hash, Phase::PreCommit),
             });
         }
 
@@ -677,7 +706,7 @@ mod tests {
                 block_hash: block.hash,
                 view: 0,
                 phase: Phase::Commit,
-                signature: sign(1, block.hash),
+                signature: sign_vote_as(1, block.hash, Phase::Commit),
             });
         }
 
@@ -704,6 +733,7 @@ mod tests {
         node.locked_qc = QuorumCert {
             block_hash: 999,
             view: 5,
+            phase: Phase::PreCommit,
             signatures: vec![],
         };
 
@@ -713,7 +743,7 @@ mod tests {
             view: 6,
             parent_hash: 888, // doesn't match locked_qc.block_hash (999)
             transactions: vec![],
-            justify: QuorumCert { block_hash: 0, view: 3, signatures: vec![] },
+            justify: QuorumCert { block_hash: 0, view: 3, phase: Phase::Prepare, signatures: vec![] },
             proposer: 1,
         };
 
@@ -738,7 +768,7 @@ mod tests {
             view: node.view,
             parent_hash: 0,
             transactions: vec![],
-            justify: QuorumCert { block_hash: 555, view: 99, signatures: vec![] },
+            justify: QuorumCert { block_hash: 555, view: 99, phase: Phase::Commit, signatures: vec![] },
             proposer: leader,
         };
         assert!(
@@ -768,6 +798,52 @@ mod tests {
         assert!(node.propose().is_none(), "non-leader cannot propose");
     }
 
+    // A vote's signature must bind the PHASE it was cast in, not just the block
+    // hash. `hash_block` folds `view` in, so cross-VIEW replay already dies on the
+    // hash. Cross-PHASE replay inside one view had no such barrier: an attacker
+    // relabels captured Prepare votes as Commit votes, the bytes still verify, and
+    // the leader forms a Commit QC — reaching Decide while PreCommit/Commit never
+    // happened and no validator ever locked. That is a direct HotStuff safety break.
+    #[test]
+    fn cross_phase_vote_replay_cannot_forge_commit_qc() {
+        let ids = vec![1u32, 2, 3, 4];
+        let mut nodes = make_ring(&ids);
+        nodes[0].submit_tx(OrderedTx::Transfer { from: 1, to: 2, amount: 10, nonce: 1 });
+        let proposal = nodes[0].propose().expect("leader proposes");
+
+        // Honest validators vote ONLY in Prepare.
+        let mut prepare_votes = vec![];
+        for node in &mut nodes[1..4] {
+            if let ProcessResult::SendToLeader(v) = node.process(proposal.clone()) {
+                prepare_votes.push(v);
+            }
+        }
+        assert_eq!(prepare_votes.len(), 3, "n=4 quorum is 3 honest Prepare votes");
+
+        // Attacker relabels the phase field. Signature bytes are untouched.
+        let replayed: Vec<HotStuffMsg> = prepare_votes
+            .iter()
+            .map(|v| match v {
+                HotStuffMsg::Vote { block_hash, view, signature, .. } => HotStuffMsg::Vote {
+                    block_hash: *block_hash,
+                    view: *view,
+                    phase: Phase::Commit,
+                    signature: signature.clone(),
+                },
+                _ => unreachable!("validators reply with votes"),
+            })
+            .collect();
+
+        for v in replayed {
+            assert!(
+                !matches!(nodes[0].process(v), ProcessResult::Committed(..)),
+                "Prepare votes relabeled as Commit must never form a Commit QC"
+            );
+        }
+        assert_eq!(nodes[0].committed_count(), 0, "no block may commit from replayed votes");
+        assert_ne!(nodes[0].phase, Phase::Decide, "leader must not reach Decide");
+    }
+
     // KG: lesson-333-bft-multivalidator-stress-2026-04-14
     // Helper: build N-validator ring with cross-registered keyrings
     fn make_ring(ids: &[NodeId]) -> Vec<HotStuffState> {
@@ -787,7 +863,7 @@ mod tests {
         }
         // Leader self-votes (wasm.rs path doesn't, but tests need it for small N quorum)
         if let HotStuffMsg::Proposal { ref block, phase, .. } = proposal {
-            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: nodes[0].view, phase, signature: sign(nodes[0].node_id, block.hash) });
+            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: nodes[0].view, phase, signature: sign_vote_as(nodes[0].node_id, block.hash, phase) });
         }
         let mut out = None;
         for v in votes {
@@ -816,7 +892,7 @@ mod tests {
             if let ProcessResult::SendToLeader(v) = node.process(commit_clone.clone()) { votes.push(v); }
         }
         if let HotStuffMsg::Proposal { ref block, .. } = commit {
-            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: 0, phase: Phase::Commit, signature: sign(1, block.hash) });
+            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: 0, phase: Phase::Commit, signature: sign_vote_as(1, block.hash, Phase::Commit) });
         }
         for v in votes {
             if let ProcessResult::Committed(txs, _new_view) = nodes[0].process(v) {
@@ -846,7 +922,7 @@ mod tests {
             if let ProcessResult::SendToLeader(v) = node.process(commit.clone()) { votes.push(v); }
         }
         if let HotStuffMsg::Proposal { ref block, .. } = commit {
-            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: 0, phase: Phase::Commit, signature: sign(1, block.hash) });
+            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: 0, phase: Phase::Commit, signature: sign_vote_as(1, block.hash, Phase::Commit) });
         }
         let mut committed = false;
         for v in votes {
@@ -866,12 +942,12 @@ mod tests {
         let real_hash = if let HotStuffMsg::Proposal { ref block, .. } = proposal { block.hash } else { 0 };
 
         // First legit vote from node 2
-        let v1 = HotStuffMsg::Vote { block_hash: real_hash, view: 0, phase: Phase::Prepare, signature: sign(2, real_hash) };
+        let v1 = HotStuffMsg::Vote { block_hash: real_hash, view: 0, phase: Phase::Prepare, signature: sign_vote_as(2, real_hash, Phase::Prepare) };
         let _ = nodes[0].process(v1);
 
         // Byzantine: node 2 tries to vote for DIFFERENT hash in same (signer=2, phase=Prepare)
         let fake_hash = real_hash ^ 0xDEADBEEF;
-        let v2 = HotStuffMsg::Vote { block_hash: fake_hash, view: 0, phase: Phase::Prepare, signature: sign(2, fake_hash) };
+        let v2 = HotStuffMsg::Vote { block_hash: fake_hash, view: 0, phase: Phase::Prepare, signature: sign_vote_as(2, fake_hash, Phase::Prepare) };
         let result = nodes[0].process(v2);
         assert!(matches!(result, ProcessResult::None), "equivocating vote must be rejected");
     }
@@ -942,7 +1018,7 @@ mod tests {
                 block_hash,
                 view: 0,
                 phase: Phase::Prepare,
-                signature: sign(i, block_hash),
+                signature: sign_vote_as(i, block_hash, Phase::Prepare),
             });
             if i < 4 {
                 assert!(matches!(result, ProcessResult::None));
@@ -954,7 +1030,7 @@ mod tests {
             block_hash,
             view: 0,
             phase: Phase::Prepare,
-            signature: sign(5, block_hash),
+            signature: sign_vote_as(5, block_hash, Phase::Prepare),
         });
         assert!(matches!(result, ProcessResult::Broadcast(_)), "5th vote should trigger quorum");
     }
@@ -987,7 +1063,7 @@ mod tests {
                 block_hash: block.hash,
                 view: 0,
                 phase: Phase::Commit,
-                signature: sign(leader_node_id, block.hash),
+                signature: sign_vote_as(leader_node_id, block.hash, Phase::Commit),
             });
         }
         let mut committed = false;
@@ -1033,7 +1109,7 @@ mod tests {
                 block_hash: block.hash,
                 view: 0,
                 phase: Phase::Commit,
-                signature: sign(leader_node_id_2, block.hash),
+                signature: sign_vote_as(leader_node_id_2, block.hash, Phase::Commit),
             });
         }
         for v in votes {
@@ -1108,7 +1184,7 @@ mod tests {
         }
         let leader_id = nodes[0].node_id;
         if let HotStuffMsg::Proposal { ref block, .. } = commit {
-            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: 0, phase: Phase::Commit, signature: sign(leader_id, block.hash) });
+            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: 0, phase: Phase::Commit, signature: sign_vote_as(leader_id, block.hash, Phase::Commit) });
         }
         for v in votes {
             let _ = nodes[0].process(v);
@@ -1121,7 +1197,7 @@ mod tests {
             block_hash: 0xDEAD_BEEF,
             view: 0, // stale!
             phase: Phase::Prepare,
-            signature: sign(2, 0xDEAD_BEEF),
+            signature: sign_vote_as(2, 0xDEAD_BEEF, Phase::Prepare),
         };
         // # KG: taliban2-H2-fix-2026-04-15
         let result = nodes[0].process(stale_vote);
@@ -1158,7 +1234,7 @@ mod tests {
         }
         let lid = nodes[0].node_id;
         if let HotStuffMsg::Proposal { ref block, .. } = commit {
-            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: 0, phase: Phase::Commit, signature: sign(lid, block.hash) });
+            votes.push(HotStuffMsg::Vote { block_hash: block.hash, view: 0, phase: Phase::Commit, signature: sign_vote_as(lid, block.hash, Phase::Commit) });
         }
         for v in votes {
             let _ = nodes[0].process(v);
@@ -1199,7 +1275,7 @@ mod tests {
             block_hash: 0xBEEF,
             view: 99,
             phase: Phase::Prepare,
-            signature: sign(2, 0xBEEF),
+            signature: sign_vote_as(2, 0xBEEF, Phase::Prepare),
         };
         let _ = nodes[0].process(stale);
         assert!(
@@ -1226,7 +1302,7 @@ mod tests {
             block_hash,
             view: 0,
             phase: Phase::Prepare,
-            signature: sign(2, block_hash),
+            signature: sign_vote_as(2, block_hash, Phase::Prepare),
         };
         let _ = nodes[0].process(vote1);
 
@@ -1236,7 +1312,7 @@ mod tests {
             block_hash: block_hash.wrapping_add(1),
             view: 0,
             phase: Phase::Prepare,
-            signature: sign(2, block_hash.wrapping_add(1)),
+            signature: sign_vote_as(2, block_hash.wrapping_add(1), Phase::Prepare),
         };
         let _ = nodes[0].process(vote2);
         assert!(

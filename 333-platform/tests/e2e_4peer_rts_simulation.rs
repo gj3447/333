@@ -50,6 +50,8 @@ impl BftCheckpointProvider for MockBftCheckpointProvider {
             Ok(QuorumCert {
                 block_hash: handle.frame_n,
                 view: *count as u64,
+                // Synthetic committed-checkpoint QC — a real one is a Commit QC.
+                phase: triple_three::bft::types::Phase::Commit,
                 signatures: vec![], // genesis-style: block_hash != 0 → accepted by stub verifier
             })
         } else {
