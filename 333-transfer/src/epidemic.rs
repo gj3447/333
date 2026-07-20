@@ -341,15 +341,15 @@ impl EpidemicEndpoint {
                         .entry(n)
                         .or_insert_with(|| from.clone());
                 }
-                // Transport-level GRAFT reply: send full body if we have it.
-                if let Some(payload) = self.plumtree.get(&id) {
-                    let auth = decode_authority_msg(&payload)
-                        .map_err(|e| NetError::Io(format!("graft payload decode: {e:?}")))?;
-                    self.net
-                        .mesh
-                        .deliver_to_from(&from, Some(&self.me), auth)?;
-                }
-                Ok(())
+                // GRAFT is double-purpose (Plumtree): retransmission trigger
+                // AND tree-edge repair. `on_graft` re-promotes `from` from lazy
+                // back to eager (dual of PRUNE) and returns an Event::Eager
+                // retransmitting the body when we hold it — unknown ids yield
+                // no events (no panic, no reply), matching the old bare-`get`
+                // behavior. The retransmission then flows through the same
+                // Event::Eager dispatch path as any eager push.
+                let events = self.plumtree.on_graft(peer_node_id(&from), id);
+                self.dispatch_events(events)
             }
             ControlMsg::Prune { from } => {
                 self.plumtree.on_prune(peer_node_id(&from));

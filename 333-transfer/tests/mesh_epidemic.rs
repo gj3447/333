@@ -156,6 +156,70 @@ fn resilience_dropped_eager_edge_recovers_via_ihave_graft() {
     assert!(c.has_msg(&id));
 }
 
+/// 2b. GRAFT double purpose: retransmission trigger AND tree-edge repair.
+///
+/// Same partition-heal scenario as test 2 — but Plumtree GRAFT is not only a
+/// pull request for the body: it also re-promotes the grafting peer back into
+/// the receiver's eager set (dual of PRUNE). Without that, the partition heals
+/// payload-wise but the healed edge stays lazy forever, so every future
+/// broadcast to D pays the IHAVE→tick→GRAFT round-trip again — permanent
+/// latency/fanout degradation that silently accumulates.
+#[test]
+fn graft_heals_tree_edge_grafting_peer_back_in_eager() {
+    let net = EpidemicNetwork::new();
+    let a = net.join("a");
+    let b = net.join("b");
+    let c = net.join("c");
+    let d = net.join("d");
+    let refs = [&a, &b, &c, &d];
+    mesh_with_dropped_eager_edge(&refs, "a", "d");
+
+    // Pre-heal: nobody has an eager edge to D.
+    for ep in &refs {
+        if ep.id() != "d" {
+            assert!(!ep.eager_peers().contains(&"d".to_string()));
+            assert!(ep.lazy_peers().contains(&"d".to_string()));
+        }
+    }
+
+    let transfer = t("alice", 0, "bob", 9);
+    let mut auth = authority(0);
+    let vote = auth.handle(&transfer).unwrap();
+    let id = msg_id_of(&encode_authority_msg(&AuthorityMsg::Vote(vote.clone())));
+
+    a.broadcast_vote(vote).unwrap();
+    pump(&refs, 6);
+
+    // Existing guarantee (test 2): the payload healed via IHAVE→GRAFT pull.
+    assert!(d.has_msg(&id), "D must receive the body via GRAFT pull");
+    assert_eq!(d.deliver_count(&id), 1);
+
+    // THE DEFECT: D grafted onto its IHAVE announcers, so at least one of them
+    // must have promoted D from lazy back to eager (edge repair). Duplicate
+    // eager retransmissions then PRUNE the extras, so the tree converges to
+    // ≥1 eager edge into D — never zero.
+    let healed: Vec<&str> = refs
+        .iter()
+        .filter(|ep| ep.id() != "d" && ep.eager_peers().contains(&"d".to_string()))
+        .map(|ep| ep.id())
+        .collect();
+    assert!(
+        !healed.is_empty(),
+        "GRAFT must repair the tree edge: some announcer must hold D in its \
+         eager set after healing, got none (edge stayed lazy forever)"
+    );
+    // Deterministic pump order: A's IHAVE is queued first, so A's retransmission
+    // lands first and survives D's duplicate-PRUNE trimming.
+    assert!(
+        a.eager_peers().contains(&"d".to_string()),
+        "the original sender A must hold the healed eager edge to D"
+    );
+    assert!(
+        !a.lazy_peers().contains(&"d".to_string()),
+        "healed peer D must leave A's lazy view"
+    );
+}
+
 /// 3. No duplicate app delivery; Plumtree prune on second full receive.
 #[test]
 fn no_duplicate_delivery_prune_on_second_eager() {
