@@ -8,6 +8,8 @@
 //   - Send IHAVE announcements to lazy peers (hash only, cheap).
 //   - Receive IHAVE for unknown msg → request full via GRAFT.
 //   - Receive duplicate full msg → send PRUNE (demote sender to lazy).
+//   - Receive GRAFT → re-promote sender to eager + retransmit full body
+//     (the tree-healing dual of PRUNE).
 //
 // This crate ships trait + in-memory reference impl. Real WebRTC/libp2p
 // transport wraps the `Event` queue in a downstream crate.
@@ -17,7 +19,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use identity333::NodeId;
+use identity333::{Keypair, NodeId};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -60,15 +62,18 @@ pub trait GossipProtocol {
     fn on_receive(&self, msg: Msg) -> Vec<Event>;
     /// Receive an IHAVE announcement; returns GRAFT if we want the body.
     fn on_ihave(&self, from: NodeId, id: MsgId, origin: NodeId) -> Vec<Event>;
+    /// Receive a GRAFT; re-promote `from` to eager (heal the tree edge) and
+    /// return the full body for retransmission if we have it.
+    fn on_graft(&self, from: NodeId, id: MsgId) -> Vec<Event>;
     /// Receive a PRUNE; demote `from` from eager to lazy.
     fn on_prune(&self, from: NodeId);
     /// Lookup delivered payload.
     fn get(&self, id: &MsgId) -> Option<Vec<u8>>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
-    me: Option<NodeId>,
+    me: NodeId,
     eager: HashSet<NodeId>,
     lazy: HashSet<NodeId>,
     seen: HashMap<MsgId, Vec<u8>>,
@@ -76,20 +81,36 @@ struct Inner {
     pending_ihave: VecDeque<(NodeId, MsgId, NodeId)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryPlumtree {
     inner: Arc<Mutex<Inner>>,
 }
 
+impl Default for InMemoryPlumtree {
+    /// Usable node with a fresh ephemeral identity. Prefer `new(me)` when the
+    /// caller already owns a NodeId (e.g. from its keystore).
+    fn default() -> Self {
+        Self::new(Keypair::generate().node_id())
+    }
+}
+
 impl InMemoryPlumtree {
     pub fn new(me: NodeId) -> Self {
-        let t = Self::default();
-        t.inner.lock().unwrap().me = Some(me);
-        t
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                me,
+                eager: HashSet::new(),
+                lazy: HashSet::new(),
+                seen: HashMap::new(),
+                pending_ihave: VecDeque::new(),
+            })),
+        }
     }
 
     pub fn add_peer(&self, peer: NodeId) {
         let mut g = self.inner.lock().unwrap();
+        // Views must stay disjoint: re-adding a pruned peer promotes it.
+        g.lazy.remove(&peer);
         g.eager.insert(peer);
     }
 
@@ -129,7 +150,7 @@ impl InMemoryPlumtree {
 impl GossipProtocol for InMemoryPlumtree {
     fn broadcast(&self, payload: Vec<u8>, id: MsgId) -> Vec<Event> {
         let mut g = self.inner.lock().unwrap();
-        let me = g.me.clone().expect("initialize with new(me)");
+        let me = g.me.clone();
         if g.seen.insert(id, payload.clone()).is_some() {
             return Vec::new();
         }
@@ -146,7 +167,7 @@ impl GossipProtocol for InMemoryPlumtree {
 
     fn on_receive(&self, msg: Msg) -> Vec<Event> {
         let mut g = self.inner.lock().unwrap();
-        let me = g.me.clone().expect("initialize with new(me)");
+        let me = g.me.clone();
         if g.seen.contains_key(&msg.id) {
             // Duplicate: demote the sender to lazy (tree-pruning).
             if g.eager.remove(&msg.sender) {
@@ -184,6 +205,23 @@ impl GossipProtocol for InMemoryPlumtree {
         // Queue for GRAFT on next tick.
         g.pending_ihave.push_back((from, id, origin));
         Vec::new()
+    }
+
+    fn on_graft(&self, from: NodeId, id: MsgId) -> Vec<Event> {
+        let mut g = self.inner.lock().unwrap();
+        let me = g.me.clone();
+        // GRAFT heals the tree: the requesting peer becomes an eager edge
+        // again (dual of the PRUNE demotion).
+        g.lazy.remove(&from);
+        g.eager.insert(from.clone());
+        // Retransmit the full body the IHAVE promised, if we still have it.
+        match g.seen.get(&id) {
+            Some(payload) => vec![Event::Eager {
+                to: from,
+                msg: Msg { id, payload: payload.clone(), sender: me },
+            }],
+            None => Vec::new(),
+        }
     }
 
     fn on_prune(&self, from: NodeId) {
@@ -308,5 +346,49 @@ mod tests {
         t.broadcast(b"stored".to_vec(), [5u8; 32]);
         assert_eq!(t.get(&[5u8; 32]), Some(b"stored".to_vec()));
         assert_eq!(t.get(&[6u8; 32]), None);
+    }
+
+    // ---- REPRO (pre-fix, expected RED) ----
+
+    #[test]
+    fn repro_g1_pruned_edge_never_heals() {
+        let me = mk_node();
+        let p1 = mk_node();
+        let t = InMemoryPlumtree::new(me);
+        t.add_peer(p1.clone());
+        let msg = Msg { id: [9u8; 32], payload: b"y".to_vec(), sender: p1.clone() };
+        let _ = t.on_receive(msg.clone());
+        let _ = t.on_receive(msg);
+        assert!(t.lazy_peers().contains(&p1), "precondition: p1 pruned to lazy");
+        // Model the downstream transport's GRAFT path: p1 asks for the body,
+        // which both re-promotes the edge and hands the payload back.
+        let evs = t.on_graft(p1.clone(), [9u8; 32]);
+        assert_eq!(evs.len(), 1, "GRAFT for a known id must retransmit the body");
+        assert!(
+            matches!(&evs[0], Event::Eager { to, msg } if to == &p1 && msg.id == [9u8; 32]),
+            "retransmission must be an Eager delivery of the grafted id to p1"
+        );
+        assert!(t.eager_peers().contains(&p1), "GRAFT must heal edge back to eager");
+        assert!(!t.lazy_peers().contains(&p1), "healed peer must leave the lazy view");
+    }
+
+    #[test]
+    fn repro_g2_add_peer_leaves_peer_in_both_views() {
+        let me = mk_node();
+        let p1 = mk_node();
+        let t = InMemoryPlumtree::new(me);
+        t.add_peer(p1.clone());
+        t.on_prune(p1.clone());
+        assert!(t.lazy_peers().contains(&p1), "precondition: p1 lazy");
+        t.add_peer(p1.clone());
+        assert!(!t.lazy_peers().contains(&p1), "add_peer must evict from lazy");
+        let evs = t.broadcast(b"z".to_vec(), [11u8; 32]);
+        assert_eq!(evs.len(), 1, "one peer must yield exactly one event");
+    }
+
+    #[test]
+    fn repro_g3_default_panics_on_broadcast() {
+        let t = InMemoryPlumtree::default();
+        let _ = t.broadcast(b"boom".to_vec(), [12u8; 32]);
     }
 }
