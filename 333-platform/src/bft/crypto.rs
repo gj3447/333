@@ -8,6 +8,7 @@
 //! sign() requires Identity (private key). verify() uses PeerId (public key).
 //! ValidatorKeyring maps NodeId(u32) → Identity for BFT operations.
 
+use super::types::Phase;
 use crate::crypto_real::{Identity, PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -42,12 +43,20 @@ impl std::hash::Hash for Signature {
 pub struct QuorumCert {
     pub block_hash: u64,
     pub view: u64,
+    /// Phase whose votes formed this QC. Vote signatures bind the phase byte
+    /// (`sign_vote`), so a QC's signatures only verify against `phase_tag(phase)`
+    /// — a Prepare QC relabeled as a Commit QC fails signature verification.
+    /// # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+    pub phase: Phase,
     pub signatures: Vec<Signature>,
 }
 
 impl QuorumCert {
+    /// Genesis bootstrap QC. `phase` is a placeholder — genesis is recognized by
+    /// (empty signatures, block_hash=0, view=0) short-circuits everywhere and its
+    /// signatures are never verified.
     pub fn genesis() -> Self {
-        Self { block_hash: 0, view: 0, signatures: vec![] }
+        Self { block_hash: 0, view: 0, phase: Phase::Prepare, signatures: vec![] }
     }
 
     pub fn has_quorum(&self, n: usize) -> bool {
@@ -168,6 +177,61 @@ pub fn verify(sig: &Signature, block_hash: u64, keyring: &ValidatorKeyring) -> b
         signer: peer_id.clone(),
         signature_hex: hex,
         message: msg.to_vec(),
+    };
+    peer_id.verify(&signed_msg)
+}
+
+/// Distinct non-zero byte per phase, bound into vote signatures so a vote signed
+/// for one phase cannot be replayed as another. Prepare/PreCommit/Commit are the
+/// voted phases; Decide is included for totality (never voted, but a stable tag
+/// costs nothing and avoids a silent 0).
+/// # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+pub fn phase_tag(p: Phase) -> u8 {
+    match p {
+        Phase::Prepare => 1,
+        Phase::PreCommit => 2,
+        Phase::Commit => 3,
+        Phase::Decide => 4,
+    }
+}
+
+/// Sign a VOTE, binding the phase into the signed message.
+///
+/// Plain `sign_with_identity` signs `block_hash` only. `block_hash` folds in the
+/// view (`hash_block(view, ..)`), so a signature is already view-specific — but
+/// NOT phase-specific. That let an attacker take an honest Prepare-phase vote,
+/// relabel its `phase` field to Commit, and replay it: the relabelled message
+/// still verified because the signature only covered `block_hash`, so a quorum of
+/// Prepare votes forged a Commit QC. Binding the phase byte makes a signature
+/// valid for exactly one phase of one block.
+/// # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+pub fn sign_vote(node_id: NodeId, block_hash: u64, phase_tag: u8, identity: &Identity) -> Signature {
+    let mut msg = block_hash.to_be_bytes().to_vec();
+    msg.push(phase_tag);
+    let signed = identity.sign(&msg);
+    Signature {
+        signer: node_id,
+        sig_bytes: signed.signature_bytes()
+            .map(|b| b.to_vec())
+            .unwrap_or_default(),
+    }
+}
+
+/// Verify a vote signature against `(block_hash, phase_tag)`. A signature made for
+/// a different phase of the same block fails here, which is the whole point.
+/// # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+pub fn verify_vote(sig: &Signature, block_hash: u64, phase_tag: u8, keyring: &ValidatorKeyring) -> bool {
+    let peer_id = match keyring.peer_id(&sig.signer) {
+        Some(p) => p,
+        None => return false,
+    };
+    let mut msg = block_hash.to_be_bytes().to_vec();
+    msg.push(phase_tag);
+    let hex: String = sig.sig_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let signed_msg = crate::crypto_real::SignedMessage {
+        signer: peer_id.clone(),
+        signature_hex: hex,
+        message: msg,
     };
     peer_id.verify(&signed_msg)
 }

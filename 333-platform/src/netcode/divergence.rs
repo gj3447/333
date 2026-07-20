@@ -15,7 +15,8 @@
 //! accepted and all other QCs are rejected — safe fail-closed default.
 
 use crate::determinism::state_hash::{DesyncDetector, DesyncEvent};
-use crate::bft::crypto::{QuorumCert, ValidatorKeyring, ValidatorSet, verify};
+use crate::bft::crypto::{phase_tag, verify_vote, QuorumCert, ValidatorKeyring, ValidatorSet};
+use crate::bft::types::Phase;
 use crate::observability; // KG: sprint6C-observability-2026-04-15
 
 /// Coordinates fast-layer desync detection with slow-layer BFT checkpoint validation.
@@ -183,11 +184,21 @@ impl FrameDivergenceDetector {
             }
         }
 
-        // Ed25519 verify each signature against the QC's block_hash.
+        // A BFT checkpoint QC is proof of a COMMIT — the QCs peers ship here are
+        // the leader's post-Decide high_qc, formed from Commit-phase votes. A
+        // Prepare/PreCommit QC must not raise the rollback floor: 2f+1 captured
+        // Prepare votes are not evidence that anything committed.
+        // # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+        if qc.phase != Phase::Commit {
+            return false;
+        }
+
+        // Ed25519 verify each signature against the QC's block_hash, bound to
+        // the phase the QC's votes were cast in (Commit, enforced above).
         // Any invalid sig → reject the entire QC.
         let block_hash = qc.block_hash;
         for sig in &qc.signatures {
-            if !verify(sig, block_hash, keyring) {
+            if !verify_vote(sig, block_hash, phase_tag(qc.phase), keyring) {
                 return false;
             }
         }
@@ -276,6 +287,7 @@ mod tests {
         let forged_qc = QuorumCert {
             block_hash: 0xBAD_F00D,
             view: 1,
+            phase: Phase::Commit,
             signatures: vec![Signature { signer: 99, sig_bytes: vec![0u8; 64] }],
         };
         let result = det.accept_bft_checkpoint(500, [0x01; 32], &forged_qc);
@@ -303,7 +315,7 @@ mod tests {
     /// KG: sprint4D-ed25519-real-verify-2026-04-15
     #[test]
     fn real_multisig_qc_accepted_with_keyring() {
-        use crate::bft::crypto::{sign_with_identity, ValidatorKeyring, ValidatorSet};
+        use crate::bft::crypto::{phase_tag, sign_vote, ValidatorKeyring, ValidatorSet};
         use crate::crypto_real::Identity;
 
         fn det_identity(nid: u32) -> Identity {
@@ -320,12 +332,13 @@ mod tests {
         }
 
         let block_hash: u64 = 0xFEED_FACE_CAFE_BABE;
-        // 3 valid signatures — satisfies quorum=3 for n=4.
+        // 3 valid Commit-phase-bound signatures — satisfies quorum=3 for n=4.
+        // Checkpoint QCs are Commit QCs, so honest test sigs bind the Commit tag.
         let signatures: Vec<_> = [1u32, 2, 3]
             .iter()
-            .map(|&nid| sign_with_identity(nid, block_hash, &det_identity(nid)))
+            .map(|&nid| sign_vote(nid, block_hash, phase_tag(Phase::Commit), &det_identity(nid)))
             .collect();
-        let valid_qc = QuorumCert { block_hash, view: 1, signatures };
+        let valid_qc = QuorumCert { block_hash, view: 1, phase: Phase::Commit, signatures };
 
         let mut det = FrameDivergenceDetector::new(32).with_keyring(kr, vs);
         let result = det.accept_bft_checkpoint(999, [0x42; 32], &valid_qc);

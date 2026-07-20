@@ -231,8 +231,8 @@ mod tests {
         let validators = make_validators();
         let mut tracker = ViewChangeTracker::new(ViewChangeConfig::default());
 
-        let qc_low = QuorumCert { block_hash: 1, view: 1, signatures: vec![] };
-        let qc_high = QuorumCert { block_hash: 2, view: 5, signatures: vec![] };
+        let qc_low = QuorumCert { block_hash: 1, view: 1, phase: Phase::Prepare, signatures: vec![] };
+        let qc_high = QuorumCert { block_hash: 2, view: 5, phase: Phase::Prepare, signatures: vec![] };
 
         // Need 5 of 7 for quorum
         assert!(tracker.collect_view_change(10, 1, qc_low.clone(), &validators).is_none());

@@ -8,7 +8,7 @@
 //!   - Multiple rounds with view advancement
 //!   - Empty tx pool → propose() returns None
 
-use triple_three::bft::crypto::{sign_standalone as sign, NodeId, ValidatorSet};
+use triple_three::bft::crypto::{phase_tag, sign_vote, NodeId, ValidatorSet};
 use triple_three::crypto_real::Identity;
 use triple_three::bft::executor::Executor;
 use triple_three::bft::state::HotStuffState;
@@ -124,12 +124,14 @@ fn run_consensus_round(nodes: &mut [TestNode]) -> bool {
             }
         }
 
-        // Leader self-vote
+        // Leader self-vote — phase-bound like every honest vote.
+        // # KG: fix-333-bft-vote-signature-phase-binding-2026-07-15
+        let leader_id = nodes[leader_idx].state.node_id;
         votes.push(HotStuffMsg::Vote {
             block_hash,
             view: nodes[leader_idx].state.view,
             phase,
-            signature: sign(nodes[leader_idx].state.node_id, block_hash),
+            signature: sign_vote(leader_id, block_hash, phase_tag(phase), &test_identity(leader_id)),
         });
 
         // Feed votes into leader; act on the result
