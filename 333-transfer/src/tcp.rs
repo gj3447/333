@@ -6,6 +6,13 @@
 // threads, no tokio / no serde.
 //
 // Frame body = `wire::encode_authority_msg` (1-byte tag + domain-tagged body).
+//
+// Restart healing: every session carries an `alive` flag that its reader thread
+// clears on EOF / fatal read error. The send path heals flagged sessions —
+// dialed ones are redialled (once per send) at their retained listen address,
+// accepted ones are pruned (their remote listen address is unknown; the dialer
+// heals that pair by dialing us again). Write errors alone cannot be the
+// trigger: a write into a freshly dead socket returns Ok until the RST lands.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -24,11 +31,26 @@ const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const CONNECT_ATTEMPTS: u32 = 40;
 const CONNECT_BACKOFF: Duration = Duration::from_millis(10);
 
+/// One live (or corpse) TCP session on the write path.
+///
+/// `alive` is shared with the session's reader thread: the reader is the only
+/// reliable observer of peer death (EOF / RST surface there first), so it flags
+/// the corpse and the send path acts on the flag. `redial` retains the peer's
+/// *listen* address for sessions we dialed — the only address that survives a
+/// peer restart. Accepted sessions have no redialable address (the inbound
+/// ephemeral port dies with the peer), so `redial` is `None` and a dead
+/// accepted session is pruned instead of healed.
+struct PeerSession {
+    stream: TcpStream,
+    redial: Option<SocketAddr>,
+    alive: Arc<AtomicBool>,
+}
+
 /// Shared state for one TCP authority peer (listener + outbound peers + inbox).
 struct TcpInner {
     id: String,
     addr: SocketAddr,
-    peers: Mutex<Vec<TcpStream>>,
+    peers: Mutex<Vec<PeerSession>>,
     inbox: Mutex<VecDeque<AuthorityMsg>>,
     stop: AtomicBool,
     listener: Mutex<Option<JoinHandle<()>>>,
@@ -95,23 +117,12 @@ impl TcpAuthorityNet {
             return Ok(());
         }
         let stream = connect_with_retry(addr)?;
-        configure_stream(&stream)?;
-        // Read replies on the same TCP session (peer may write back without dialing us).
-        if let Ok(read_half) = stream.try_clone() {
-            if configure_stream(&read_half).is_ok() {
-                let handle = spawn_reader(Arc::clone(&self.inner), read_half);
-                self.inner
-                    .readers
-                    .lock()
-                    .expect("readers lock")
-                    .push(handle);
-            }
-        }
+        let session = dialed_session(&self.inner, addr, stream)?;
         self.inner
             .peers
             .lock()
             .expect("peers lock")
-            .push(stream);
+            .push(session);
         Ok(())
     }
 
@@ -207,10 +218,80 @@ impl TcpEndpoint {
         }
         let mut ok = 0usize;
         let mut last_err: Option<String> = None;
+
+        // Phase 1 — heal sessions whose reader flagged death (EOF / fatal read).
+        // This flag, not a write error, is the load-bearing trigger: a write
+        // into a corpse stream can return Ok (the kernel buffers the bytes
+        // before the peer's RST arrives), so an error-triggered-only reconnect
+        // would never fire and the corpse would shadow the peer forever.
+        let mut idx = 0;
+        while idx < peers.len() {
+            if peers[idx].alive.load(Ordering::SeqCst) {
+                idx += 1;
+                continue;
+            }
+            match peers[idx].redial {
+                // Dialed session: the retained listen address survives the peer
+                // restart. One connect attempt per send — no retry/backoff loop
+                // on the send path; the caller's next send is the retry.
+                Some(addr) => match redial_once(&self.inner, addr) {
+                    Ok(fresh) => {
+                        peers[idx] = fresh;
+                        idx += 1;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        idx += 1; // keep the corpse entry: it carries the redial addr
+                    }
+                },
+                // Accepted session: no redialable address. Prune the corpse; a
+                // restarted dialer heals this pair by dialing us again (the
+                // accept loop pushes the fresh session).
+                None => {
+                    peers.remove(idx);
+                }
+            }
+        }
+        if peers.is_empty() {
+            // Every session was an unhealable corpse — same surface as "no
+            // peers connected yet".
+            return Ok(());
+        }
+
+        // Phase 2 — best-effort fan-out to live sessions. A surfaced write
+        // error is the second death signal: flag it and, for dialed sessions,
+        // try one reconnect-and-resend within this send.
         for p in peers.iter_mut() {
-            match p.write_all(&frame).and_then(|_| p.flush()) {
+            if !p.alive.load(Ordering::SeqCst) {
+                continue; // redial failed this round; next send retries
+            }
+            match p.stream.write_all(&frame).and_then(|_| p.stream.flush()) {
                 Ok(()) => ok += 1,
-                Err(e) => last_err = Some(e.to_string()),
+                Err(e) => {
+                    p.alive.store(false, Ordering::SeqCst);
+                    last_err = Some(e.to_string());
+                    if let Some(addr) = p.redial {
+                        match redial_once(&self.inner, addr) {
+                            Ok(fresh) => {
+                                match (&fresh.stream)
+                                    .write_all(&frame)
+                                    .and_then(|_| (&fresh.stream).flush())
+                                {
+                                    Ok(()) => ok += 1,
+                                    Err(e2) => {
+                                        fresh.alive.store(false, Ordering::SeqCst);
+                                        last_err = Some(e2.to_string());
+                                    }
+                                }
+                                // The fresh session replaces the corpse even if
+                                // its first write failed — phase 1 redials it
+                                // on the next send.
+                                *p = fresh;
+                            }
+                            Err(e2) => last_err = Some(e2),
+                        }
+                    }
+                }
             }
         }
         if ok == 0 {
@@ -281,7 +362,39 @@ fn connect_with_retry(addr: SocketAddr) -> Result<TcpStream, NetError> {
     )))
 }
 
-fn spawn_reader(inner: Arc<TcpInner>, stream: TcpStream) -> JoinHandle<()> {
+/// Wrap an already-connected outbound stream into a [`PeerSession`]: configure
+/// both halves, spawn the session reader sharing the `alive` flag, retain
+/// `addr` (the peer's listen address) for restart redials.
+fn dialed_session(
+    inner: &Arc<TcpInner>,
+    addr: SocketAddr,
+    stream: TcpStream,
+) -> Result<PeerSession, NetError> {
+    configure_stream(&stream)?;
+    let alive = Arc::new(AtomicBool::new(true));
+    // Read replies on the same TCP session (peer may write back without dialing us).
+    if let Ok(read_half) = stream.try_clone() {
+        if configure_stream(&read_half).is_ok() {
+            let handle = spawn_reader(Arc::clone(inner), read_half, Arc::clone(&alive));
+            inner.readers.lock().expect("readers lock").push(handle);
+        }
+    }
+    Ok(PeerSession {
+        stream,
+        redial: Some(addr),
+        alive,
+    })
+}
+
+/// One reconnect attempt to a dialed peer's listen address. Send-path helper:
+/// exactly one `connect`, no retry/backoff loop — a down peer must not stall
+/// every broadcast, and the caller's next send is the natural retry.
+fn redial_once(inner: &Arc<TcpInner>, addr: SocketAddr) -> Result<PeerSession, String> {
+    let stream = TcpStream::connect(addr).map_err(|e| format!("redial {addr}: {e}"))?;
+    dialed_session(inner, addr, stream).map_err(|e| format!("redial {addr}: {e:?}"))
+}
+
+fn spawn_reader(inner: Arc<TcpInner>, stream: TcpStream, alive: Arc<AtomicBool>) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut stream = stream;
         loop {
@@ -303,6 +416,11 @@ fn spawn_reader(inner: Arc<TcpInner>, stream: TcpStream) -> JoinHandle<()> {
                     {
                         continue;
                     }
+                    // EOF or fatal error: the peer side of this session is
+                    // gone. Flag the corpse for the send path — writes into it
+                    // may keep returning Ok, so this flag is the only reliable
+                    // death signal.
+                    alive.store(false, Ordering::SeqCst);
                     break;
                 }
             }
@@ -327,12 +445,19 @@ fn spawn_listener(inner: Arc<TcpInner>, listener: TcpListener) -> JoinHandle<()>
             // Accepted streams are also write peers so a dialing client (or peer)
             // receives our broadcasts without us knowing its listen addr in advance.
             // Full-mesh connect_all may double-deliver; collectors dedupe by authority.
+            // `redial: None` — an accepted session cannot be healed from this
+            // side (the remote listen addr is unknown), only pruned once dead.
+            let alive = Arc::new(AtomicBool::new(true));
             if let Ok(write_half) = stream.try_clone() {
                 if configure_stream(&write_half).is_ok() {
-                    inner.peers.lock().expect("peers lock").push(write_half);
+                    inner.peers.lock().expect("peers lock").push(PeerSession {
+                        stream: write_half,
+                        redial: None,
+                        alive: Arc::clone(&alive),
+                    });
                 }
             }
-            let handle = spawn_reader(Arc::clone(&inner), stream);
+            let handle = spawn_reader(Arc::clone(&inner), stream, alive);
             inner
                 .readers
                 .lock()
@@ -417,6 +542,75 @@ mod tests {
         );
         a.shutdown();
         b.shutdown();
+    }
+
+    /// Lease a loopback port from the OS, then hand it back. The restart test
+    /// needs one address to survive a bind/drop/bind cycle, which an ephemeral
+    /// port cannot give: the whole defect is about dialling the *same* listen
+    /// address twice.
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        l.local_addr().expect("probe addr").port()
+    }
+
+    fn poll_until(ep: &TcpEndpoint, tries: u32) -> Vec<AuthorityMsg> {
+        let mut got = Vec::new();
+        for _ in 0..tries {
+            got.extend(ep.poll());
+            if !got.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        got
+    }
+
+    /// An authority restart is normal operation, not a fault. The committee is
+    /// fixed and quorum names *specific* members, so a peer that stays
+    /// unreachable for the rest of our process lifetime is a permanent quorum
+    /// loss waiting to accumulate.
+    #[test]
+    fn a_restarted_peer_becomes_reachable_again() {
+        let policy = policy();
+        let port = free_port();
+        let b_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        let a = TcpAuthorityNet::bind("a").unwrap();
+        let b1 = TcpAuthorityNet::bind_at("b", b_addr).unwrap();
+        a.connect_peer(b_addr).unwrap();
+        let ea = a.endpoint();
+
+        ea.broadcast_order(signed_tx(&policy, 0, 1)).unwrap();
+        assert_eq!(
+            poll_until(&b1.endpoint(), 50).len(),
+            1,
+            "baseline: a live peer receives the broadcast"
+        );
+
+        b1.shutdown();
+        drop(b1);
+        // A write into a just-dead session can still return Ok — the kernel
+        // buffers it before the RST lands. Ok is not evidence of delivery.
+        let _ = ea.broadcast_order(signed_tx(&policy, 1, 1));
+
+        let b2 = TcpAuthorityNet::bind_at("b", b_addr).unwrap();
+        let eb2 = b2.endpoint();
+        let mut got = Vec::new();
+        for _ in 0..60 {
+            let _ = ea.broadcast_order(signed_tx(&policy, 2, 1));
+            got.extend(eb2.poll());
+            if !got.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !got.is_empty(),
+            "restarted peer is permanently unreachable: the corpse stream is never replaced"
+        );
+
+        a.shutdown();
+        b2.shutdown();
     }
 
     #[test]
