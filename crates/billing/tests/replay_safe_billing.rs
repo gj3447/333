@@ -17,7 +17,7 @@ fn sum_u64(store: &impl Store, cid: &str, event: &str, field: &str) -> u64 {
 #[test]
 fn billing_conserves_and_each_debit_is_a_finalized_spend() {
     let mut s = MemoryStore::default();
-    let mut acct = Account::new("alice-credits", 100);
+    let mut acct = Account::new(&mut s, "sess-1", "alice-credits", 100);
     assert!(acct.meter_and_bill(&mut s, "sess-1", 2048, 1)); // cost 2
     assert!(acct.meter_and_bill(&mut s, "sess-1", 1024, 1)); // cost 1
     assert!(acct.meter_and_bill(&mut s, "sess-1", 5000, 1)); // cost 5
@@ -37,7 +37,7 @@ fn billing_conserves_and_each_debit_is_a_finalized_spend() {
 #[test]
 fn a_replayed_debit_message_does_not_double_charge() {
     let mut s = MemoryStore::default();
-    let mut acct = Account::new("alice-credits", 100);
+    let mut acct = Account::new(&mut s, "sess-2", "alice-credits", 100);
     acct.meter_and_bill(&mut s, "sess-2", 2048, 1); // version 0 -> 1, balance 98
     let before = acct.balance();
     // a replayed debit at the now-STALE version 0 must be rejected, not re-charged
@@ -49,7 +49,7 @@ fn a_replayed_debit_message_does_not_double_charge() {
 #[test]
 fn an_underfunded_account_gates() {
     let mut s = MemoryStore::default();
-    let mut acct = Account::new("poor", 1);
+    let mut acct = Account::new(&mut s, "sess-3", "poor", 1);
     assert!(!acct.meter_and_bill(&mut s, "sess-3", 4096, 1)); // cost 4 > 1
     assert_eq!(verify_present(&s, "sess-3", "relay_gated", 1), Verdict::Present);
     assert_eq!(acct.balance(), 1); // never overdrawn

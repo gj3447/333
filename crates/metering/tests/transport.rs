@@ -18,7 +18,7 @@ fn sum_u64(store: &impl Store, cid: &str, event: &str, field: &str) -> u64 {
 fn a_loopback_session_meters_within_budget_and_conserves_end_to_end() {
     let mut s = MemoryStore::default();
     let mut transport = Loopback::new(vec![2048, 1024, 5000]); // costs 2, 1, 5 = 8
-    let mut bucket = CreditBucket::new(100);
+    let mut bucket = CreditBucket::new(&mut s, "sess-1", 100);
     let forwarded = run_session(&mut s, "sess-1", &mut transport, &mut bucket, 1);
 
     assert_eq!(forwarded, 3, "all chunks forwarded within budget");
@@ -34,7 +34,7 @@ fn a_loopback_session_meters_within_budget_and_conserves_end_to_end() {
 fn a_session_that_outruns_its_budget_gates_partway() {
     let mut s = MemoryStore::default();
     let mut transport = Loopback::new(vec![2048, 4096, 2048]); // costs 2, 4, 2
-    let mut bucket = CreditBucket::new(3); // covers the first chunk (2), gates on the 4
+    let mut bucket = CreditBucket::new(&mut s, "sess-2", 3); // covers the first chunk (2), gates on the 4
     let forwarded = run_session(&mut s, "sess-2", &mut transport, &mut bucket, 1);
 
     assert_eq!(forwarded, 1, "stops at the gate");

@@ -10,7 +10,7 @@ fn main() {
     let cid = "relay-session-demo";
     let mut s = MemoryStore::default();
     let mut transport = Loopback::new(vec![2048, 1024, 2048]); // 2 + 1 + 2 = 5
-    let mut bucket = CreditBucket::new(5);
+    let mut bucket = CreditBucket::new(&mut s, cid, 5);
     run_session(&mut s, cid, &mut transport, &mut bucket, 1);
     println!("{}", to_ooptdd_jsonl(&s.query(cid)));
 }

@@ -2604,6 +2604,7 @@ dependencies = [
  "p333-consensus",
  "p333-ltdd",
  "p333-metering",
+ "tempfile",
 ]
 
 [[package]]
@@ -2612,6 +2613,7 @@ version = "0.0.0"
 dependencies = [
  "p333-ltdd",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2649,7 +2651,9 @@ dependencies = [
 name = "p333-ltdd"
 version = "0.0.0"
 dependencies = [
+ "p333-wal",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

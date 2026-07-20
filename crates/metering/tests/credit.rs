@@ -30,7 +30,7 @@ fn cost_is_ceil_kib_times_rate() {
 #[test]
 fn metered_forwards_debit_credit_and_conserve() {
     let mut s = MemoryStore::default();
-    let mut bucket = CreditBucket::new(100);
+    let mut bucket = CreditBucket::new(&mut s, "sess-1", 100);
     assert!(relay_forward(&mut s, "sess-1", &mut bucket, 2048, 1)); // cost 2
     assert!(relay_forward(&mut s, "sess-1", &mut bucket, 1024, 1)); // cost 1
     assert!(relay_forward(&mut s, "sess-1", &mut bucket, 5000, 1)); // cost 5
@@ -49,7 +49,7 @@ fn metered_forwards_debit_credit_and_conserve() {
 #[test]
 fn empty_bucket_gates_the_relay_and_never_overdraws() {
     let mut s = MemoryStore::default();
-    let mut bucket = CreditBucket::new(3);
+    let mut bucket = CreditBucket::new(&mut s, "sess-2", 3);
     assert!(relay_forward(&mut s, "sess-2", &mut bucket, 2048, 1)); // cost 2 -> ok, 1 left
     assert!(!relay_forward(&mut s, "sess-2", &mut bucket, 4096, 1)); // cost 4 > 1 -> GATED, refused
 
@@ -67,7 +67,7 @@ fn a_leaky_relay_that_forwards_without_debiting_breaks_conservation() {
     // ADVERSARIAL: a buggy/cheating relay meters the forward but the debit silently never lands
     // (free-riding). Its return value would say "ok"; the conservation invariant is what catches it.
     let mut s = MemoryStore::default();
-    let mut bucket = CreditBucket::new(100);
+    let mut bucket = CreditBucket::new(&mut s, "sess-3", 100);
     relay_forward(&mut s, "sess-3", &mut bucket, 2048, 1); // honest: cost 2, debited 2
     s.ship(&[Event::new("sess-3", "relay_forwarded").with("bytes", 9000u64).with("cost", 9u64)]); // leaked: no debit
 

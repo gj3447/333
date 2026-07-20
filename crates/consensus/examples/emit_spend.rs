@@ -10,7 +10,7 @@ fn main() {
     let cid = "spend-demo";
     let mut s = MemoryStore::default();
     let mut l = Ledger::default();
-    l.register("coin-A");
+    l.register(&mut s, cid, "coin-A");
     l.spend(&mut s, cid, "coin-A", 0, "alice->bob"); // finalizes
     l.spend(&mut s, cid, "coin-A", 0, "alice->carol"); // equivocation -> rejected
     println!("{}", to_ooptdd_jsonl(&s.query(cid)));

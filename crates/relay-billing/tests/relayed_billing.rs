@@ -28,8 +28,8 @@ async fn real_relayed_payload_is_metered_and_billed() {
 
     // billing state the dialer charges as the relayed bytes are confirmed delivered.
     let mut store = MemoryStore::default();
-    let mut account = Account::new("relay-credits", 100);
     let cid = "relayed-session";
+    let mut account = Account::new(&mut store, cid, "relay-credits", 100);
 
     let scenario = async {
         let mut relay_addr: Option<Multiaddr> = None;

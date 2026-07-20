@@ -19,9 +19,13 @@ pub struct Account {
 
 impl Account {
     /// A new account `object` pre-funded with `balance` credits (owned object at version 0).
-    pub fn new(object: &str, balance: u64) -> Self {
+    /// Emits `object_registered` (via the ledger) + `account_funded{object,balance}`: creation
+    /// and funding are judged transitions too — an event-sourced store must be able to rebuild
+    /// the opening state from the trace alone (wal design §1 gap 1).
+    pub fn new(store: &mut impl Store, cid: &str, object: &str, balance: u64) -> Self {
         let mut ledger = Ledger::default();
-        ledger.register(object);
+        ledger.register(store, cid, object);
+        store.ship(&[Event::new(cid, "account_funded").with("object", object).with("balance", balance)]);
         Self { object: object.to_string(), balance, ledger }
     }
 
@@ -73,5 +77,23 @@ impl Account {
     /// ledger rejects it (`equivocation_rejected`) — the replay does NOT charge the account again.
     pub fn replay_debit_at(&mut self, store: &mut impl Store, cid: &str, version: u64) -> bool {
         self.ledger.spend(store, cid, &self.object, version, "replayed-debit")
+    }
+
+    /// [`Account::meter_and_bill`], but the forward/gate decision only comes back as
+    /// [`Externalized<bool>`] — proof the debit trace reached stable storage BEFORE any byte
+    /// is forwarded (DUR-6 sync-then-send). Billing is exactly where amnesia equivocation
+    /// turns into money: a crash after forwarding an un-persisted debit restarts the account
+    /// at the old version/balance, and the same credits can be spent again. On a sync failure
+    /// there is no decision to act on — refuse the forward.
+    #[cfg(all(feature = "wal", unix))]
+    pub fn meter_and_bill_durable(
+        &mut self,
+        store: &mut p333_ltdd::wal_store::WalStore,
+        cid: &str,
+        bytes: u64,
+        rate_per_kib: u64,
+    ) -> Result<p333_ltdd::wal_store::Externalized<bool>, p333_ltdd::wal_store::WalStoreError> {
+        let forwarded = self.meter_and_bill(store, cid, bytes, rate_per_kib);
+        store.externalize(forwarded)
     }
 }

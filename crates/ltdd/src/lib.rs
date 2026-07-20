@@ -24,10 +24,13 @@
 
 use serde_json::{Map, Value};
 
+#[cfg(all(feature = "wal", unix))]
+pub mod wal_store;
+
 /// A structured trace event — the LTDD envelope. `cid` correlates one cycle across peers,
 /// `event` names the step, `attrs` are structured fields. Never assert on free-text logs:
 /// that resurrects the oracle problem (rewording a log line breaks the receipt).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Event {
     pub cid: String,
     pub event: String,
@@ -58,6 +61,23 @@ impl Event {
             o.insert(k.clone(), v.clone());
         }
         Value::Object(o)
+    }
+
+    /// Inverse of [`Event::to_ooptdd_json`]: rebuild an event from the flat envelope
+    /// (`cid` — falling back to `cycle_id` — plus `event`; every other key becomes an
+    /// attr). `None` when the value is not an envelope. Round-trip law:
+    /// `from_ooptdd_json(&e.to_ooptdd_json()) == Some(e)`.
+    pub fn from_ooptdd_json(v: &Value) -> Option<Event> {
+        let o = v.as_object()?;
+        let cid = o.get("cid").or_else(|| o.get("cycle_id"))?.as_str()?.to_string();
+        let event = o.get("event")?.as_str()?.to_string();
+        let mut attrs = Map::new();
+        for (k, val) in o {
+            if k != "cid" && k != "cycle_id" && k != "event" {
+                attrs.insert(k.clone(), val.clone());
+            }
+        }
+        Some(Event { cid, event, attrs })
     }
 }
 

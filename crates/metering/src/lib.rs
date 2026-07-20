@@ -21,8 +21,11 @@ pub struct CreditBucket {
 }
 
 impl CreditBucket {
-    /// A bucket pre-funded with `balance` credits.
-    pub fn new(balance: u64) -> Self {
+    /// A bucket pre-funded with `balance` credits, emitting `account_funded` —
+    /// funding is a judged transition too (wal design §1 gap 1: a store that
+    /// replays the trace must be able to rebuild the opening balance).
+    pub fn new(store: &mut impl Store, cid: &str, balance: u64) -> Self {
+        store.ship(&[Event::new(cid, "account_funded").with("balance", balance)]);
         Self { balance }
     }
 

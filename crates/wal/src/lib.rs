@@ -44,8 +44,10 @@
 //! Deliberate v1 deltas from etcd (recorded in the absorption doc §3):
 //! no HardState in segment headers, no preallocation/filePipeline (torn-tail
 //! detection does not depend on it), single directory-level `LOCK` flock
-//! instead of per-segment locks (via std `File::try_lock`), snapshots /
-//! release_older / read-only verify deferred.
+//! instead of per-segment locks (via std `File::try_lock`), snapshots
+//! deferred. Retention/maintenance surface: [`Wal::release_older`] (sealed
+//! segments fully `<= upto`), read-only [`verify`], and [`repair`] with a
+//! mandatory full backup (FMT-10).
 #![cfg(unix)]
 
 mod error;
@@ -188,33 +190,7 @@ impl Wal {
             .map_err(|_| WalError::NotAWal(format!("{} has no LOCK file", dir.display())))?;
         lock_exclusive(&lock)?;
 
-        // Foreign files (.DS_Store, editor droppings, subdirs) are ignored —
-        // only `*.wal` names participate (review finding #9; etcd does the
-        // same). A malformed `*.wal` name is still fatal: real ambiguity.
-        let mut segs: Vec<(u64, u64, PathBuf)> = Vec::new();
-        for ent in fs::read_dir(dir)? {
-            let ent = ent?;
-            if !ent.file_type()?.is_file() {
-                continue;
-            }
-            let p = ent.path();
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.ends_with(".wal") {
-                continue;
-            }
-            let (seq, first) = parse_segment_name(name)?;
-            segs.push((seq, first, p));
-        }
-        if segs.is_empty() {
-            return Err(WalError::NotAWal(format!("{} has no segments", dir.display())));
-        }
-        segs.sort_by_key(|s| s.0);
-        for (i, s) in segs.iter().enumerate() {
-            let expected = segs[0].0 + i as u64;
-            if s.0 != expected {
-                return Err(WalError::SegmentSeqGap { expected, found: s.0 });
-            }
-        }
+        let segs = list_segments(dir)?;
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut crc = 0u32;
@@ -224,108 +200,15 @@ impl Wal {
         for (i, (_seq, _first, path)) in segs.iter().enumerate() {
             let is_last = i == last_idx;
             let mut f = OpenOptions::new().read(true).write(true).open(path)?;
-            let file_len = f.metadata()?.len();
-            let mut valid_off = 0u64; // offset after the last fully-validated record
-            let mut chain_at_entry = crc; // state we arrived with (handoff gate)
-            let mut first_record = true;
-
-            enum End {
-                Clean,
-                ZeroTail,
-                Fail(DecodeFailure),
-            }
-
-            let end = {
-                let mut rd = BufReader::new(&mut f);
-                loop {
-                    match record::decode_record(&mut crc, &mut rd) {
-                        Ok(Decoded::Record(rec, consumed)) => {
-                            match rec.kind {
-                                RecordKind::CrcSeed => {
-                                    // FMT-4 handoff gate. A complete-but-wrong
-                                    // seed is fatal by design: segment headers
-                                    // are fsynced before the file becomes
-                                    // visible (create/cut protocol), so a seed
-                                    // can be corrupt but never torn.
-                                    if !(i == 0 && first_record) && rec.crc != chain_at_entry {
-                                        return Err(WalError::CrcMismatch {
-                                            expected: rec.crc,
-                                            actual: chain_at_entry,
-                                        });
-                                    }
-                                }
-                                RecordKind::Metadata => {
-                                    if rec.data != metadata {
-                                        return Err(WalError::MetadataConflict);
-                                    }
-                                }
-                                RecordKind::Entry => {
-                                    let (seq, payload) = record::decode_entry_data(&rec.data)?;
-                                    if let Some(last) = entries.last() {
-                                        if seq != last.seq + 1 {
-                                            return Err(WalError::EntrySeqGap {
-                                                expected: last.seq + 1,
-                                                found: seq,
-                                            });
-                                        }
-                                    }
-                                    entries.push(Entry { seq, payload });
-                                }
-                            }
-                            valid_off += consumed as u64;
-                            chain_at_entry = crc;
-                            first_record = false;
-                        }
-                        Ok(Decoded::Eof) => break End::Clean,
-                        Ok(Decoded::ZeroLen) => {
-                            break if is_last { End::ZeroTail } else { End::Clean }
-                            // Non-last note: we never preallocate, so zeros in
-                            // a sealed segment can only be trailing garbage a
-                            // repair once left behind — data past a zero field
-                            // is unreachable by construction, matching etcd's
-                            // decoder which also stops at the first zero field.
-                        }
-                        Err(df) => break End::Fail(df),
-                    }
-                }
-            };
-
-            match end {
-                End::Clean => {}
-                End::ZeroTail => {} // torn zero tail of the last file → truncated below
-                End::Fail(df) => {
-                    if !is_last {
-                        return Err(df.error);
-                    }
-                    let repair = match &df.error {
-                        // Genuinely partial bytes at EOF = torn by definition.
-                        WalError::TornRecord => true,
-                        // Complete-but-invalid record: repair ONLY when its own
-                        // extent contains an all-zero disk sector (FMT-7).
-                        WalError::CrcMismatch { .. } | WalError::CorruptFrame => {
-                            let scan_end = match df.frame_len {
-                                Some(fl) => (valid_off + fl).min(file_len),
-                                None => (valid_off + 8 + UNKNOWN_EXTENT_SCAN).min(file_len),
-                            };
-                            // Skip the 8-byte lenField; a frame's own trailing
-                            // pad (≤7B) can never fill a 512B sector alone.
-                            zero_sector_in_window(&mut f, valid_off + 8, scan_end)?
-                        }
-                        _ => false,
-                    };
-                    if !repair {
-                        return Err(df.error);
-                    }
-                }
-            }
+            let scan = scan_segment(&mut f, i, is_last, metadata, &mut crc, &mut entries)?;
 
             if is_last {
                 // Drop the un-synced/torn suffix and persist the truncation —
                 // sync_all: the size change is metadata (absorption DUR-8 note).
-                f.set_len(valid_off)?;
+                f.set_len(scan.valid_off)?;
                 f.sync_all()?;
-                f.seek(SeekFrom::Start(valid_off))?;
-                tail = Some((f, valid_off));
+                f.seek(SeekFrom::Start(scan.valid_off))?;
+                tail = Some((f, scan.valid_off));
             }
         }
 
@@ -419,6 +302,34 @@ impl Wal {
         self.sync()
     }
 
+    /// Release sealed segments whose entries are ALL `<= upto` (LIF-5/API-9).
+    /// Returns how many segment files were removed.
+    ///
+    /// The active tail segment is never removed, and a segment survives as
+    /// long as it holds even one entry `> upto` — so a reopen after release
+    /// replays a contiguous run that still covers everything above `upto`.
+    /// Deletions go oldest-first with a directory fsync after each removal:
+    /// a crash at any point leaves a contiguous (possibly longer) suffix,
+    /// never a gapped one. Snapshot pinning is deferred with snapshots
+    /// themselves (v1 delta): the caller's `upto` is the retention contract.
+    pub fn release_older(&mut self, upto: u64) -> Result<usize, WalError> {
+        self.guard()?;
+        let segs = list_segments(&self.dir)?;
+        let mut removed = 0usize;
+        for i in 0..segs.len().saturating_sub(1) {
+            // Segment i's entries end right before the next segment's first
+            // seq (the `<seq>-<first>.wal` name is authoritative, FMT-9).
+            let next_first = segs[i + 1].1;
+            if next_first > upto.saturating_add(1) {
+                break; // this segment still holds live entries — stop (contiguity)
+            }
+            fs::remove_file(&segs[i].2)?;
+            self.dir_file.sync_all()?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     fn guard(&self) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
@@ -463,6 +374,273 @@ impl Drop for Wal {
             let _ = self.tail.sync_data();
         }
     }
+}
+
+/// What a read-only [`verify`] pass found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub segments: usize,
+    pub entries: usize,
+    /// 0 when the log holds no entries.
+    pub first_seq: u64,
+    /// 0 when the log holds no entries.
+    pub last_seq: u64,
+    /// A repairable torn/un-synced suffix follows the last valid record —
+    /// [`Wal::open`] (or [`repair`]) would truncate it away.
+    pub torn_tail: bool,
+}
+
+/// Read-only integrity check (API-10). Replays every record without touching
+/// a byte on disk: a torn tail is *reported* (`torn_tail: true`), while
+/// corruption of the synced region (broken crc chain, corrupt frame with no
+/// zero-sector evidence, seq gaps, metadata conflict) is an `Err` — exactly
+/// the classification [`Wal::open`] uses, minus the truncation.
+///
+/// Takes the writer lock: verifying under a live appender would race the
+/// tail, so a held lock surfaces as [`WalError::Locked`].
+pub fn verify(dir: &Path, metadata: &[u8]) -> Result<VerifyReport, WalError> {
+    let lock = File::options()
+        .read(true)
+        .write(true)
+        .open(dir.join(LOCK_FILE))
+        .map_err(|_| WalError::NotAWal(format!("{} has no LOCK file", dir.display())))?;
+    lock_exclusive(&lock)?;
+    scan_all(dir, metadata)
+}
+
+/// What [`repair`] did.
+#[derive(Debug)]
+pub struct RepairReport {
+    /// Untouched pre-repair copy of every file in the WAL directory.
+    pub backup: PathBuf,
+    pub entries: usize,
+    pub last_seq: u64,
+    /// Whether a torn suffix was actually truncated (false = clean no-op).
+    pub truncated: bool,
+}
+
+/// Explicit torn-tail repair with a mandatory full backup first (FMT-10).
+///
+/// Only the same states [`Wal::open`] auto-repairs are repairable — a torn
+/// record / zero-sector tail of the LAST segment (etcd: only
+/// `ErrUnexpectedEOF` is repairable). Fatal corruption of the synced region
+/// returns the verify error with the directory untouched and **no backup
+/// made** — nothing was going to be modified. The backup lands beside the
+/// WAL as `<dir>.walbak` and an existing one is never clobbered.
+///
+/// This is a maintenance entry point for a downed writer; any live appender
+/// makes it fail with [`WalError::Locked`].
+pub fn repair(dir: &Path, metadata: &[u8], opts: WalOptions) -> Result<RepairReport, WalError> {
+    // Read-only classification first: fatal corruption must abort before any
+    // mutation (FMT-8), and `torn_tail` tells us whether open() will truncate.
+    let report = verify(dir, metadata)?;
+
+    let parent = dir.parent().ok_or_else(|| WalError::NotAWal("no parent dir".into()))?;
+    let dir_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| WalError::NotAWal("unusable dir name".into()))?;
+    let backup = parent.join(format!("{dir_name}.walbak"));
+    if backup.exists() {
+        return Err(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("backup {} already exists — move it away first", backup.display()),
+        )));
+    }
+    fs::create_dir(&backup)?;
+    for ent in fs::read_dir(dir)? {
+        let ent = ent?;
+        if !ent.file_type()?.is_file() {
+            continue;
+        }
+        let p = ent.path();
+        fs::copy(&p, backup.join(p.file_name().expect("file has a name")))?;
+    }
+    File::open(&backup)?.sync_all()?;
+
+    let (entries, wal) = Wal::open(dir, metadata, opts)?;
+    let receipt = wal.close()?;
+    Ok(RepairReport {
+        backup,
+        entries: entries.len(),
+        last_seq: receipt.last_seq,
+        truncated: report.torn_tail,
+    })
+}
+
+/// List, sort, and contiguity-check the `*.wal` segments of `dir`.
+///
+/// Foreign files (.DS_Store, editor droppings, subdirs) are ignored — only
+/// `*.wal` names participate (review finding #9; etcd does the same). A
+/// malformed `*.wal` name is still fatal: real ambiguity.
+fn list_segments(dir: &Path) -> Result<Vec<(u64, u64, PathBuf)>, WalError> {
+    let mut segs: Vec<(u64, u64, PathBuf)> = Vec::new();
+    for ent in fs::read_dir(dir)? {
+        let ent = ent?;
+        if !ent.file_type()?.is_file() {
+            continue;
+        }
+        let p = ent.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".wal") {
+            continue;
+        }
+        let (seq, first) = parse_segment_name(name)?;
+        segs.push((seq, first, p));
+    }
+    if segs.is_empty() {
+        return Err(WalError::NotAWal(format!("{} has no segments", dir.display())));
+    }
+    segs.sort_by_key(|s| s.0);
+    for (i, s) in segs.iter().enumerate() {
+        let expected = segs[0].0 + i as u64;
+        if s.0 != expected {
+            return Err(WalError::SegmentSeqGap { expected, found: s.0 });
+        }
+    }
+    Ok(segs)
+}
+
+/// One segment's scan outcome.
+struct SegScan {
+    /// Offset just past the last fully-validated record.
+    valid_off: u64,
+    /// A repairable torn/un-synced suffix follows `valid_off` (last segment
+    /// only — anywhere else the scan returns the fatal error instead).
+    torn: bool,
+}
+
+/// The shared per-segment replay: decode records, advance the rolling crc
+/// chain, gate the CrcSeed handoff, accumulate entries — and classify the
+/// end of the file exactly as documented on [`Wal::open`]. Mutates nothing.
+fn scan_segment(
+    f: &mut File,
+    seg_index: usize,
+    is_last: bool,
+    metadata: &[u8],
+    crc: &mut u32,
+    entries: &mut Vec<Entry>,
+) -> Result<SegScan, WalError> {
+    let file_len = f.metadata()?.len();
+    let mut valid_off = 0u64; // offset after the last fully-validated record
+    let mut chain_at_entry = *crc; // state we arrived with (handoff gate)
+    let mut first_record = true;
+
+    enum End {
+        Clean,
+        ZeroTail,
+        Fail(DecodeFailure),
+    }
+
+    let end = {
+        let mut rd = BufReader::new(&mut *f);
+        loop {
+            match record::decode_record(crc, &mut rd) {
+                Ok(Decoded::Record(rec, consumed)) => {
+                    match rec.kind {
+                        RecordKind::CrcSeed => {
+                            // FMT-4 handoff gate. A complete-but-wrong
+                            // seed is fatal by design: segment headers
+                            // are fsynced before the file becomes
+                            // visible (create/cut protocol), so a seed
+                            // can be corrupt but never torn.
+                            if !(seg_index == 0 && first_record) && rec.crc != chain_at_entry {
+                                return Err(WalError::CrcMismatch {
+                                    expected: rec.crc,
+                                    actual: chain_at_entry,
+                                });
+                            }
+                        }
+                        RecordKind::Metadata => {
+                            if rec.data != metadata {
+                                return Err(WalError::MetadataConflict);
+                            }
+                        }
+                        RecordKind::Entry => {
+                            let (seq, payload) = record::decode_entry_data(&rec.data)?;
+                            if let Some(last) = entries.last() {
+                                if seq != last.seq + 1 {
+                                    return Err(WalError::EntrySeqGap {
+                                        expected: last.seq + 1,
+                                        found: seq,
+                                    });
+                                }
+                            }
+                            entries.push(Entry { seq, payload });
+                        }
+                    }
+                    valid_off += consumed as u64;
+                    chain_at_entry = *crc;
+                    first_record = false;
+                }
+                Ok(Decoded::Eof) => break End::Clean,
+                Ok(Decoded::ZeroLen) => {
+                    break if is_last { End::ZeroTail } else { End::Clean }
+                    // Non-last note: we never preallocate, so zeros in
+                    // a sealed segment can only be trailing garbage a
+                    // repair once left behind — data past a zero field
+                    // is unreachable by construction, matching etcd's
+                    // decoder which also stops at the first zero field.
+                }
+                Err(df) => break End::Fail(df),
+            }
+        }
+    };
+
+    let torn = match end {
+        End::Clean => false,
+        End::ZeroTail => true, // torn zero tail of the last file
+        End::Fail(df) => {
+            if !is_last {
+                return Err(df.error);
+            }
+            let repair = match &df.error {
+                // Genuinely partial bytes at EOF = torn by definition.
+                WalError::TornRecord => true,
+                // Complete-but-invalid record: repair ONLY when its own
+                // extent contains an all-zero disk sector (FMT-7).
+                WalError::CrcMismatch { .. } | WalError::CorruptFrame => {
+                    let scan_end = match df.frame_len {
+                        Some(fl) => (valid_off + fl).min(file_len),
+                        None => (valid_off + 8 + UNKNOWN_EXTENT_SCAN).min(file_len),
+                    };
+                    // Skip the 8-byte lenField; a frame's own trailing
+                    // pad (≤7B) can never fill a 512B sector alone.
+                    zero_sector_in_window(f, valid_off + 8, scan_end)?
+                }
+                _ => false,
+            };
+            if !repair {
+                return Err(df.error);
+            }
+            true
+        }
+    };
+
+    Ok(SegScan { valid_off, torn })
+}
+
+/// The full read-only replay behind [`verify`] (caller holds the lock).
+fn scan_all(dir: &Path, metadata: &[u8]) -> Result<VerifyReport, WalError> {
+    let segs = list_segments(dir)?;
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut crc = 0u32;
+    let mut torn = false;
+    let last_idx = segs.len() - 1;
+    for (i, (_seq, _first, path)) in segs.iter().enumerate() {
+        let mut f = OpenOptions::new().read(true).open(path)?;
+        let scan = scan_segment(&mut f, i, i == last_idx, metadata, &mut crc, &mut entries)?;
+        if i == last_idx {
+            torn = scan.torn;
+        }
+    }
+    Ok(VerifyReport {
+        segments: segs.len(),
+        entries: entries.len(),
+        first_seq: entries.first().map(|e| e.seq).unwrap_or(0),
+        last_seq: entries.last().map(|e| e.seq).unwrap_or(0),
+        torn_tail: torn,
+    })
 }
 
 /// Scan `[start, end)` of `f` for one all-zero chunk on **absolute file

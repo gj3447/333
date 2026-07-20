@@ -19,9 +19,12 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// Register a fresh object at version 0.
-    pub fn register(&mut self, object: &str) {
+    /// Register a fresh object at version 0, emitting `object_registered` —
+    /// registration is a judged transition like any other (wal design §1
+    /// gap 1: an event-sourced store cannot rebuild what never shipped).
+    pub fn register(&mut self, store: &mut impl Store, cid: &str, object: &str) {
         self.versions.insert(object.to_string(), 0);
+        store.ship(&[Event::new(cid, "object_registered").with("object", object)]);
     }
 
     /// The object's current (unspent) version, if registered.
@@ -57,5 +60,24 @@ impl Ledger {
                 false
             }
         }
+    }
+
+    /// [`Ledger::spend`], but the decision comes back only as
+    /// [`Externalized<bool>`] — proof the finalize/reject event reached
+    /// stable storage (DUR-6 sync-then-send: p333 has no consensus behind
+    /// it, so signing/answering an un-persisted spend is amnesia
+    /// equivocation waiting for a restart). On a sync failure there is no
+    /// value to act on: the caller must refuse the ack.
+    #[cfg(all(feature = "wal", unix))]
+    pub fn spend_durable(
+        &mut self,
+        store: &mut p333_ltdd::wal_store::WalStore,
+        cid: &str,
+        object: &str,
+        version: u64,
+        txn: &str,
+    ) -> Result<p333_ltdd::wal_store::Externalized<bool>, p333_ltdd::wal_store::WalStoreError> {
+        let finalized = self.spend(store, cid, object, version, txn);
+        store.externalize(finalized)
     }
 }

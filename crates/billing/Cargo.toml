@@ -5,7 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "333 v2 substrate — credits as OWNED OBJECTS: relay billing composing two lanes. A debit is a finalized owned-object spend (Lane A: replay-safe, no double-debit) AND the debited amount equals the metered cost (Lane B metering: conservation). LTDD-verified end to end."
 
+[features]
+# Durable ack boundary: meter_and_bill_durable() over p333-ltdd's WalStore (native-only).
+wal = ["p333-ltdd/wal", "p333-consensus/wal"]
+
 [dependencies]
 p333-ltdd = { path = "../ltdd" }
 p333-metering = { path = "../metering" }
 p333-consensus = { path = "../consensus" }
+
+[dev-dependencies]
+tempfile = "3"
