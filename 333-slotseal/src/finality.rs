@@ -1,5 +1,38 @@
-//! # EffectCert client-finality — closing the withholding fork (the load-bearing joint).
+//! # EffectCert client-finality predicate (applied-at-quorum, Sui-Lutris effect-cert).
 //!
+//! ## ⚠️ 5-lens Naesengmoon: "closes the withholding fork" headline RETRACTED (2026-07-21, BLOCKED 5/5 FATAL)
+//!
+//! A closing 5-lens pass BLOCKED the claim that this brick PROVES the withholding
+//! fork closed. Accepted. The **design is sound** (migrating finality from
+//! cert-ASSEMBLED to APPLIED-AT-QUORUM is the correct fix, credited by all lenses),
+//! but the earlier proof was **VACUOUS, not unsound**:
+//! * TAUTOLOGY: the withholding test hand-supplied the attestation set `{a0}` and
+//!   observed `is_final = false` — which holds because `1 < quorum`, a fact about the
+//!   integer 1, identical under any adversary or none. The load-bearing lemma (honest
+//!   `a2,a3` never received `a0`'s completing vote, so they could not apply and thus
+//!   cannot attest, confining the equivocator to `<= f < quorum` attestations) was
+//!   argued in prose, never DERIVED in code.
+//! * ATTESTATION != APPLICATION: [`EffectAttestation::is_valid`] checks only a
+//!   signature; nothing binds it to an actual `confirm()`/apply, and attestation
+//!   production is NOT wired into `transfer333::authority::confirm()`. That absent
+//!   wire is the exact half in which the proof would live.
+//! * The `n=7` "n-f vs 2f+1" test was mis-designed: `n=7=3f+1` gives `n-f == 2f+1 == 5`,
+//!   so it could not witness the distinction its name asserts (fixed below to `n=5`).
+//!
+//! **Honest claim now:** these tests establish the EffectCert PREDICATE
+//! ([`is_final_effectcert`] requires a quorum of distinct valid apply-attestations; a
+//! bare `Certificate` is provisional), plus an **apply-gated MODEL** (an authority
+//! attests only an order it could actually confirm, so the withholding set is DERIVED
+//! not hand-picked), plus the quorum hard core at `n != 3f+1` and cross-committee
+//! rejection. They do **NOT** prove the system closes the fork: that requires wiring
+//! **attest-iff-applied into `transfer333::authority::confirm()`** (the production
+//! integration, the remaining load-bearing work) and a griefing/liveness argument (a
+//! single within-`f` equivocator that withholds converts the fork into a permanent
+//! honest STALL = finality-DoS on the target slot, resolved only by the agreement/
+//! recovery leg — a separate milestone). KG:
+//! `ac-333coin-effectcert-brick-is-predicate-not-wired-system-proof-2026-07-21`.
+//!
+//! Original design context (kept): the recovery client-safety is inseparable from
 //! The 5-lens re-verification showed the recovery's client-safety is INSEPARABLE
 //! from the client finality predicate: under the shipped `cert-exists` rule (a bare
 //! verifying `transfer333::Certificate` = final, FastPay Lemma A.1), a within-`f`
@@ -241,44 +274,71 @@ mod tests {
         }
     }
 
-    // ⭐ THE BRICK — EffectCert converts the withholding client-fork into a safe stall.
-    // Byzantine a0 shows order_a to honest but UNICASTS order_b only to the client, who
-    // assembles cert_b = {a1,a2,a0}. Under cert-exists the client finalizes order_b
-    // (UNSAFE — no honest node applied it). Under EffectCert the client needs a quorum
-    // of apply-attestations; only a0 (which holds the cert) can attest -> 1 < quorum 3
-    // -> NOT final. The premature finalization is withheld: no client-visible fork.
+    // An authority attests order X only if it could actually CONFIRM/apply X — i.e. it
+    // holds a valid quorum certificate for X from its OWN evidence. Models the
+    // attest-iff-applied binding (the confirm()->attest wire; not yet wired into
+    // transfer333::authority::confirm(), disclosed in the module header), so the
+    // attestation set is DERIVED from what each node holds, not hand-picked.
+    fn attest_if_can_confirm(
+        idx: u8,
+        own_votes: &[Vote],
+        order: &SignedTransfer,
+        committee: &Committee,
+    ) -> Option<EffectAttestation> {
+        Certificate::assemble(order.clone(), own_votes.to_vec(), committee)?;
+        Some(attest(
+            idx,
+            committee,
+            &order.transfer.from,
+            order.transfer.from_seq,
+            order.order_id(),
+        ))
+    }
+
+    // EffectCert vs cert-exists under withholding — the attestation set is DERIVED
+    // (attest-iff-can-confirm), NOT hand-picked, and the predicate FLIPS with the
+    // adversary's choice (the adversary's dilemma), so this is not the earlier
+    // tautology. a0 equivocates and WITHHOLDS its order_b vote to itself/a client.
     #[test]
-    fn effectcert_withholds_finality_that_cert_exists_would_prematurely_grant() {
+    fn effectcert_withholds_derived_finality_but_delivery_grants_it() {
         let (committee, mut auth, p) = setup(4);
         assert_eq!(committee.quorum(), 3);
         let order_a = order(&p, "alice", 0, "bob", 10);
         let order_b = order(&p, "alice", 0, "carol", 10);
-        let _va1 = auth[1].handle(&order_a).unwrap(); // honest a1 -> a (its lock)
+        let _va1 = auth[1].handle(&order_a).unwrap(); // a1 locked order_a
         let vb2 = auth[2].handle(&order_b).unwrap(); // honest a2 -> b
-        // a1 also legitimately votes b? No: a1 locked a. The honest b-voters are a2, a3.
         let vb3 = auth[3].handle(&order_b).unwrap(); // honest a3 -> b
-        let vb0 = forge_vote(0, &committee, &order_b); // equivocator a0's WITHHELD b-vote
-        // cert_b is assembled AT THE CLIENT from the withheld equivocation vote:
-        let cert_b = Certificate::assemble(order_b.clone(), vec![vb0, vb2, vb3], &committee)
-            .expect("client assembles cert_b from a0(withheld)+a2+a3");
-
-        // OLD predicate: cert-exists says FINAL (the unsafe over-finalization).
-        assert!(
-            is_final_cert_exists(&cert_b, &committee),
-            "cert-exists prematurely finalizes the client's assembled-but-unapplied cert"
-        );
-
-        // NEW predicate: only authorities that APPLIED order_b can attest. Honest a2,a3
-        // voted b but never received a0's completing vote, so they could not assemble
-        // /apply cert_b -> they do NOT attest. Only the equivocator a0 (which holds the
-        // cert) attests -> 1 attestation.
+        let vb0 = forge_vote(0, &committee, &order_b); // equivocator a0's b-vote
         let oid_b = order_b.order_id();
-        let attestations = vec![attest(0, &committee, "alice", 0, oid_b)];
+
+        // WITHHOLDING: honest a2,a3 hold only {a2_b, a3_b} = 2 < quorum -> cannot confirm
+        // cert_b -> DERIVED: no attestation. Only a0 (holding the cert) can attest.
+        let a2 = attest_if_can_confirm(2, &[vb2.clone(), vb3.clone()], &order_b, &committee);
+        let a3 = attest_if_can_confirm(3, &[vb3.clone(), vb2.clone()], &order_b, &committee);
+        let a0 = attest_if_can_confirm(0, &[vb0.clone(), vb2.clone(), vb3.clone()], &order_b, &committee);
+        assert!(a2.is_none() && a3.is_none(), "honest cannot attest what they could not confirm");
+        assert!(a0.is_some(), "the equivocator, holding the cert, can attest");
+        let derived: Vec<_> = [a2, a3, a0].into_iter().flatten().collect();
+        assert_eq!(derived.len(), 1, "withholding DERIVES 1 < quorum attestations");
         assert!(
-            !is_final_effectcert("alice", 0, oid_b, &attestations, &committee),
-            "EffectCert withholds finality: 1 attestation < quorum 3 -> not final"
+            !is_final_effectcert("alice", 0, oid_b, &derived, &committee),
+            "withholding -> not final (safe stall)"
         );
-        assert!(EffectCert::assemble("alice", 0, oid_b, &attestations, &committee).is_none());
+        // cert-exists WOULD have prematurely finalized the client's assembled cert:
+        let cert_b =
+            Certificate::assemble(order_b.clone(), vec![vb0.clone(), vb2.clone(), vb3.clone()], &committee)
+                .unwrap();
+        assert!(is_final_cert_exists(&cert_b, &committee));
+
+        // ADVERSARY'S DILEMMA (this is why it is not a tautology): if a0 DELIVERS its
+        // vote instead of withholding, honest a2,a3 CAN confirm cert_b -> DERIVED: they
+        // attest -> quorum -> final. The SAME predicate flips with the adversary choice.
+        let d2 = attest_if_can_confirm(2, &[vb2.clone(), vb3.clone(), vb0.clone()], &order_b, &committee);
+        let d3 = attest_if_can_confirm(3, &[vb3.clone(), vb2.clone(), vb0.clone()], &order_b, &committee);
+        let d0 = attest_if_can_confirm(0, &[vb0.clone(), vb2.clone(), vb3.clone()], &order_b, &committee);
+        let delivered: Vec<_> = [d2, d3, d0].into_iter().flatten().collect();
+        assert_eq!(delivered.len(), 3, "delivery DERIVES a quorum of attestations");
+        assert!(is_final_effectcert("alice", 0, oid_b, &delivered, &committee), "delivery -> final");
     }
 
     // Common case preserved: a genuinely applied order (a quorum of honest authorities
@@ -301,22 +361,43 @@ mod tests {
         );
     }
 
-    // EffectCert requires n-f (not 2f+1) at a NON-canonical committee. n=7,f=2: quorum
-    // = n-f = 5. 3 attestations (= 2f+1, the UNSAFE bound n=4 hides) must NOT finalize;
-    // 5 must. Guards the quorum hard core (C8) on the finality object too.
+    // EffectCert requires n-f (not 2f+1) at a genuinely NON-canonical committee. n=5,
+    // f=1: n-f=4, 2f+1=3 DIFFER (unlike n=7=3f+1 where they coincide — the prior test's
+    // bug). 3 (=2f+1) must NOT finalize; 4 (=n-f) must. Also: EffectCert UNIQUENESS —
+    // even with a double-attesting Byzantine a0, two conflicting orders cannot BOTH
+    // reach n-f (two quorums of 4 in n=5 share >=3, >=2 honest, who each applied only
+    // one order), so no two conflicting EffectCerts -> no finality fork.
     #[test]
-    fn effectcert_needs_n_minus_f_not_2f_plus_1_at_n7() {
-        let (committee, _auth, p) = setup(7);
-        assert_eq!(committee.quorum(), 5); // n-f = 7-2
-        let o = order(&p, "alice", 0, "bob", 10);
-        let oid = o.order_id();
-        let three: Vec<_> = (0..3).map(|i| attest(i, &committee, "alice", 0, oid)).collect();
+    fn effectcert_needs_n_minus_f_not_2f_plus_1_and_is_unique_at_n5() {
+        let (committee, _auth, p) = setup(5);
+        assert_eq!(committee.quorum(), 4); // n-f = 5-1 (2f+1 = 3 would be UNSAFE)
+        let oa = order(&p, "alice", 0, "bob", 10);
+        let ob = order(&p, "alice", 0, "carol", 10);
+        let oid_a = oa.order_id();
+        let oid_b = ob.order_id();
+
+        let three: Vec<_> = (0..3).map(|i| attest(i, &committee, "alice", 0, oid_a)).collect();
         assert!(
-            !is_final_effectcert("alice", 0, oid, &three, &committee),
-            "3 attestations (2f+1) must NOT finalize at n=7; only n-f=5 does"
+            !is_final_effectcert("alice", 0, oid_a, &three, &committee),
+            "3 (=2f+1) must NOT finalize at n=5; only n-f=4 does"
         );
-        let five: Vec<_> = (0..5).map(|i| attest(i, &committee, "alice", 0, oid)).collect();
-        assert!(is_final_effectcert("alice", 0, oid, &five, &committee));
+        let four: Vec<_> = (0..4).map(|i| attest(i, &committee, "alice", 0, oid_a)).collect();
+        assert!(is_final_effectcert("alice", 0, oid_a, &four, &committee));
+
+        // Uniqueness under the adversary's best split: a0 double-attests both orders,
+        // honest split 2/2. Neither reaches n-f=4 -> no two conflicting EffectCerts.
+        let ec_a = vec![
+            attest(0, &committee, "alice", 0, oid_a),
+            attest(1, &committee, "alice", 0, oid_a),
+            attest(2, &committee, "alice", 0, oid_a),
+        ]; // {a0,a1,a2} = 3 < 4
+        let ec_b = vec![
+            attest(0, &committee, "alice", 0, oid_b),
+            attest(3, &committee, "alice", 0, oid_b),
+            attest(4, &committee, "alice", 0, oid_b),
+        ]; // {a0,a3,a4} = 3 < 4
+        assert!(!is_final_effectcert("alice", 0, oid_a, &ec_a, &committee));
+        assert!(!is_final_effectcert("alice", 0, oid_b, &ec_b, &committee));
     }
 
     // Cross-committee / forged attestation is rejected: an attestation whose signature
