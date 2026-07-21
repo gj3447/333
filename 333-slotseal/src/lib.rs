@@ -34,6 +34,8 @@
 //! LakatoTree: `LakatosTree_333_Cryptocurrency_20260721` node
 //! `optionA-single-decree-ba-reframe` (predictions pending MCP restore).
 
+pub mod agreement;
+
 use identity333::NodeId;
 use serde::{Deserialize, Serialize};
 use transfer333::authority::AuthorityId;
@@ -52,7 +54,7 @@ pub use transfer333::authority::quorum;
 /// Keyed to a specific committee so a decree can never be replayed against a
 /// different roster. The decree is *ephemeral*: one instance per
 /// `(committee_id, account, seq)`, torn down at Decide.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SlotSeal {
     /// The account whose `(account, seq)` slot was contested.
     pub account: AccountId,
@@ -68,7 +70,7 @@ pub struct SlotSeal {
 ///
 /// Exactly one of these is decided per slot, making "which happened first" a
 /// single globally-agreed fact instead of a per-node race between universes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SealOutcome {
     /// A competing certificate won: the slot finalizes this order. `order_id` is
     /// the digest of the winning [`transfer333`] order; the client re-finalizes a
