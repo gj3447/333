@@ -1,0 +1,17 @@
+[package]
+name = "p333-relay"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "333 v2 substrate reachability: Circuit-Relay-v2 reservation + relayed connectivity (DCUtR wired). Native-node receipt; browser-wasm reachability is a separate integration milestone."
+
+[dependencies]
+libp2p = { version = "0.56", features = [
+    "tokio", "tcp", "websocket", "dns", "noise", "yamux",
+    "relay", "dcutr", "identify", "ping", "macros",
+] }
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"

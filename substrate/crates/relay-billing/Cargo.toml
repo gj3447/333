@@ -1,0 +1,21 @@
+[package]
+name = "p333-relay-billing"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "333 v2 substrate — meter REAL relayed bytes. A request-response payload is forwarded over an actual Circuit-Relay-v2 connection (via p333-relay), then metered + billed as a credits-as-owned-objects debit (p333-billing). The loopback Transport, but on the real relay."
+
+[dependencies]
+p333-relay = { path = "../relay" }
+p333-metering = { path = "../metering" }
+p333-billing = { path = "../billing" }
+p333-ltdd = { path = "../ltdd" }
+libp2p = { version = "0.56", features = [
+    "tokio", "tcp", "noise", "yamux",
+    "relay", "identify", "ping", "request-response", "cbor", "macros",
+] }
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"

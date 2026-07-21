@@ -1,0 +1,18 @@
+[package]
+name = "p333-wal"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "333 v2 substrate durability: write-ahead log ported as *design-invariant absorption* (not code copy) from etcd server/storage/wal @6006f405. Record format, rolling crc32c chain, torn-tail recovery, and the Save()-returns-means-durable ack boundary — flattened to (seq, payload) records with the raft coupling removed. Native-only (cfg(unix)); excluded from wasm builds by construction."
+
+# Deliberately tiny dependency surface (absorption doc API-14): the WAL must compile fast,
+# stay deterministic, and never drag substrate deps into the durability core.
+#   crc32c — Castagnoli polynomial, same as etcd's rolling record chain (FMT-3).
+# Locking uses std File::try_lock (stable since 1.89) — no flock crate needed; fdatasync
+# goes through std File::sync_data (on apple targets std already issues F_FULLFSYNC —
+# verified against rustc 1.97 std source during absorption, DUR-1 verify).
+[target.'cfg(unix)'.dependencies]
+crc32c = "0.6"
+
+[dev-dependencies]
+tempfile = "3"

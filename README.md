@@ -6,11 +6,22 @@ Lineage: FastPay (Baudet et al., Meta 2020), Zef (2022), Sui Lutris / Mysticeti
 fast path (2024), Linera single-user microchains (2025), and the consensus-number-1
 asset-transfer theorem (Guerraoui et al., PODC 2019).
 
-> Separate from `gj3447/p333` (the delltower-lineage `identity`/`crdt` crates). This
-> repo is the `SERVER/07_PROJECTS/333-*` line — crates named `transfer333`,
+> This repo is the `SERVER/07_PROJECTS/333-*` line — crates named `transfer333`,
 > `crdt333`, `identity333`, … — 30 crates linked by relative path deps (kept as
 > sibling directories; no forced top-level workspace so a WIP crate never blocks
 > the others).
+>
+> **`substrate/` (absorbed 2026-07-21)** — the former `gj3447/p333` repo, the
+> delltower-lineage *honest-333 v2 substrate*: a self-contained Cargo workspace
+> (`p333-*` crates: `identity`/`discovery`/`ltdd`/`metering`/`crdt`/`replay`/
+> `consensus`/`billing`/`relay`/`relay-billing`/`relay-client-wasm`/`wal`), each
+> gated by an LTDD green receipt. Merged here via `git subtree` (full history
+> preserved); `gj3447/p333` is archived and points here. It builds independently
+> (`cd substrate && cargo test --locked`) and its `p333-` names do not collide
+> with the top-level `*333` crates, so the two lineages coexist. The overlapping
+> domains (`consensus`/`crdt`/`identity`) are kept side-by-side by design: the
+> `*333` versions are the broad P2P-OS line, the `p333-*` versions the
+> receipt-driven substrate line.
 
 ## Verified core
 

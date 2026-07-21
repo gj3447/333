@@ -1,0 +1,5 @@
+# wasm32 browser target (p333-relay-client-wasm). Target-scoped: native builds unaffected.
+# The getrandom 0.3 "wasm_js" FEATURE alone is INSUFFICIENT for wasm32-unknown-unknown;
+# the backend cfg is MANDATORY or the build errors (rust-libp2p discussion #6212).
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

@@ -1,0 +1,30 @@
+[package]
+name = "p333-relay-client-wasm"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "333 v2 substrate reachability: the relay CLIENT compiled for the BROWSER target (wasm32-unknown-unknown) over websocket-websys. A browser is dial-only, so it becomes reachable by dialing OUT to a relay and reserving a Circuit-Relay-v2 slot (reservation needs no NAT hole -> independent of DCUtR hole-punch). This crate is the wasm32 COMPILE gate of the browser-reachability frontier."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Arch-agnostic: behaviours + security/mux upgrades. NO tcp/tokio here, so the wasm
+# build cannot inherit a non-wasm transport. default-features=false is load-bearing.
+[dependencies]
+libp2p = { version = "0.56", default-features = false, features = [
+    "ed25519", "macros", "noise", "yamux",
+    "relay", "dcutr", "identify", "ping",
+] }
+anyhow = "1"
+
+# Browser/wasm: transport + executor + the getrandom dual-pin trap (rust-libp2p #6212).
+# Cargo UNIONS features for `libp2p` across target stanzas, so the wasm build gets
+# relay+dcutr+identify+ping+noise+yamux + websocket-websys + wasm-bindgen.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+libp2p = { version = "0.56", features = ["websocket-websys", "wasm-bindgen"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# getrandom DUAL-PIN: 0.3 uses feature "wasm_js"; 0.2 (aliased) uses feature "js".
+# The 0.3 feature ALONE is insufficient -> see .cargo/config.toml getrandom_backend cfg.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
