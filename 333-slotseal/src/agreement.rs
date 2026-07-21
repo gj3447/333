@@ -41,9 +41,51 @@
 //!   mutually exclusive, and at most one Finalize is valid (cert uniqueness), so at
 //!   most one value is decidable ⇒ no fork.
 //!
-//! Scope: safety (no-fork) under a synchronous deterministic harness. Liveness /
-//! view-change / termination under partition is a separate milestone (M4).
-//! KG: `prom16-333-optionA-total-order-leg`.
+//! ## ⚠️ 5-lens Naesengmoon RE-VERIFICATION: headline RETRACTED (2026-07-21, BLOCKED, 2 FATAL)
+//!
+//! A second 5-lens adversarial pass BLOCKED the "SAFETY (no-fork)" **headline** and
+//! the refutation is accepted. The split (honestly):
+//!
+//! **PROVEN, kept:** (1) [`no_cert_can_form`] `votes(C)+f+unvoted < quorum` is
+//! algebraically `|O_C| >= 2f+1` (observers locked to non-`C` orders), a
+//! sound-CONSERVATIVE bound — it over-charges the adversary with `f`, so a `Void`
+//! fires only when NO future/withheld/equivocated vote can reach quorum. It closes
+//! the prior unsafe 2-2 `Void` (`ac-333coin-b2`). **GUARD: keep it exactly; do NOT
+//! "optimize" it back toward `min(f, votes_other)` — that is the b2-unsound form.**
+//! (2) Finalize-XOR-Void mutual exclusivity is airtight. (3) No-fork of the SlotSeal
+//! AGREEMENT decision holds under a SINGLE SHARED synchronous evidence set.
+//!
+//! **REFUTED, this is NOT client-visible safety:** clients finalize off the
+//! **Certificate** object (cert-exists, FastPay Lemma A.1); this harness reasons
+//! about the **SlotSeal** object; **EffectCert (applied-at-quorum-AND-not-sealed) is
+//! UNBUILT.** So "≤1 decidable SlotSeal" can be true while a client forks. Concrete
+//! counterexample (n=4, f=1): a Byzantine `a0` shows its `order_a` vote to all honest
+//! but UNICASTS its `order_b` vote ONLY to a client `C`. `cert_b = {a1,a2,a0}` = 3
+//! verifies → `C` finalizes `order_b` under cert-exists. Yet every honest node's
+//! union has `order_b`=2 → `2+f+0=3` is NOT `< 3` → `Void` correctly REJECTED, and no
+//! honest node holds quorum → **all honest STALL** while `C` finalized: a
+//! client-visible fork the single-leader [`run_single_decree`] cannot even represent
+//! (a cert existing globally but at no honest node). Withholding-to-a-client is
+//! *synchronous* Byzantine directed-send (Dolev-Strong), not a deferred async
+//! phenomenon — so "async deferred" does NOT cover it.
+//!
+//! **Therefore the TRUE, honest claim of this module is:** *no-fork of the SlotSeal
+//! AGREEMENT object under a single shared synchronous evidence set, plus a proven-
+//! sound Byzantine-aware `Void` predicate.* It does **NOT** establish client-visible
+//! safety. Establishing that requires (a) building **EffectCert** and migrating
+//! client finality off cert-exists (a bare `Certificate` is PROVISIONAL until a
+//! decided-SlotSeal attestation) — the load-bearing joint, NOT deferrable; (b) a
+//! MULTI-DECIDER harness where distinct honest nodes hold different unions via
+//! directed Byzantine unicast (incl. to a client); (c) `n != 3f+1` tests (the n=4
+//! suite has `n-f == 2f+1 == 3`, so the quorum hard core is unexercised) + an
+//! in-harness cert-uniqueness proof (duplicate-signer / cross-committee forged certs
+//! rejected). KG: `ac-333coin-harness-nofork-is-agreement-object-not-client-finality-2026-07-21`,
+//! `lesson-333-recovery-client-safety-inseparable-from-effectcert-2026-07-21`.
+//!
+//! Scope (honest): the SlotSeal-agreement-object no-fork + the sound `Void`
+//! predicate, under a synchronous single-shared-evidence harness. Client-visible
+//! safety, EffectCert finality, multi-decider/withholding, liveness, and `n!=3f+1`
+//! are the remaining work. KG: `prom16-333-optionA-total-order-leg`.
 
 use crate::{SealOutcome, SlotSeal};
 use std::collections::{BTreeMap, BTreeSet};
@@ -383,8 +425,11 @@ mod tests {
         }
     }
 
-    // ⭐ SAFETY oracle — an equivocator makes a certificate's existence NODE-DEPENDENT,
-    // yet all honest nodes decide the SAME SlotSeal (no fork). a0 equivocates: signs
+    // AGREEMENT-OBJECT no-fork (NOT client-visible safety — see the module
+    // RETRACTION: a client finalizing off cert-exists can still fork; that needs
+    // EffectCert). Under a SINGLE SHARED synchronous evidence set (the leader
+    // broadcasts the cert), an equivocator makes a certificate's existence
+    // NODE-DEPENDENT, yet all honest nodes decide the SAME SlotSeal. a0 equivocates: signs
     // BOTH order_a and order_b for slot (alice,0). Honest a1->a, a2->b, a3->b. cert_b
     // = {a0_b, a2, a3} is formable; cert_a = {a0_a, a1} = 2 < quorum is not. Nodes have
     // DIFFERENT local evidence (some hold a0_b, some hold a0_a). The leader (holding
