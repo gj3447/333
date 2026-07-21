@@ -13,3 +13,9 @@ description = "333 coin recovery — single-decree-per-slot SlotSeal decree type
 transfer333 = { path = "../333-transfer" }
 identity333 = { path = "../333-identity" }
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Only for the safety harness: forge a Byzantine equivocator's votes (an authority
+# that double-signs two orders for one slot — impossible via the honest handle()
+# lock-on-first-seen). Version pinned to transfer333's so the key/sig types unify.
+ed25519-dalek = "2"
