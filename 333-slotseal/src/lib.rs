@@ -35,6 +35,7 @@
 //! `optionA-single-decree-ba-reframe` (predictions pending MCP restore).
 
 pub mod agreement;
+pub mod finality;
 
 use identity333::NodeId;
 use serde::{Deserialize, Serialize};
