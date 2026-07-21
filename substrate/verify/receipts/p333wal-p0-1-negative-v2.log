@@ -1,0 +1,51 @@
+   Compiling p333-wal v0.0.0 (/opt/src/p333/crates/wal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running tests/durability.rs (target/debug/deps/durability-7d86da9d74e48ee1)
+
+running 14 tests
+test crash_child_body ... ignored
+
+running 1 test
+test metadata_conflict_detected ... ok
+test midstream_kind_corruption_is_fatal ... ok
+test oversized_append_rejected_wal_still_usable ... ok
+test foreign_files_in_dir_are_ignored ... ok
+test corrupt_synced_record_is_fatal ... FAILED
+test append_continues_after_reopen ... ok
+test single_writer_flock ... ok
+test crash_receipt_synced_prefix_survives ... ok
+test zero_sector_tail_is_torn_not_fatal ... ok
+test zeroed_tail_record_extent_repairs_to_prefix ... FAILED
+test zeros_in_later_record_do_not_mask_corruption ... FAILED
+test roundtrip_across_segments ... ok
+test torn_tail_truncation_at_every_offset ... ok
+
+failures:
+
+---- corrupt_synced_record_is_fatal stdout ----
+
+thread 'corrupt_synced_record_is_fatal' (32055) panicked at crates/wal/tests/durability.rs:349:18:
+corruption inside the synced region must be fatal, got Ok(2)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- zeroed_tail_record_extent_repairs_to_prefix stdout ----
+
+thread 'zeroed_tail_record_extent_repairs_to_prefix' (32067) panicked at crates/wal/tests/durability.rs:300:5:
+assertion `left == right` failed: zeroed tail record must truncate away
+  left: 2
+ right: 1
+
+---- zeros_in_later_record_do_not_mask_corruption stdout ----
+
+thread 'zeros_in_later_record_do_not_mask_corruption' (32068) panicked at crates/wal/tests/durability.rs:265:18:
+corruption before a zero-heavy record must stay fatal, got Ok(2)
+
+
+failures:
+    corrupt_synced_record_is_fatal
+    zeroed_tail_record_extent_repairs_to_prefix
+    zeros_in_later_record_do_not_mask_corruption
+
+test result: FAILED. 10 passed; 3 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+error: test failed, to rerun pass `-p p333-wal --test durability`

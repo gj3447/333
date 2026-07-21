@@ -1,0 +1,13 @@
+[package]
+name = "p333-metering"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "333 v2 substrate relay metering -> credit-bucket, LTDD-verified: assert (read back from the store) that metered bytes were ACTUALLY debited and the bucket gates when empty. Conservation invariant catches a free-riding relay."
+
+[dependencies]
+# The verification primitive: structured-event emission + store + 3-valued arrival verdict.
+p333-ltdd = { path = "../ltdd" }
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,21 @@
+# Relay-metering session, read back from the store. An external `ooptdd` gate asserts the billing
+# actually happened — not the relay's "forwarded ok". Provenance: these events are emitted by
+# `crates/metering` (the Circuit-Relay-v2 transport itself emits none), so `service: p333.metering`.
+# Load-bearing: the conservation invariant (every metered cost was actually debited) AND the
+# count-correspondence (every forward debited exactly once) — a free-riding or double-debiting
+# relay breaks one of them.
+cid_env: OOPTDD_CID
+service: p333.metering
+expect:
+  - {event: relay_forwarded, op: ">=", count: 1}
+  - {event: credit_debited,  op: ">=", count: 1}
+  - invariant:
+      left:  {reduce: sum, field: cost,   event: relay_forwarded}
+      right: {reduce: sum, field: amount, event: credit_debited}
+      op: "=="
+      tol: 0.0
+  - invariant:  # every forward was debited exactly once (no free-riding, no ghost debit)
+      left:  {reduce: count, event: relay_forwarded}
+      right: {reduce: count, event: credit_debited}
+      op: "=="
+      tol: 0.0
