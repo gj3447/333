@@ -8,14 +8,43 @@
 //! `contested_slot_outcome_is_delivery_order_dependent_so_seal_needs_total_order`,
 //! gj3447/333 @3436691) into one globally-agreed fact.
 //!
-//! **Scope (M1):** single view, honest-leader safety + external validity +
-//! order-invariance, on an in-memory deterministic permutation harness.
-//! **Out of scope:** liveness / view-change / pacemaker (M4); the Byzantine-aware
-//! `Void` validity precondition (M2 — so a `Void` proposal is *never* externally
-//! valid here and the agreement cannot Void); real async networking.
+//! ## ⚠️ 5-lens Naesengmoon RETRACTION (2026-07-21, `naesengmoon5-m1-order-invariance` BLOCKED, unanimous, SOLID=FATAL)
 //!
-//! KG: `prom16-333-optionA-total-order-leg`. Guard G3 (this is the single-leg
-//! order-invariance step, NOT yet cross-leg cert-uniqueness — that is M3).
+//! An adversarial 5-lens verification **BLOCKED** the original M1 "order-invariance"
+//! safety claim as **VACUOUS**, and the refutation is accepted as correct. The one
+//! structural defect all five lenses converged on: the oracle conditions on the
+//! single object whose *formation* IS the entire locus of order-dependence — the
+//! quorum-certificate — and then proves order-invariance of what remains. Permuting
+//! the intra-set delivery order of a FIXED, complete, shared vote-multiset is just
+//! **commutativity of a threshold count** (`count(votes) >= n-f` is order-independent
+//! by arithmetic), true by construction, NOT a Byzantine-agreement safety property.
+//! The ~0.5 "baseline" was a strawman (a first-vote-wins accumulator nobody ships).
+//!
+//! The TRUE theorem is `(external-validity ∧ cert-uniqueness) ⇒ order-invariance`, so
+//! this milestone **load-bearingly presupposes M2 (Byzantine-aware validity) and M3
+//! (cert-uniqueness)** — it is a corollary sequenced *before* the hard parts, not a
+//! foundation. The real order-dependence is **set-membership** dependence (is a
+//! straggler's / equivocator's vote IN a node's evidence set at decision time),
+//! driven by the async rail (`net.rs` independent per-peer FIFO mailboxes,
+//! `epidemic.rs` Plumtree, NO sequencer) — which this fixed-shared-set harness
+//! structurally cannot touch. A single within-`f` equivocator that double-signs
+//! `order_a` to one honest node and `order_b` to another makes the certificate's
+//! existence node-dependent → the genuine fork this oracle never observes.
+//!
+//! **Therefore the tests below are relabeled as a TALLY-COMMUTATIVITY SMOKE TEST
+//! and an external-validity-of-proposals check — NOT a safety result.** The real
+//! order-invariance oracle requires a two-rail async, no-sequencer harness with a
+//! Byzantine equivocator producing node-dependent evidence sets, plus a
+//! vote-forging capability; that is the genuine M2/M3 safety work.
+//! KG: `ac-333coin-M1-order-invariance-oracle-is-fixed-set-commutativity-2026-07-21`,
+//! `lesson-333-do-not-condition-on-the-cert-whose-formation-is-the-order-dependence-2026-07-21`.
+//!
+//! **Scope (honest):** these are sanity/smoke checks over `transfer333`'s real
+//! `Certificate`/`quorum` types. Out of scope: liveness (M4), Byzantine-aware
+//! `Void` validity (M2), cross-leg cert-uniqueness (M3), async no-sequencer
+//! fidelity, node-dependent evidence, equivocation.
+//!
+//! KG: `prom16-333-optionA-total-order-leg`.
 
 use crate::{SealOutcome, SlotSeal};
 use std::collections::BTreeMap;
@@ -288,18 +317,31 @@ mod tests {
         (committee, auth, p)
     }
 
-    // ⭐ M1 order-invariance oracle. The RED baseline
-    // (contested_slot_outcome_is_delivery_order_dependent) shows the SAME 2-1-1
-    // snapshot resolves to a finalized transfer XOR a terminal lock depending on
-    // the straggler's delivery. Here: route the decision through the single-decree
-    // agreement and assert the decided SlotSeal is IDENTICAL across EVERY delivery
-    // permutation of the underlying votes AND under Byzantine vote noise —
-    // permutation-agreement = 1.0 (vs the order-dependent baseline).
-    // Closes LakatoTree prediction `order-invariance` (contested_slot_outcome
-    // permutation-agreement 0.5 -> 1.0). Guard G2 honoured: permutations + a
-    // Byzantine vote are exercised, not a single happy path.
+    // SMOKE TEST ONLY — tally commutativity, NOT a safety result (see the module
+    // RETRACTION header + `naesengmoon5-m1-order-invariance` BLOCKED). This shows
+    // only that a threshold count over a FIXED, complete, shared valid vote-set is
+    // invariant to intra-set delivery order — true by arithmetic. It does NOT
+    // exercise the real set-membership / equivocation order-dependence (that needs
+    // the async no-sequencer + equivocator harness of M2/M3), and it must NOT be
+    // read as closing any safety property. Kept as a regression guard against a
+    // trivial mutable-accumulator bug + to exercise the quorum hard core at n=5.
     #[test]
-    fn ba_decides_one_order_invariant_seal_across_all_vote_permutations() {
+    fn tally_commutativity_smoke_and_quorum_hardcore_not_a_safety_result() {
+        // Quorum hard core (C8): at a NON-canonical committee n=5 (f=1), the safe
+        // quorum is n-f=4, NOT the unsafe 2f+1=3. Prove a cert needs 4 votes here,
+        // so a latent 2f+1 quorum bug (which n=4's n-f==2f+1==3 hides) is caught.
+        {
+            let (c5, mut a5, p5) = setup(5);
+            assert_eq!(c5.quorum(), 4, "n=5 quorum must be n-f=4, not 2f+1=3");
+            let o = order(&p5, "alice", 0, "bob", 10);
+            let v: Vec<_> = (0..3).map(|i| a5[i].handle(&o).unwrap()).collect();
+            // 3 votes = the UNSAFE 2f+1 — must NOT assemble a certificate at n=5:
+            assert!(
+                Certificate::assemble(o.clone(), v, &c5).is_none(),
+                "3 votes (2f+1) must not certify at n=5; only n-f=4 does"
+            );
+        }
+
         let (committee, mut auth, p) = setup(4);
         assert_eq!(committee.quorum(), 3);
         let order_a = order(&p, "alice", 0, "bob", 10);
@@ -347,8 +389,11 @@ mod tests {
             assert_eq!(decided.outcome, SealOutcome::Finalize { order_id: order_a.order_id() });
             distinct.insert(decided);
         }
-        // ORDER-INVARIANCE: one identical decision across all 6 permutations = 1.0.
-        assert_eq!(distinct.len(), 1, "decided value invariant to delivery order");
+        // Tally commutativity only: the count over a FIXED valid vote-set is the
+        // same across all 6 delivery permutations (true by arithmetic). NOT a
+        // safety/order-invariance result — the real order-dependence is the
+        // set-membership/equivocation race this harness holds constant.
+        assert_eq!(distinct.len(), 1, "fixed-set tally is delivery-order commutative");
     }
 
     // External validity teeth: a Byzantine leader cannot get honest nodes to
