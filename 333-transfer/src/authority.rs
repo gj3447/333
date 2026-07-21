@@ -1074,6 +1074,73 @@ mod tests {
         }
     }
 
+    // KNOWN LIMITATION — equivocation split-vote permanently locks the slot with
+    // no recovery path. This is the #1 code-verified liveness gap for the 333
+    // transferable coin (PROM 16 prom16-333-cryptocurrency-frontier, 2026-07-21).
+    // It is self-inflicted and LIVENESS-ONLY: the lock strands only the
+    // equivocator's own (account, seq) slot; third-party no-double-spend safety
+    // is preserved (no certificate is ever produced). Recovery is non-monotone and
+    // can only come from consensus (Cuttlefish/Stingray FastUnlock routed through
+    // the 333-platform HotStuff engine), NEVER a CRDT/LWW tie-break (CALM). The
+    // GREEN fix (barrier-gated SlotBump) is gated on OQ1 (total-order guarantee)
+    // and an adversarial-interleaving oracle, and is deliberately NOT attempted
+    // here — this test only pins the terminal-lock baseline the fix must move.
+    // LakatoTree: LakatosTree_333_Cryptocurrency_20260721 node `baseline-gap`
+    //   (pred recovery_paths_for_uncertified_contested_lock=0, novel
+    //    grep_hits_unlock_epoch_reconfig_in_transfer333_src=0).
+    #[test]
+    fn KNOWN_LIMITATION_two_two_split_vote_permanently_locks_slot_with_no_recovery() {
+        // n = 4 committee, so quorum = n - f = 4 - 1 = 3.
+        let (committee, mut authorities, policy) = setup(4);
+        assert_eq!(committee.quorum(), 3);
+
+        // Two DISTINCT owner-signed orders equivocate the same (alice, seq 0) slot.
+        let order_a = order(&policy, "alice", 0, "bob", 10);
+        let order_b = order(&policy, "alice", 0, "carol", 10);
+        assert_ne!(order_a, order_b);
+
+        // A 2-2 split: authorities {0,1} lock order_a, authorities {2,3} lock order_b.
+        // Each lock is first-seen for that authority, so every handle() succeeds.
+        assert!(authorities[0].handle(&order_a).is_ok());
+        assert!(authorities[1].handle(&order_a).is_ok());
+        assert!(authorities[2].handle(&order_b).is_ok());
+        assert!(authorities[3].handle(&order_b).is_ok());
+
+        // Neither order can now reach quorum: a locked authority re-votes only for
+        // ITS order and returns Equivocation for the other. Max attainable votes
+        // for either candidate is 2 < 3.
+        let (verified_a, result_a) = certify(&order_a, &mut authorities, &committee);
+        assert!(verified_a.is_none(), "order_a must not certify");
+        assert_eq!(
+            result_a,
+            Certified::Failed { votes: 2, refusals: 2, contested: true },
+        );
+        let (verified_b, result_b) = certify(&order_b, &mut authorities, &committee);
+        assert!(verified_b.is_none(), "order_b must not certify");
+        assert_eq!(
+            result_b,
+            Certified::Failed { votes: 2, refusals: 2, contested: true },
+        );
+
+        // TERMINAL: retrying never recovers. There is no unlock / SlotBump / epoch
+        // reset in the shipped crate, so the slot stays contested forever. This is
+        // the metric the fix must move (recovery rate 0.0 -> 1.0).
+        for _ in 0..5 {
+            let (va, ra) = certify(&order_a, &mut authorities, &committee);
+            let (vb, rb) = certify(&order_b, &mut authorities, &committee);
+            assert!(va.is_none() && vb.is_none());
+            assert!(matches!(ra, Certified::Failed { contested: true, .. }));
+            assert!(matches!(rb, Certified::Failed { contested: true, .. }));
+        }
+
+        // SAFETY IS PRESERVED throughout: because no certificate ever assembled,
+        // neither recipient was ever paid — the equivocation costs the equivocator
+        // liveness on its own slot, never a third-party double-spend.
+        assert_eq!(authorities[0].ledger().balance(&"bob".into()), 0);
+        assert_eq!(authorities[0].ledger().balance(&"carol".into()), 0);
+        assert_eq!(authorities[0].ledger().balance(&"alice".into()), 100);
+    }
+
     #[test]
     fn committee_id_is_sorted_policy_and_roster_bound() {
         let policy = policy();
