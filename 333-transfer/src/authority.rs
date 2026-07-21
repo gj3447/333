@@ -1141,6 +1141,62 @@ mod tests {
         assert_eq!(authorities[0].ledger().balance(&"alice".into()), 100);
     }
 
+    // OQ1 (total-order necessity). The contested-slot outcome is DELIVERY-ORDER
+    // dependent, so any recovery decided from a local no-quorum snapshot races a
+    // straggler vote and is unsafe without a total order over {vote, seal}. This
+    // is the code-grounded REFUTATION of the "owner-signed bump = CN=1, no
+    // consensus needed" hypothesis (a seal-latch design was refuted by adversarial
+    // verification in the prom16-333-cryptocurrency OQ1 cycle, 2026-07-21): a
+    // broadcast-only seal cannot preserve certificate uniqueness, because the SAME
+    // 3-authority snapshot can still resolve to a finalized transfer OR to a
+    // terminal lock, decided only by what a straggler observes next. Preserving
+    // cert-uniqueness therefore needs the consensus (Cuttlefish/Stingray Theorem 2
+    // shared-log) leg, not just Theorem 1 quorum arithmetic.
+    // LakatoTree: LakatosTree_333_Cryptocurrency_20260721 node oq1-total-order-required.
+    #[test]
+    fn contested_slot_outcome_is_delivery_order_dependent_so_seal_needs_total_order() {
+        // Snapshot common to both universes: a0,a1 lock order_a, a2 locks order_b,
+        // a3 has not voted. Votes so far a=2, b=1 — neither at quorum=3. Any
+        // recovery that "seals from this snapshot" must be safe against a3's next
+        // move.
+        let a_to = "bob";
+        let b_to = "carol";
+
+        // Universe 1 — a3 next observes order_a: the slot FINALIZES order_a.
+        let (committee1, mut u1, policy1) = setup(4);
+        let a1o = order(&policy1, "alice", 0, a_to, 10);
+        let b1o = order(&policy1, "alice", 0, b_to, 10);
+        u1[0].handle(&a1o).unwrap();
+        u1[1].handle(&a1o).unwrap();
+        u1[2].handle(&b1o).unwrap();
+        // certify presents order_a to all four: a0,a1 re-vote, a2 equivocates, a3
+        // (open) votes order_a -> 3 distinct votes = quorum -> a real certificate.
+        let (verified1, result1) = certify(&a1o, &mut u1, &committee1);
+        assert!(verified1.is_some(), "with a3 voting order_a the slot finalizes");
+        assert_eq!(result1, Certified::Ok);
+        assert_eq!(u1[0].ledger().balance(&a_to.into()), 10);
+
+        // Universe 2 — a3 next observes order_b (locks it): the slot is TERMINAL.
+        let (committee2, mut u2, policy2) = setup(4);
+        let a2o = order(&policy2, "alice", 0, a_to, 10);
+        let b2o = order(&policy2, "alice", 0, b_to, 10);
+        u2[0].handle(&a2o).unwrap();
+        u2[1].handle(&a2o).unwrap();
+        u2[2].handle(&b2o).unwrap();
+        u2[3].handle(&b2o).unwrap();
+        let (verified2, _r2) = certify(&a2o, &mut u2, &committee2);
+        assert!(verified2.is_none(), "with a3 locking order_b the slot is terminal");
+        assert_eq!(u2[0].ledger().balance(&a_to.into()), 0);
+
+        // Same snapshot (a:2, b:1) -> finalized-transfer XOR terminal-lock, decided
+        // only by a3's future delivery order. A snapshot-computed seal thus races
+        // a3; on transfer333's reliable-broadcast rail (independent FIFO mailboxes,
+        // no sequencer) two honest authorities can observe {seal, late cert} in
+        // opposite orders => two valid certificates at one slot = a cert-uniqueness
+        // break. Recovery needs a TOTAL ORDER (OQ1); owner authorization alone
+        // (CN=1) is insufficient.
+    }
+
     #[test]
     fn committee_id_is_sorted_policy_and_roster_bound() {
         let policy = policy();
