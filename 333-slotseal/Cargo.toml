@@ -1,0 +1,15 @@
+[package]
+name = "slotseal333"
+version = "0.1.0"
+edition = "2021"
+description = "333 coin recovery — single-decree-per-slot SlotSeal decree type + identity bridge + n-f quorum reuse (M0 scaffold, no agreement logic yet). PROM prom16-333-optionA-total-order-leg 2026-07-21."
+
+# fresh-native vehicle: this crate is native and typed over transfer333's own
+# AuthorityId/VerifyingKey + identity333::NodeId. It does NOT depend on
+# 333-platform (triple-three) — the safety pattern (locked_qc/view-change) is
+# ported in later milestones, never imported, so the content-binding P0 and the
+# unsafe 2f+1 quorum of that engine are structurally excluded.
+[dependencies]
+transfer333 = { path = "../333-transfer" }
+identity333 = { path = "../333-identity" }
+serde = { version = "1", features = ["derive"] }
