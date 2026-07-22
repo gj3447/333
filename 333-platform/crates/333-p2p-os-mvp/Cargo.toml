@@ -4,6 +4,7 @@
 name = "p2p-os-mvp"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "333 Phase 4 P2P OS MVP: WNFS + UCAN + Plan9 (3 atoms)"
 
 [dependencies]

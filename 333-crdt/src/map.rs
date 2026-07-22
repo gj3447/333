@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Modified from Garage src/util/crdt/map.rs (GNU AGPLv3) for 333 in 2026:
+// reduced API, deterministic two-pointer merge, and local tests.
+// See ../NOTICE and ../../THIRD_PARTY_NOTICES.md.
 // KG: TASK_ATOM_L5_GP_Map, CONTRACT_ATOM_L5_GP_Map
 // Composite CRDT Map: key → V where V is itself a CRDT. Per-key recursive merge.
 // Ported from garage::util::crdt::map.

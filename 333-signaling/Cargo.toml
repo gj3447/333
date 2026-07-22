@@ -2,7 +2,7 @@
 name = "signaling333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS L12+ Signaling Mesh — WebRTC offer/answer/ice topic management, GossipSub v1.1-style peer scoring, signed envelopes. Composes gossip333 + identity333."
 
 # KG: SPAN_333_L12plus_Signaling, plan-333-p2p-os-synthesis-execution-2026-04-18, queue-p9-signaling-mesh-2026-04-18, seed-333-gossipsub-control-plane-2026-04-17

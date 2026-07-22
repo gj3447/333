@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Modified from Garage src/util/crdt/bool.rs and deletable.rs (GNU AGPLv3)
+// for 333 in 2026. See ../NOTICE and ../../THIRD_PARTY_NOTICES.md.
 // KG: TASK_ATOM_L5_GP_ScalarCrdt, CONTRACT_ATOM_L5_GP_ScalarCrdt
 // Simple scalar CRDTs: Bool (absorbing true) + Deletable<T> (tombstone)
 

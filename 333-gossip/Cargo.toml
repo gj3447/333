@@ -2,7 +2,7 @@
 name = "gossip333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS L12 Gossip — Plumtree epidemic broadcaster (eager/lazy peer split, IHAVE/PRUNE, duplicate detection)."
 
 # KG: SPAN_333_L12_Gossip, plan-333-p2p-os-synthesis-execution-2026-04-18

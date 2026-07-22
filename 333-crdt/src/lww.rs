@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Modified from Garage src/util/crdt/{lww,lww_map}.rs (GNU AGPLv3) for 333
+// in 2026: explicit timestamps, reduced API, deterministic merge, and tests.
+// See ../NOTICE and ../../THIRD_PARTY_NOTICES.md.
 // KG: TASK_ATOM_L5_GP_Lww_Family, CONTRACT_ATOM_L5_GP_Lww_Family
 // Last-Writer-Wins register + LwwMap. Ported from garage::util::crdt::{lww,lww_map}.
 // Timestamps are user-provided (clock injection for testability). Tie-break via inner CRDT merge.

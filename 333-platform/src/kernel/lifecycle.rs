@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// 333 modification notice (2026): Rust state-machine adaptation of Puter's
+// BaseService lifecycle pattern. See ../../../THIRD_PARTY_NOTICES.md.
 // KG: puter-tpa-P5-lifecycle-2026-04-16, SPAN_333_Kernel
 // P5: BaseService lifecycle state machine — ported from Puter TemplateMethod(0.88) pattern
 // Valid transitions: Created→Starting, Starting→Running, Starting→Failed,

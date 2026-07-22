@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// 333 modification notice (2026): typed Rust event-channel adaptation of the
+// Puter observer/pub-sub pattern. See ../../../THIRD_PARTY_NOTICES.md.
 // KG: puter-tpa-P7-event-pubsub-2026-04-16, SPAN_333_Kernel
 // P7: Typed event channels — Puter Observer(0.90) pattern ported to Rust
 // Type-safe pub/sub without tokio (WASM-compatible).

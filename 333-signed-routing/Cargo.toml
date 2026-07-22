@@ -2,7 +2,7 @@
 name = "signed_routing333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS: signed peer records over Kademlia DHT (identity333 × kademlia333 glue)"
 
 # KG: SPAN_333_L0_L2_SignedRouting, plan-333-three-way-hybrid-2026-04-17

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Modified from Garage src/util/crdt/crdt.rs (GNU AGPLv3) for 333 in 2026:
+// reduced trait surface, changed primitive/Option behavior, and added tests.
+// See ../NOTICE and ../../THIRD_PARTY_NOTICES.md.
 // KG: TASK_ATOM_L5_GP_TraitContracts, CONTRACT_ATOM_L5_GP_TraitContracts
 // Foundation CRDT traits (Crdt + AutoCrdt) ported from garage::util::crdt::crdt
 //

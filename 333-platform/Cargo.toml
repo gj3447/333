@@ -14,6 +14,7 @@ resolver = "2"
 name = "triple-three"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "333 Platform — P2P state sync with HLC, LWW-Map, and CRDT"
 
 [lib]

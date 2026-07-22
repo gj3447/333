@@ -2,6 +2,7 @@
 name = "triple-three-ggrs-adapter"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "GGRS rollback-netcode adapter for 333 Platform — spike crate"
 # KG: seed-ggrs-bft-adapter-eval-2026-04-15
 

@@ -82,3 +82,25 @@ cd 333-transfer && cargo test
 
 Other crates are as-recovered; their build state is not exhaustively verified here —
 `transfer333` + `crdt333` are the verified-green core.
+
+## License and source availability
+
+Copyright (C) 2026 Gyeongjun Ra (라경준) and contributors.
+
+333 is free software distributed under the **GNU Affero General Public License
+version 3 only** (`AGPL-3.0-only`). See [`LICENSE`](LICENSE) for the complete
+terms. In particular, operators who modify the program and make it available
+for users to interact with over a network must provide those users the
+Corresponding Source as required by section 13 of the AGPL.
+
+The public Git repository is the source-availability location for the revision
+it identifies. A deployment should expose a stable link to the exact deployed
+revision or an equivalent complete Corresponding Source archive; a link to a
+different or newer revision is not a substitute.
+
+This repository contains modified/adapted AGPL work and also documents
+non-code research lineage. Garage CRDT provenance, Puter kernel provenance,
+modification notices, and the distinction between derived source and design
+references are recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
+and [`333-crdt/NOTICE`](333-crdt/NOTICE). Package dependencies retain their own
+licenses.

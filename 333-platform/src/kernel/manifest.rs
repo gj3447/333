@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// 333 modification notice (2026): Rust manifest/version-negotiation design
+// adapted from Puter TPA analysis. See ../../../THIRD_PARTY_NOTICES.md.
 // KG: puter-tpa-P2-manifest-2026-04-16, puter-tpa-P10-semver-2026-04-16
 // P2: Extension manifest hot-load — each WASM extension declares its manifest
 // P10: SemVer runtime module export — manifest carries version, compat range

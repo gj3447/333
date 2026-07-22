@@ -2,5 +2,5 @@
 name = "plugin333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS L8 Plugin — Strategy+Registry pattern (Kubo Plugin inspired)"

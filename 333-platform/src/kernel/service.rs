@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// 333 modification notice (2026): Rust service-registry/microkernel pattern
+// adapted from Puter TPA analysis. See ../../../THIRD_PARTY_NOTICES.md.
 // KG: puter-tpa-P1-service-registry-2026-04-16, SPAN_333_Kernel
 // P1: ServiceRegistry<S> sealed trait — Puter Microkernel pattern (confidence 0.92)
 // Sealed: external code cannot implement Service without going through register().

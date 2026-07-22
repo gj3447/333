@@ -2,7 +2,7 @@
 name = "signed_state333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS integration demo: signed LWW ops combining crdt333 + identity333"
 
 # KG: SPAN_333_L5_L0_SignedCRDT_Integration, work-buffer-2026-04-18-scw-identity-shipped

@@ -2,6 +2,7 @@
 name = "slotseal333"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "333 coin recovery — single-decree-per-slot SlotSeal decree type + identity bridge + n-f quorum reuse (M0 scaffold, no agreement logic yet). PROM prom16-333-optionA-total-order-leg 2026-07-21."
 
 # fresh-native vehicle: this crate is native and typed over transfer333's own

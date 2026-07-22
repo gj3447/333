@@ -2,7 +2,7 @@
 name = "hypervisor333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS L10 Hypervisor — trait layer (VmManager/Instance/Snapshot/QuotaEnforcer) + in-memory impl for deterministic testing. Wasmtime/Hyperlight backend is out of scope for this crate; implement Backend trait in downstream crate."
 
 # KG: SPAN_333_L10_Hypervisor, plan-333-p2p-os-synthesis-execution-2026-04-18

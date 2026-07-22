@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// 333 modification notice (2026): Rust/WASM adaptation based on TPA design
+// analysis of Puter (AGPL-3.0-only). See ../../../THIRD_PARTY_NOTICES.md.
 // KG: puter-tpa-P1-service-registry-2026-04-16
 // KG: puter-tpa-P2-manifest-2026-04-16
 // KG: puter-tpa-P3-capability-2026-04-16

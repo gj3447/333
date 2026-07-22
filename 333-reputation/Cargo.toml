@@ -2,7 +2,7 @@
 name = "reputation333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS L12 Reputation — PeerScorer trait + GossipFanout selector (bandwidth/latency/uptime weighted)."
 
 # KG: SPAN_333_L12_Reputation, plan-333-p2p-os-synthesis-execution-2026-04-18

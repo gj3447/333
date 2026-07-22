@@ -2,7 +2,7 @@
 name = "transport333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS L1 Transport — trait + in-memory mesh for deterministic integration testing"
 
 # KG: SPAN_333_L1_Transport

@@ -2,7 +2,7 @@
 name = "stress333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS stress harness — concurrency / throughput / adversarial tests across the full 25-crate stack. Not for production; runs cargo test as integration, cargo run --release for throughput benches."
 
 # KG: SPAN_333_Stress_Harness, queue-stress-hard-2026-04-18

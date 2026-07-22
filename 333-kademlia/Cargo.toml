@@ -2,7 +2,7 @@
 name = "kademlia333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS L2 Routing — Minimal Kademlia DHT (XOR distance + k-bucket) over identity333 NodeId"
 
 # KG: SPAN_333_L2_Kademlia, plan-333-three-way-hybrid-2026-04-17

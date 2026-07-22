@@ -2,6 +2,7 @@
 name = "triple-three-crdt-bench"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "Spike: Loro vs 333 custom CRDT bench — BFT keyring compatibility analysis"
 # KG: seed-rts-conflict-loro-vs-custom-crdt-2026-04-15
 # NOTE: triple-three lib has unconditional wasm-bindgen/web-sys deps (not cfg-gated),

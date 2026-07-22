@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// 333 modification notice (2026): tick-driven Rust worker queue inspired by
+// Puter's worker scheduling pattern. See ../../../THIRD_PARTY_NOTICES.md.
 // KG: puter-tpa-P8-worker-queue-2026-04-16, SPAN_333_Kernel
 // P8: Worker job queue — lightweight async task queue (WASM-compatible, no tokio)
 // Inspired by Puter Worker job scheduling pattern.

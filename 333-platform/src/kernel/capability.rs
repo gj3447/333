@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// 333 modification notice (2026): capability/context design inspired by
+// Puter's actor-auth model. See ../../../THIRD_PARTY_NOTICES.md.
 // KG: puter-tpa-P3-capability-2026-04-16, puter-tpa-P4-context-isolation-2026-04-16
 // P3: Ed25519 capability model — each service gets signed capability tokens
 // P4: Context isolation — capability sets are scoped per service instance

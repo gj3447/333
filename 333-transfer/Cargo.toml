@@ -2,7 +2,7 @@
 name = "transfer333"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-only"
 description = "333 P2P OS — consensusless single-owner asset transfer (FastPay/QAAT/Linera single-user-microchain lineage). Owner-sequenced transfers over reliable causal broadcast; no global consensus for the common case."
 
 # KG: SA_333_Platform, consensus-prom16-333-no-blockchain-2026-07-12,
