@@ -1,0 +1,178 @@
+{
+  "schema_version": "engine-spec/v1",
+  "name": "333-compute-exchange-consent-kernel",
+  "purpose": "Own deterministic consent, lease, assignment, verification, and service-credit settlement admission for contributor compute without ambient authority.",
+  "decision": {
+    "verdict": "engine",
+    "current_consumers": [
+      "ComputeExchange command handler",
+      "event replay and conformance test harness"
+    ],
+    "planned_consumers": [
+      "Metahumotonic browser foreground contributor adapter",
+      "333 sandbox and metering adapter",
+      "agent enrollment API adapter",
+      "service-credit accounting adapter"
+    ],
+    "fit_evidence": [
+      "Consent, revocation, expiry, resource admission, independent verification, and settlement ordering are stable shared safety semantics across all adapters.",
+      "Idempotency identity and one authoritative aggregate are required so retries cannot start a second sandbox or post credits twice.",
+      "Clock, sandbox, capability signature, persistence, and accounting implementations must remain replaceable ports around one deterministic kernel."
+    ],
+    "alternatives_considered": [
+      "UI-only consent checks",
+      "A scheduler-specific helper module",
+      "Direct coupling to the existing hypervisor and billing prototypes"
+    ]
+  },
+  "boundary": {
+    "owns": "One contributor-node aggregate containing consent generation, active grant, lease, assignment and attempt, submitted verification evidence, settlement state, and an in-memory idempotency inbox",
+    "mechanism": "Validate versioned commands, emit immutable domain facts, evolve the pure aggregate, and request sandbox or service-credit effects only after their guards pass",
+    "policy_outside": [
+      "SaaS pricing and service-credit rates",
+      "Workload selection and business priority",
+      "Browser presentation and consent copy",
+      "Marketplace matching and contributor reputation"
+    ],
+    "non_goals": [
+      "Installing software or starting work on page access",
+      "Providing P2P transport or discovery",
+      "Executing or verifying workload code inside the reducer",
+      "Claiming payment, token, consensus, or finality"
+    ],
+    "state_authority": "One fenced writer per contributor NodeId and generation; this alpha supplies only an in-memory single-writer reference"
+  },
+  "model": {
+    "resources": [
+      "ResourceGrant",
+      "ResourceLease",
+      "ResourceCaps",
+      "VerifierCapability",
+      "service-credit settlement intent"
+    ],
+    "work_units": [
+      "Assignment",
+      "Attempt",
+      "SubmittedResult",
+      "VerificationRecord",
+      "SettlementPlan"
+    ]
+  },
+  "state_model": {
+    "consent": "Unseen | Active | Revoked | Expired",
+    "lease": "Closed | Active | Stopped",
+    "attempt": "None | Offered | Running | ResultSubmitted | Verified | Failed",
+    "settlement": "None | Prepared | Posted",
+    "semantic_source": "COMPUTE_EXCHANGE_FSM_SPEC.json",
+    "implementation": "src/lib.rs Aggregate, decide, evolve, and ComputeExchange::handle"
+  },
+  "protocol": {
+    "commands": [
+      "GrantConsent",
+      "ObserveTime",
+      "OpenLease",
+      "OfferAssignment",
+      "StartAttempt",
+      "SubmitResult",
+      "VerifyResult",
+      "PrepareSettlement",
+      "RecordSettlementReceipt",
+      "RevokeConsent"
+    ],
+    "events": [
+      "ConsentGranted",
+      "TimeObserved",
+      "LeaseOpened",
+      "AssignmentOffered",
+      "AttemptStarted",
+      "ResultSubmitted",
+      "ResultVerified",
+      "ResultRejected",
+      "SettlementPrepared",
+      "SettlementReceiptRecorded",
+      "ConsentRevoked",
+      "ConsentExpired",
+      "LeaseStopped",
+      "AttemptFailed"
+    ],
+    "effects": [
+      "StartSandbox",
+      "StopSandbox",
+      "PostServiceCredit"
+    ],
+    "versioning": "The Rust alpha and JSON contracts are v1; breaking command, event, snapshot, or fingerprint changes require a new major version and explicit upcaster or migration."
+  },
+  "invariants": [
+    "A URL visit or ObserveTime without an explicit ResourceGrant cannot emit StartSandbox.",
+    "StartSandbox requires Active consent, a matching active ResourceLease, one offered Assignment, the current generation, and resources within every enclosing cap.",
+    "Browser alpha v1 is foreground-only, network-free, GPU-free, duty-cycle at most 50 percent, memory at most 512 MiB, and admits one outstanding assignment.",
+    "Revocation or observed grant expiry emits StopSandbox, stops the lease, fails offered or running work, and rejects new leases, offers, starts, and result submissions.",
+    "The result producer cannot be its verifier, and verifier capability subject, node, attempt, and time scope must match.",
+    "PostServiceCredit is unreachable before ResultVerified, and a receipt is recorded only against the exact prepared settlement.",
+    "The same idempotency key and intent replays its recorded decision without effect redelivery; a different intent under the same key is a conflict."
+  ],
+  "ports": [
+    "ClockObservationPort",
+    "ConsentReceiptStore",
+    "EventJournal",
+    "TransactionalInboxOutbox",
+    "CapabilitySignatureVerifier",
+    "SandboxController",
+    "UsageMeter",
+    "IndependentResultVerifier",
+    "ServiceCreditLedger"
+  ],
+  "runtime": {
+    "ordering": "Commands are serialized by NodeId and generation; accepted event order is the reducer order returned for one command.",
+    "concurrency": "Different NodeId aggregates may progress concurrently, but one aggregate has one writer and one outstanding assignment in v1.",
+    "backpressure": "The alpha admits no internal queue; adapters must bound ingress and reject overload before command handling without weakening consent or cap checks.",
+    "cancellation": "RevokeConsent is immediate and auditable; it emits StopSandbox and blocks new work, while already submitted or verified evidence may complete verification and settlement.",
+    "timeouts": "No ambient clock is read; an external clock adapter records ObserveTime, and expiry occurs only when observed_at is at or beyond the grant deadline."
+  },
+  "durability": {
+    "persistence": "Not implemented in this alpha; production must append accepted events and the effect outbox before acknowledging success.",
+    "atomic_commit": "Not implemented in this alpha; production must atomically commit idempotency claim, expected generation, events, and effect intents.",
+    "recovery": "Not implemented in this alpha; public evolve assumes already accepted facts and does not validate hostile or corrupt replay input. Production must validate schema, order, generation, and integrity, quarantine invalid history, replay versioned events, restore the dedup inbox, and resume only unacknowledged outbox effects under a fenced writer lease.",
+    "effect_idempotency": "EffectId derives from the command idempotency key and effect role; production destinations must also deduplicate and reconcile receipts.",
+    "migration": "Retain original event bytes, upcast at replay boundaries, and require an explicit migration for generation, fingerprint, or state-shape changes."
+  },
+  "failure_model": [
+    "Invalid input, missing consent or lease, terminal consent, scope excess, invalid transitions, unauthorized verification, stale generation, unverified result, and idempotency conflict are typed mutation-free rejections.",
+    "A transient sandbox or ledger port failure is outside the pure reducer and must be reconciled through a durable outbox rather than converted into an accepted domain fact.",
+    "An unknown credit-post outcome must not be blindly retried with a new idempotency identity.",
+    "Corrupt or incompatible persisted state must quarantine the aggregate rather than reconstruct consent or authorization from defaults."
+  ],
+  "observability": {
+    "traces": [
+      "Record NodeId, generation, idempotency fingerprint, command type, accepted events, rejection type, effect id, and causation ids without workload payloads or capability secrets."
+    ],
+    "metrics": [
+      "Consent grants, revocations, expiries, cap rejections, stale generations, idempotency conflicts, sandbox starts and stops, verification rejects, prepared credits, receipt lag, and outbox failures."
+    ],
+    "redaction": "Principal identifiers, capability material, workload/result digests, and external ledger references are protected trace fields and never high-cardinality metric labels."
+  },
+  "security": [
+    "No ambient authority: every privileged verification and effect path requires recorded scope and an exact aggregate match.",
+    "The alpha VerifierCapability is not cryptographically authenticated; a production signature verifier is mandatory before command admission.",
+    "Workload bytes never enter the kernel and must be signed, sandboxed, resource-metered, and denied network capability by the adapter.",
+    "Contributor traffic from one NodeId cannot modify another aggregate or shared pricing decisions."
+  ],
+  "verification": [
+    "Table-test positive and negative command-state pairs, including visit-without-consent, lease/start without prerequisites, every cap, producer-verifier separation, and settlement ordering.",
+    "Replay-test same-key same-intent and same-key different-intent behavior and assert effects are not redispatched by the in-memory reference.",
+    "Conformance-test the Rust reducer against COMPUTE_EXCHANGE_FSM_SPEC.json and its traces.",
+    "Before production, crash-test every cut around inbox, event append, outbox dispatch, sandbox stop, ledger post, and receipt acknowledgement."
+  ],
+  "implementation_slices": [
+    "Completed alpha slice: std-only ResourceGrant through verified result and service-credit receipt with 25 unit tests.",
+    "Next: signed capability adapter and explicit browser foreground worker with hard stop and usage metering.",
+    "Then: transactional event journal and inbox/outbox with crash injection.",
+    "Only after those gates: bounded transport/discovery and a non-commercial contributor pilot."
+  ],
+  "falsifiers": [
+    "If only one UI call path exists and no separate agent, sandbox, verification, or accounting adapter materializes, collapse this into a pure consent module.",
+    "If the platform cannot enforce foreground, network, GPU, memory, duty-cycle, and stop semantics outside the reducer, do not enroll contributors.",
+    "If independent result verification cannot be made economically or technically credible, do not emit service-credit effects.",
+    "If durable dedup plus outbox reconciliation is not implemented, do not claim restart-safe settlement or commercial readiness."
+  ]
+}

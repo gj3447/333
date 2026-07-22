@@ -1,0 +1,12 @@
+[package]
+name = "compute-exchange333"
+version = "0.1.0-alpha.1"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Consent-first deterministic kernel for the 333 browser compute exchange alpha"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

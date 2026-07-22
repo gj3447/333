@@ -1,0 +1,313 @@
+{
+  "schema_version": "fsm-spec/v1",
+  "name": "333-compute-exchange-single-generation",
+  "execution": {
+    "step_interface": "step(configuration, typed_event) -> next_configuration, effect_commands",
+    "event_queue": "External commands and recorded clock observations are FIFO per NodeId and generation; the consent region's accepted STOP coordination event is delivered to the work region before later work admission.",
+    "run_to_completion": "All guards are evaluated from one immutable aggregate snapshot, selected facts are evolved in order, and effects are emitted only after the full command decision is accepted.",
+    "action_order": "Check idempotency and generation, select the transition, evolve facts, then expose outbox effect commands."
+  },
+  "context_schema": {
+    "policy_hash": {"type": "string"},
+    "grant_cap_valid": {"type": "boolean"},
+    "grant_expiry": {"type": "timestamp", "role": "deadline"},
+    "consent_active": {"type": "boolean"},
+    "active_generation": {"type": "non-negative integer"},
+    "lease_active": {"type": "boolean"},
+    "no_outstanding_assignment": {"type": "boolean"},
+    "offered_assignment_id": {"type": "string"},
+    "attempt_running": {"type": "boolean"},
+    "producer_id": {"type": "actor-id"},
+    "submitted_result_digest": {"type": "string"},
+    "result_verified": {"type": "boolean"},
+    "prepared_settlement_id": {"type": "string"}
+  },
+  "event_schemas": {
+    "GRANT_CONSENT": {
+      "type": "object",
+      "required": ["actor", "event_id", "generation"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "generation": {"type": "non-negative integer"}
+      }
+    },
+    "REVOKE_CONSENT": {
+      "type": "object",
+      "required": ["actor", "event_id"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"}
+      }
+    },
+    "TIMEOUT": {
+      "type": "object",
+      "required": ["actor", "event_id", "deadline", "observed_at"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "deadline": {"type": "timestamp", "role": "deadline"},
+        "observed_at": {"type": "timestamp", "role": "observation_time"}
+      }
+    },
+    "OPEN_LEASE": {
+      "type": "object",
+      "required": ["actor", "event_id", "generation"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "generation": {"type": "non-negative integer"}
+      }
+    },
+    "OFFER_ASSIGNMENT": {
+      "type": "object",
+      "required": ["actor", "event_id", "assignment_id"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "assignment_id": {"type": "string"}
+      }
+    },
+    "START_ATTEMPT": {
+      "type": "object",
+      "required": ["actor", "event_id", "assignment_id", "attempt_id"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "assignment_id": {"type": "string"},
+        "attempt_id": {"type": "string"}
+      }
+    },
+    "SUBMIT_RESULT": {
+      "type": "object",
+      "required": ["actor", "event_id", "attempt_id", "result_digest"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "attempt_id": {"type": "string"},
+        "result_digest": {"type": "string"}
+      }
+    },
+    "VERIFY_ACCEPT": {
+      "type": "object",
+      "required": ["actor", "event_id", "attempt_id", "result_digest", "verifier_id"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "attempt_id": {"type": "string"},
+        "result_digest": {"type": "string"},
+        "verifier_id": {"type": "actor-id"}
+      }
+    },
+    "VERIFY_REJECT": {
+      "type": "object",
+      "required": ["actor", "event_id", "attempt_id", "result_digest", "verifier_id"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "attempt_id": {"type": "string"},
+        "result_digest": {"type": "string"},
+        "verifier_id": {"type": "actor-id"}
+      }
+    },
+    "PREPARE_SETTLEMENT": {
+      "type": "object",
+      "required": ["actor", "event_id", "attempt_id", "settlement_id"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "attempt_id": {"type": "string"},
+        "settlement_id": {"type": "string"}
+      }
+    },
+    "RECORD_RECEIPT": {
+      "type": "object",
+      "required": ["actor", "event_id", "settlement_id"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"},
+        "settlement_id": {"type": "string"}
+      }
+    },
+    "STOP": {
+      "type": "object",
+      "required": ["actor", "event_id"],
+      "properties": {
+        "actor": {"type": "actor-id"},
+        "event_id": {"type": "string"}
+      }
+    }
+  },
+  "guards": {
+    "grant_within_policy": {
+      "reads": ["policy_hash", "grant_cap_valid"],
+      "event_reads": ["generation"],
+      "pure": true,
+      "synchronous": true
+    },
+    "expiry_due": {
+      "kind": "deadline",
+      "deadline_context_field": "grant_expiry",
+      "observed_event_field": "observed_at",
+      "reads": ["grant_expiry"],
+      "event_reads": ["observed_at"],
+      "pure": true,
+      "synchronous": true
+    },
+    "lease_within_active_grant": {
+      "reads": ["consent_active", "active_generation"],
+      "event_reads": ["generation"],
+      "pure": true,
+      "synchronous": true
+    },
+    "assignment_admissible": {
+      "reads": ["lease_active", "no_outstanding_assignment"],
+      "event_reads": ["assignment_id"],
+      "pure": true,
+      "synchronous": true
+    },
+    "start_admissible": {
+      "reads": ["consent_active", "lease_active", "offered_assignment_id"],
+      "event_reads": ["assignment_id", "attempt_id"],
+      "pure": true,
+      "synchronous": true
+    },
+    "result_within_attempt_caps": {
+      "reads": ["attempt_running"],
+      "event_reads": ["attempt_id", "result_digest"],
+      "pure": true,
+      "synchronous": true
+    },
+    "independent_verifier_capability": {
+      "reads": ["producer_id", "submitted_result_digest"],
+      "event_reads": ["verifier_id", "result_digest", "attempt_id"],
+      "pure": true,
+      "synchronous": true
+    },
+    "verified_result_matches": {
+      "reads": ["result_verified"],
+      "event_reads": ["attempt_id", "settlement_id"],
+      "pure": true,
+      "synchronous": true
+    },
+    "receipt_matches_prepared_settlement": {
+      "reads": ["prepared_settlement_id"],
+      "event_reads": ["settlement_id"],
+      "pure": true,
+      "synchronous": true
+    }
+  },
+  "effects": {
+    "RecordConsentGranted": {"kind": "command", "payload_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+    "RecordConsentRevoked": {"kind": "command", "payload_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+    "RecordConsentExpired": {"kind": "command", "payload_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+    "RecordLeaseOpened": {"kind": "command", "payload_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+    "RecordAssignment": {"kind": "command", "payload_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+    "StartSandbox": {"kind": "command", "payload_schema": {"type": "object", "required": ["assignment_id", "attempt_id", "event_id"], "properties": {"assignment_id": {"type": "string"}, "attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "StopSandbox": {"kind": "command", "payload_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+    "RecordAttemptFailed": {"kind": "command", "payload_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+    "RecordWorkPreserved": {"kind": "command", "payload_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}}},
+    "RecordResult": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordVerification": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordVerificationRejected": {"kind": "command", "payload_schema": {"type": "object", "required": ["attempt_id", "event_id"], "properties": {"attempt_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "PostServiceCredit": {"kind": "command", "payload_schema": {"type": "object", "required": ["settlement_id", "event_id"], "properties": {"settlement_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "RecordSettlementReceipt": {"kind": "command", "payload_schema": {"type": "object", "required": ["settlement_id", "event_id"], "properties": {"settlement_id": {"type": "string"}, "event_id": {"type": "string"}}}},
+    "AuditInvalidTransition": {"kind": "audit", "payload_schema": {"type": "object", "required": ["state", "event", "actor", "reason", "event_id"], "properties": {"state": {"type": "string"}, "event": {"type": "string"}, "actor": {"type": "actor-id"}, "reason": {"type": "string"}, "event_id": {"type": "string"}}}}
+  },
+  "machines": [
+    {
+      "id": "consent",
+      "initial": "unseen",
+      "states": [
+        {"id": "unseen", "kind": "atomic"},
+        {"id": "active", "kind": "atomic"},
+        {"id": "revoked", "kind": "final"},
+        {"id": "expired", "kind": "final"}
+      ],
+      "events": ["GRANT_CONSENT", "REVOKE_CONSENT", "TIMEOUT"],
+      "invalid_event_policy": {
+        "mode": "reject-and-audit",
+        "guard_false": "reject-and-audit",
+        "state_change": "none",
+        "effect": "AuditInvalidTransition",
+        "effect_binding": {"state": "configuration.state", "event": "event.type", "actor": "event.actor", "reason": "rejection.reason", "event_id": "event.event_id"}
+      },
+      "transitions": [
+        {"id": "grant", "from": "unseen", "event": "GRANT_CONSENT", "to": "active", "guard": "grant_within_policy", "effects": ["RecordConsentGranted"], "effect_bindings": {"RecordConsentGranted": {"event_id": "event.event_id"}}},
+        {"id": "revoke", "from": "active", "event": "REVOKE_CONSENT", "to": "revoked", "effects": ["RecordConsentRevoked", "StopSandbox"], "effect_bindings": {"RecordConsentRevoked": {"event_id": "event.event_id"}, "StopSandbox": {"event_id": "event.event_id"}}},
+        {"id": "expire", "from": "active", "event": "TIMEOUT", "to": "expired", "guard": "expiry_due", "effects": ["RecordConsentExpired", "StopSandbox"], "effect_bindings": {"RecordConsentExpired": {"event_id": "event.event_id"}, "StopSandbox": {"event_id": "event.event_id"}}}
+      ]
+    },
+    {
+      "id": "work",
+      "initial": "closed",
+      "states": [
+        {"id": "closed", "kind": "atomic"},
+        {"id": "leased", "kind": "atomic"},
+        {"id": "offered", "kind": "atomic"},
+        {"id": "running", "kind": "atomic"},
+        {"id": "submitted", "kind": "atomic"},
+        {"id": "submitted_stopped", "kind": "atomic"},
+        {"id": "verified", "kind": "atomic"},
+        {"id": "verified_stopped", "kind": "atomic"},
+        {"id": "prepared", "kind": "atomic"},
+        {"id": "prepared_stopped", "kind": "atomic"},
+        {"id": "posted", "kind": "final"},
+        {"id": "failed", "kind": "final"},
+        {"id": "stopped", "kind": "final"}
+      ],
+      "events": ["OPEN_LEASE", "OFFER_ASSIGNMENT", "START_ATTEMPT", "SUBMIT_RESULT", "VERIFY_ACCEPT", "VERIFY_REJECT", "PREPARE_SETTLEMENT", "RECORD_RECEIPT", "STOP"],
+      "invalid_event_policy": {
+        "mode": "reject-and-audit",
+        "guard_false": "reject-and-audit",
+        "state_change": "none",
+        "effect": "AuditInvalidTransition",
+        "effect_binding": {"state": "configuration.state", "event": "event.type", "actor": "event.actor", "reason": "rejection.reason", "event_id": "event.event_id"}
+      },
+      "transitions": [
+        {"id": "open-lease", "from": "closed", "event": "OPEN_LEASE", "to": "leased", "guard": "lease_within_active_grant", "effects": ["RecordLeaseOpened"], "effect_bindings": {"RecordLeaseOpened": {"event_id": "event.event_id"}}},
+        {"id": "offer", "from": "leased", "event": "OFFER_ASSIGNMENT", "to": "offered", "guard": "assignment_admissible", "effects": ["RecordAssignment"], "effect_bindings": {"RecordAssignment": {"event_id": "event.event_id"}}},
+        {"id": "start", "from": "offered", "event": "START_ATTEMPT", "to": "running", "guard": "start_admissible", "effects": ["StartSandbox"], "effect_bindings": {"StartSandbox": {"assignment_id": "event.assignment_id", "attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "submit", "from": "running", "event": "SUBMIT_RESULT", "to": "submitted", "guard": "result_within_attempt_caps", "effects": ["RecordResult", "StopSandbox"], "effect_bindings": {"RecordResult": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}, "StopSandbox": {"event_id": "event.event_id"}}},
+        {"id": "verify", "from": "submitted", "event": "VERIFY_ACCEPT", "to": "verified", "guard": "independent_verifier_capability", "effects": ["RecordVerification"], "effect_bindings": {"RecordVerification": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "reject-result", "from": "submitted", "event": "VERIFY_REJECT", "to": "failed", "guard": "independent_verifier_capability", "effects": ["RecordVerificationRejected"], "effect_bindings": {"RecordVerificationRejected": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "prepare", "from": "verified", "event": "PREPARE_SETTLEMENT", "to": "prepared", "guard": "verified_result_matches", "effects": ["PostServiceCredit"], "effect_bindings": {"PostServiceCredit": {"settlement_id": "event.settlement_id", "event_id": "event.event_id"}}},
+        {"id": "record-receipt", "from": "prepared", "event": "RECORD_RECEIPT", "to": "posted", "guard": "receipt_matches_prepared_settlement", "effects": ["RecordSettlementReceipt"], "effect_bindings": {"RecordSettlementReceipt": {"settlement_id": "event.settlement_id", "event_id": "event.event_id"}}},
+        {"id": "stop-leased", "from": "leased", "event": "STOP", "to": "stopped", "effects": ["RecordAttemptFailed"], "effect_bindings": {"RecordAttemptFailed": {"event_id": "event.event_id"}}},
+        {"id": "stop-offered", "from": "offered", "event": "STOP", "to": "stopped", "effects": ["RecordAttemptFailed"], "effect_bindings": {"RecordAttemptFailed": {"event_id": "event.event_id"}}},
+        {"id": "stop-running", "from": "running", "event": "STOP", "to": "stopped", "effects": ["RecordAttemptFailed"], "effect_bindings": {"RecordAttemptFailed": {"event_id": "event.event_id"}}},
+        {"id": "stop-submitted", "from": "submitted", "event": "STOP", "to": "submitted_stopped", "effects": ["RecordWorkPreserved"], "effect_bindings": {"RecordWorkPreserved": {"event_id": "event.event_id"}}},
+        {"id": "verify-stopped", "from": "submitted_stopped", "event": "VERIFY_ACCEPT", "to": "verified_stopped", "guard": "independent_verifier_capability", "effects": ["RecordVerification"], "effect_bindings": {"RecordVerification": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "reject-stopped", "from": "submitted_stopped", "event": "VERIFY_REJECT", "to": "failed", "guard": "independent_verifier_capability", "effects": ["RecordVerificationRejected"], "effect_bindings": {"RecordVerificationRejected": {"attempt_id": "event.attempt_id", "event_id": "event.event_id"}}},
+        {"id": "stop-verified", "from": "verified", "event": "STOP", "to": "verified_stopped", "effects": ["RecordWorkPreserved"], "effect_bindings": {"RecordWorkPreserved": {"event_id": "event.event_id"}}},
+        {"id": "prepare-stopped", "from": "verified_stopped", "event": "PREPARE_SETTLEMENT", "to": "prepared_stopped", "guard": "verified_result_matches", "effects": ["PostServiceCredit"], "effect_bindings": {"PostServiceCredit": {"settlement_id": "event.settlement_id", "event_id": "event.event_id"}}},
+        {"id": "stop-prepared", "from": "prepared", "event": "STOP", "to": "prepared_stopped", "effects": ["RecordWorkPreserved"], "effect_bindings": {"RecordWorkPreserved": {"event_id": "event.event_id"}}},
+        {"id": "record-stopped-receipt", "from": "prepared_stopped", "event": "RECORD_RECEIPT", "to": "posted", "guard": "receipt_matches_prepared_settlement", "effects": ["RecordSettlementReceipt"], "effect_bindings": {"RecordSettlementReceipt": {"settlement_id": "event.settlement_id", "event_id": "event.event_id"}}}
+      ]
+    }
+  ],
+  "coordination": {
+    "event_protocol": "An accepted revoke or due expiry terminates the consent region and atomically enqueues one STOP fact for the work region; STOP fails offered/running work but preserves already submitted, verified, or prepared evidence for fair settlement.",
+    "global_invariants": [
+      "StartSandbox is reachable only while consent and lease context are active.",
+      "STOP is processed before any later work-admission command.",
+      "PostServiceCredit is reachable only from verified states, including the stopped-but-preserved branch."
+    ]
+  },
+  "safety_properties": [
+    {"id": "consent-before-start", "statement": "No StartSandbox effect occurs without an explicit active grant and matching lease and assignment.", "verification": "Guard truth tables, abstract traces, and Rust negative tests."},
+    {"id": "caps-never-expand", "statement": "Grant, lease, assignment, and observed result usage form a monotonically narrowing resource-cap chain.", "verification": "Table tests for every cap and assignment-subset regression."},
+    {"id": "independent-verification-before-credit", "statement": "The producer cannot verify its own result, and PostServiceCredit is unreachable until a scoped independent verifier accepts the exact result.", "verification": "Verifier guard boundary traces and Rust settlement-order tests."},
+    {"id": "terminal-consent-stops-new-work", "statement": "Revocation or due expiry issues StopSandbox and prevents later lease, offer, start, or submit transitions for that generation.", "verification": "STOP coordination traces and Rust revoke/expiry tests."}
+  ],
+  "liveness_properties": [
+    {"id": "bounded-stop", "statement": "Active work eventually receives STOP after revocation or a delivered due TIMEOUT observation.", "assumptions": ["The external clock delivers TIMEOUT at or after the grant deadline.", "The outbox dispatcher eventually attempts StopSandbox."], "verification": "Deadline guard traces plus integration test with a controllable sandbox adapter."},
+    {"id": "submitted-work-can-settle", "statement": "A result submitted before STOP can still reach posted settlement after independent verification.", "assumptions": ["A valid verifier verdict and matching accounting receipt are eventually delivered."], "verification": "Stopped-settlement abstract traces and Rust revocation-after-submit test."}
+  ],
+  "trace_fixtures": ["COMPUTE_EXCHANGE_FSM_TRACES.json"],
+  "conformance": {
+    "implementation_step": "Bind each guard and effect name to src/lib.rs decide helpers, typed Rejection variants, Event facts, and Effect intents.",
+    "model_trace_runner": "symposium-chu fsm-design/scripts/run_fsm_traces.py executes COMPUTE_EXCHANGE_FSM_TRACES.json.",
+    "contract_tests": "Run every transition, every guard false branch, and invalid-event policy against this model and the Rust reducer before adapter integration."
+  }
+}

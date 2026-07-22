@@ -1,0 +1,224 @@
+{
+  "cases": [
+    {
+      "id": "consent-revoke",
+      "machine": "consent",
+      "steps": [
+        {"event": "GRANT_CONSENT", "guard_results": {"grant_within_policy": true}, "expected_state": "active", "expected_effects": ["RecordConsentGranted"]},
+        {"event": "REVOKE_CONSENT", "guard_results": {}, "expected_state": "revoked", "expected_effects": ["RecordConsentRevoked", "StopSandbox"]}
+      ]
+    },
+    {
+      "id": "consent-expiry",
+      "machine": "consent",
+      "steps": [
+        {"event": "GRANT_CONSENT", "guard_results": {"grant_within_policy": true}, "expected_state": "active", "expected_effects": ["RecordConsentGranted"]},
+        {"event": "TIMEOUT", "guard_results": {"expiry_due": true}, "expected_state": "expired", "expected_effects": ["RecordConsentExpired", "StopSandbox"]}
+      ]
+    },
+    {
+      "id": "consent-guard-false",
+      "machine": "consent",
+      "steps": [
+        {"event": "GRANT_CONSENT", "guard_results": {"grant_within_policy": false}, "expected_state": "unseen", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "expiry-not-due",
+      "machine": "consent",
+      "steps": [
+        {"event": "GRANT_CONSENT", "guard_results": {"grant_within_policy": true}, "expected_state": "active", "expected_effects": ["RecordConsentGranted"]},
+        {"event": "TIMEOUT", "guard_results": {"expiry_due": false}, "expected_state": "active", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "invalid-revoke-before-consent",
+      "machine": "consent",
+      "steps": [
+        {"event": "REVOKE_CONSENT", "guard_results": {}, "expected_state": "unseen", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "work-happy-path",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "VERIFY_ACCEPT", "guard_results": {"independent_verifier_capability": true}, "expected_state": "verified", "expected_effects": ["RecordVerification"]},
+        {"event": "PREPARE_SETTLEMENT", "guard_results": {"verified_result_matches": true}, "expected_state": "prepared", "expected_effects": ["PostServiceCredit"]},
+        {"event": "RECORD_RECEIPT", "guard_results": {"receipt_matches_prepared_settlement": true}, "expected_state": "posted", "expected_effects": ["RecordSettlementReceipt"]}
+      ]
+    },
+    {
+      "id": "work-verifier-rejects",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "VERIFY_REJECT", "guard_results": {"independent_verifier_capability": true}, "expected_state": "failed", "expected_effects": ["RecordVerificationRejected"]}
+      ]
+    },
+    {
+      "id": "stop-from-leased",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "STOP", "guard_results": {}, "expected_state": "stopped", "expected_effects": ["RecordAttemptFailed"]}
+      ]
+    },
+    {
+      "id": "stop-from-offered",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "STOP", "guard_results": {}, "expected_state": "stopped", "expected_effects": ["RecordAttemptFailed"]}
+      ]
+    },
+    {
+      "id": "stop-from-running",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "STOP", "guard_results": {}, "expected_state": "stopped", "expected_effects": ["RecordAttemptFailed"]}
+      ]
+    },
+    {
+      "id": "submitted-settles-after-stop",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "STOP", "guard_results": {}, "expected_state": "submitted_stopped", "expected_effects": ["RecordWorkPreserved"]},
+        {"event": "VERIFY_ACCEPT", "guard_results": {"independent_verifier_capability": true}, "expected_state": "verified_stopped", "expected_effects": ["RecordVerification"]},
+        {"event": "PREPARE_SETTLEMENT", "guard_results": {"verified_result_matches": true}, "expected_state": "prepared_stopped", "expected_effects": ["PostServiceCredit"]},
+        {"event": "RECORD_RECEIPT", "guard_results": {"receipt_matches_prepared_settlement": true}, "expected_state": "posted", "expected_effects": ["RecordSettlementReceipt"]}
+      ]
+    },
+    {
+      "id": "submitted-rejected-after-stop",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "STOP", "guard_results": {}, "expected_state": "submitted_stopped", "expected_effects": ["RecordWorkPreserved"]},
+        {"event": "VERIFY_REJECT", "guard_results": {"independent_verifier_capability": true}, "expected_state": "failed", "expected_effects": ["RecordVerificationRejected"]}
+      ]
+    },
+    {
+      "id": "verified-settles-after-stop",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "VERIFY_ACCEPT", "guard_results": {"independent_verifier_capability": true}, "expected_state": "verified", "expected_effects": ["RecordVerification"]},
+        {"event": "STOP", "guard_results": {}, "expected_state": "verified_stopped", "expected_effects": ["RecordWorkPreserved"]},
+        {"event": "PREPARE_SETTLEMENT", "guard_results": {"verified_result_matches": true}, "expected_state": "prepared_stopped", "expected_effects": ["PostServiceCredit"]},
+        {"event": "RECORD_RECEIPT", "guard_results": {"receipt_matches_prepared_settlement": true}, "expected_state": "posted", "expected_effects": ["RecordSettlementReceipt"]}
+      ]
+    },
+    {
+      "id": "prepared-settles-after-stop",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "VERIFY_ACCEPT", "guard_results": {"independent_verifier_capability": true}, "expected_state": "verified", "expected_effects": ["RecordVerification"]},
+        {"event": "PREPARE_SETTLEMENT", "guard_results": {"verified_result_matches": true}, "expected_state": "prepared", "expected_effects": ["PostServiceCredit"]},
+        {"event": "STOP", "guard_results": {}, "expected_state": "prepared_stopped", "expected_effects": ["RecordWorkPreserved"]},
+        {"event": "RECORD_RECEIPT", "guard_results": {"receipt_matches_prepared_settlement": true}, "expected_state": "posted", "expected_effects": ["RecordSettlementReceipt"]}
+      ]
+    },
+    {
+      "id": "work-guard-false-open",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": false}, "expected_state": "closed", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "work-guard-false-offer",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": false}, "expected_state": "leased", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "work-guard-false-start",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": false}, "expected_state": "offered", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "work-guard-false-submit",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": false}, "expected_state": "running", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "work-guard-false-verify",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "VERIFY_ACCEPT", "guard_results": {"independent_verifier_capability": false}, "expected_state": "submitted", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "work-guard-false-prepare",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "VERIFY_ACCEPT", "guard_results": {"independent_verifier_capability": true}, "expected_state": "verified", "expected_effects": ["RecordVerification"]},
+        {"event": "PREPARE_SETTLEMENT", "guard_results": {"verified_result_matches": false}, "expected_state": "verified", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "work-guard-false-receipt",
+      "machine": "work",
+      "steps": [
+        {"event": "OPEN_LEASE", "guard_results": {"lease_within_active_grant": true}, "expected_state": "leased", "expected_effects": ["RecordLeaseOpened"]},
+        {"event": "OFFER_ASSIGNMENT", "guard_results": {"assignment_admissible": true}, "expected_state": "offered", "expected_effects": ["RecordAssignment"]},
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "running", "expected_effects": ["StartSandbox"]},
+        {"event": "SUBMIT_RESULT", "guard_results": {"result_within_attempt_caps": true}, "expected_state": "submitted", "expected_effects": ["RecordResult", "StopSandbox"]},
+        {"event": "VERIFY_ACCEPT", "guard_results": {"independent_verifier_capability": true}, "expected_state": "verified", "expected_effects": ["RecordVerification"]},
+        {"event": "PREPARE_SETTLEMENT", "guard_results": {"verified_result_matches": true}, "expected_state": "prepared", "expected_effects": ["PostServiceCredit"]},
+        {"event": "RECORD_RECEIPT", "guard_results": {"receipt_matches_prepared_settlement": false}, "expected_state": "prepared", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    },
+    {
+      "id": "work-invalid-event",
+      "machine": "work",
+      "steps": [
+        {"event": "START_ATTEMPT", "guard_results": {"start_admissible": true}, "expected_state": "closed", "expected_effects": ["AuditInvalidTransition"]}
+      ]
+    }
+  ]
+}
