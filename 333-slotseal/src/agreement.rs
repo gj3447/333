@@ -137,6 +137,7 @@ pub fn no_cert_can_form(
             &v.policy_id,
             &v.network_id,
             &v.transfer,
+            v.round,
         );
         if key.verify_strict(&msg, &v.signature).is_err() {
             continue;
@@ -413,6 +414,7 @@ mod tests {
             &order.policy_id(),
             &order.network_id,
             &order.transfer,
+            order.round,
         );
         let sig = key(idx).sign(&msg);
         Vote {
@@ -421,6 +423,7 @@ mod tests {
             policy_id: order.policy_id(),
             network_id: order.network_id.clone(),
             transfer: order.transfer.clone(),
+            round: order.round,
             signature: sig,
         }
     }

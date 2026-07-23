@@ -17,9 +17,9 @@ use crate::owner::{
 };
 use crate::Transfer;
 
-const DOMAIN_TRANSFER: &[u8] = b"transfer333/wire-signed-order/v2\0";
-const DOMAIN_VOTE: &[u8] = b"transfer333/wire-vote/v2\0";
-const DOMAIN_CERT: &[u8] = b"transfer333/wire-cert/v2\0";
+const DOMAIN_TRANSFER: &[u8] = b"transfer333/wire-signed-order/v3\0";
+const DOMAIN_VOTE: &[u8] = b"transfer333/wire-vote/v3\0";
+const DOMAIN_CERT: &[u8] = b"transfer333/wire-cert/v3\0";
 pub const MAX_CERTIFICATE_VOTES: usize = MAX_COMMITTEE_MEMBERS;
 
 /// Wire tag for [`AuthorityMsg`] over TCP / framed streams.
@@ -66,10 +66,12 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
     put_bytes(buf, s.as_bytes());
 }
 
-/// Unsigned transfer payload without a domain tag.
-fn put_transfer_body(buf: &mut Vec<u8>, t: &Transfer) {
+/// Unsigned transfer payload without a domain tag. The owner re-vote round
+/// follows `from_seq`, matching the signing preimage layout.
+fn put_transfer_body(buf: &mut Vec<u8>, t: &Transfer, round: u64) {
     put_str(buf, &t.from);
     buf.extend_from_slice(&t.from_seq.to_le_bytes());
+    buf.extend_from_slice(&round.to_le_bytes());
     put_str(buf, &t.to);
     buf.extend_from_slice(&t.amount.to_le_bytes());
 }
@@ -77,7 +79,7 @@ fn put_transfer_body(buf: &mut Vec<u8>, t: &Transfer) {
 fn put_signed_transfer_body(buf: &mut Vec<u8>, order: &SignedTransfer) {
     buf.extend_from_slice(order.policy_id().as_bytes());
     put_str(buf, order.network_id.as_str());
-    put_transfer_body(buf, &order.transfer);
+    put_transfer_body(buf, &order.transfer, order.round);
     buf.extend_from_slice(&order.owner_signature().to_bytes());
 }
 
@@ -131,17 +133,21 @@ fn take_str(
         .map_err(|_| WireError::BadUtf8)
 }
 
-fn take_transfer_body(input: &mut &[u8]) -> Result<Transfer, WireError> {
+fn take_transfer_body(input: &mut &[u8]) -> Result<(Transfer, u64), WireError> {
     let from = take_str(input, "transfer.from", MAX_ACCOUNT_ID_BYTES)?;
     let from_seq = take_u64(input)?;
+    let round = take_u64(input)?;
     let to = take_str(input, "transfer.to", MAX_ACCOUNT_ID_BYTES)?;
     let amount = take_u128(input)?;
-    Ok(Transfer {
-        from,
-        from_seq,
-        to,
-        amount,
-    })
+    Ok((
+        Transfer {
+            from,
+            from_seq,
+            to,
+            amount,
+        },
+        round,
+    ))
 }
 
 fn take_network_id(input: &mut &[u8]) -> Result<NetworkId, WireError> {
@@ -170,12 +176,13 @@ fn take_committee_id(input: &mut &[u8]) -> Result<CommitteeId, WireError> {
 fn take_signed_transfer_body(input: &mut &[u8]) -> Result<SignedTransfer, WireError> {
     let policy_id = take_policy_id(input)?;
     let network_id = take_network_id(input)?;
-    let transfer = take_transfer_body(input)?;
+    let (transfer, round) = take_transfer_body(input)?;
     let owner_signature = take_signature(input)?;
-    Ok(SignedTransfer::from_parts(
+    Ok(SignedTransfer::from_parts_at_round(
         network_id,
         policy_id,
         transfer,
+        round,
         owner_signature,
     ))
 }
@@ -199,7 +206,7 @@ fn put_vote_body(buf: &mut Vec<u8>, v: &Vote) {
     buf.extend_from_slice(v.committee_id.as_bytes());
     buf.extend_from_slice(v.policy_id.as_bytes());
     put_str(buf, v.network_id.as_str());
-    put_transfer_body(buf, &v.transfer);
+    put_transfer_body(buf, &v.transfer, v.round);
     buf.extend_from_slice(&v.signature.to_bytes());
 }
 
@@ -208,7 +215,7 @@ fn take_vote_body(input: &mut &[u8]) -> Result<Vote, WireError> {
     let committee_id = take_committee_id(input)?;
     let policy_id = take_policy_id(input)?;
     let network_id = take_network_id(input)?;
-    let transfer = take_transfer_body(input)?;
+    let (transfer, round) = take_transfer_body(input)?;
     let signature = take_signature(input)?;
     Ok(Vote {
         authority,
@@ -216,13 +223,14 @@ fn take_vote_body(input: &mut &[u8]) -> Result<Vote, WireError> {
         policy_id,
         network_id,
         transfer,
+        round,
         signature,
     })
 }
 
 // --- public encode / decode --------------------------------------------------
 
-/// Encode an owner-authenticated order with the fail-closed v2 domain.
+/// Encode an owner-authenticated order with the fail-closed v3 domain.
 pub fn encode_transfer(order: &SignedTransfer) -> Vec<u8> {
     let t = &order.transfer;
     let mut buf = Vec::with_capacity(
@@ -233,7 +241,8 @@ pub fn encode_transfer(order: &SignedTransfer) -> Vec<u8> {
     buf
 }
 
-/// Decode a v2 owner-authenticated order. Unsigned v1 domains fail closed.
+/// Decode a v3 owner-authenticated order. Unsigned v1 and pre-round v2 domains
+/// fail closed.
 pub fn decode_transfer(bytes: &[u8]) -> Result<SignedTransfer, WireError> {
     let mut input = bytes;
     expect_domain(&mut input, DOMAIN_TRANSFER)?;
@@ -523,7 +532,7 @@ mod tests {
     fn unsigned_v1_order_fails_closed() {
         let mut legacy = Vec::new();
         legacy.extend_from_slice(b"transfer333/wire-transfer/v1\0");
-        put_transfer_body(&mut legacy, &tx("alice", 0, "bob", 1));
+        put_transfer_body(&mut legacy, &tx("alice", 0, "bob", 1), 0);
         assert_eq!(decode_transfer(&legacy), Err(WireError::BadDomain));
 
         let mut framed = vec![TAG_ORDER];

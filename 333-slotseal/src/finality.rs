@@ -246,6 +246,7 @@ mod tests {
             &order.policy_id(),
             &order.network_id,
             &order.transfer,
+            order.round,
         );
         Vote {
             authority: id,
@@ -253,6 +254,7 @@ mod tests {
             policy_id: order.policy_id(),
             network_id: order.network_id.clone(),
             transfer: order.transfer.clone(),
+            round: order.round,
             signature: key(idx).sign(&msg),
         }
     }

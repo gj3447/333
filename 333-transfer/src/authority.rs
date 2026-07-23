@@ -20,7 +20,7 @@ use crate::owner::{
 };
 use crate::{AccountId, Ledger, Reject, Transfer};
 
-const AUTHORITY_VOTE_DOMAIN: &[u8] = b"transfer333/authority-vote/v4\0";
+const AUTHORITY_VOTE_DOMAIN: &[u8] = b"transfer333/authority-vote/v5\0";
 const COMMITTEE_ID_DOMAIN: &[u8] = b"transfer333/committee-id/v1\0";
 
 /// Wire and admission bound for one committee. This also bounds certificate
@@ -66,15 +66,16 @@ impl fmt::Display for CommitteeId {
 /// Domain-separated bytes signed by one authority vote.
 ///
 /// Every trust-domain discriminator is covered: authority alias, committee
-/// roster, owner policy, deployment/network, and the complete transfer. No vote
-/// can be transplanted between aliases or domains while retaining a valid
-/// signature.
+/// roster, owner policy, deployment/network, the complete transfer, and the
+/// owner-declared re-vote round. No vote can be transplanted between aliases,
+/// domains, or rounds while retaining a valid signature.
 pub fn authority_signing_message(
     authority: &AuthorityId,
     committee_id: &CommitteeId,
     policy_id: &PolicyId,
     network_id: &NetworkId,
     transfer: &Transfer,
+    round: u64,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(
         144 + network_id.as_str().len() + transfer.from.len() + transfer.to.len(),
@@ -84,7 +85,7 @@ pub fn authority_signing_message(
     message.extend_from_slice(&(authority.len() as u64).to_le_bytes());
     message.extend_from_slice(authority.as_bytes());
     message.extend_from_slice(policy_id.as_bytes());
-    put_network_transfer_body(&mut message, network_id, transfer);
+    put_network_transfer_body(&mut message, network_id, transfer, round);
     message
 }
 
@@ -95,8 +96,9 @@ pub fn signing_message(
     policy_id: &PolicyId,
     network_id: &NetworkId,
     transfer: &Transfer,
+    round: u64,
 ) -> Vec<u8> {
-    authority_signing_message(authority, committee_id, policy_id, network_id, transfer)
+    authority_signing_message(authority, committee_id, policy_id, network_id, transfer, round)
 }
 
 /// Byzantine quorum size for `n` authorities tolerating f = floor((n-1)/3).
@@ -208,6 +210,10 @@ pub struct Vote {
     pub policy_id: PolicyId,
     pub network_id: NetworkId,
     pub transfer: Transfer,
+    /// The order round this vote signs. A vote is valid only for an order at
+    /// the same round, so votes from different rounds can never mix into one
+    /// certificate.
+    pub round: u64,
     pub signature: Signature,
 }
 
@@ -226,6 +232,8 @@ pub enum VoteError {
         got: NetworkId,
     },
     WrongTransfer,
+    /// The vote signs a different round than the order it is presented for.
+    WrongRound { expected: u64, got: u64 },
     UnknownAuthority {
         authority: AuthorityId,
     },
@@ -267,6 +275,12 @@ impl Vote {
         if self.transfer != order.transfer {
             return Err(VoteError::WrongTransfer);
         }
+        if self.round != order.round {
+            return Err(VoteError::WrongRound {
+                expected: order.round,
+                got: self.round,
+            });
+        }
         let key = committee
             .key_of(&self.authority)
             .ok_or_else(|| VoteError::UnknownAuthority {
@@ -279,6 +293,7 @@ impl Vote {
                 &self.policy_id,
                 &self.network_id,
                 &self.transfer,
+                self.round,
             ),
             &self.signature,
         )
@@ -330,8 +345,15 @@ pub enum AuthorityError {
     Poisoned,
 }
 
-fn slot(transfer: &Transfer) -> (AccountId, u64) {
-    (transfer.from.clone(), transfer.from_seq)
+/// Vote-slot identity: one lock per (account, sequence, round). A higher round
+/// is a fresh slot, which is what lets a cooperating owner recover a contested
+/// lower-round slot by re-signing at a bumped round.
+fn slot(order: &SignedTransfer) -> (AccountId, u64, u64) {
+    (
+        order.transfer.from.clone(),
+        order.transfer.from_seq,
+        order.round,
+    )
 }
 
 /// What a journal is claimed by: this authority, this committee, this genesis.
@@ -382,7 +404,7 @@ pub struct Authority {
     policy: TransferPolicy,
     committee_id: CommitteeId,
     ledger: Ledger,
-    locked: HashMap<(AccountId, u64), SignedTransfer>,
+    locked: HashMap<(AccountId, u64, u64), SignedTransfer>,
     confirmed: HashMap<(AccountId, u64), [u8; 32]>,
     journal: Box<dyn Journal>,
     /// Set once a journal append fails. In-memory state is then no longer backed
@@ -487,7 +509,7 @@ impl Authority {
                     me.locked = sn
                         .locked
                         .iter()
-                        .map(|o| (slot(&o.transfer), o.clone()))
+                        .map(|o| (slot(o), o.clone()))
                         .collect();
                     me.confirmed = sn
                         .confirmed
@@ -496,17 +518,21 @@ impl Authority {
                         .collect();
                 }
                 JournalRecord::Locked(order) => {
-                    me.locked.insert(slot(&order.transfer), order.clone());
+                    me.locked.insert(slot(order), order.clone());
                 }
                 JournalRecord::Confirmed(order) => {
-                    let s = slot(&order.transfer);
+                    let account = order.transfer.from.clone();
+                    let seq = order.transfer.from_seq;
                     me.ledger.apply(&order.transfer).map_err(|e| {
                         JournalError::Corrupt(format!(
-                            "replay: confirmed record for {s:?} does not apply: {e:?}"
+                            "replay: confirmed record for ({account}, {seq}) does not apply: {e:?}"
                         ))
                     })?;
-                    me.confirmed.insert(s.clone(), order.order_id());
-                    me.locked.remove(&s);
+                    me.confirmed.insert((account.clone(), seq), order.order_id());
+                    // Confirmation spends the sequence for every round, so all
+                    // round locks for the (account, seq) go.
+                    me.locked
+                        .retain(|(a, s, _), _| !(*a == account && *s == seq));
                 }
             }
         }
@@ -588,12 +614,14 @@ impl Authority {
         let policy_id = order.policy_id();
         let network_id = order.network_id.clone();
         let transfer = order.transfer.clone();
+        let round = order.round;
         let signature = self.signing.sign(&authority_signing_message(
             &self.id,
             &committee_id,
             &policy_id,
             &network_id,
             &transfer,
+            round,
         ));
         Vote {
             authority: self.id.clone(),
@@ -601,13 +629,17 @@ impl Authority {
             policy_id,
             network_id,
             transfer,
+            round,
             signature,
         }
     }
 
     /// Validate and vote using a deterministic guard order:
     ///
-    /// 1. not poisoned; 2. owner proof; 3. pending/idempotence/equivocation;
+    /// 1. not poisoned; 2. owner proof; 3. pending/idempotence/equivocation per
+    /// (account, seq, round) — a higher round is a fresh slot even when a lower
+    /// round is locked on a different order, which is the cooperating owner's
+    /// recovery path from a split vote;
     /// 4. sender exists; 5. amount is positive; 6. complete ledger preflight,
     /// including sequence and balance arithmetic; 7. **make the lock durable**;
     /// 8. install the lock and sign.
@@ -630,7 +662,7 @@ impl Authority {
             .map_err(AuthorityError::OwnerAuth)?;
 
         let transfer = &order.transfer;
-        let pending_slot = slot(transfer);
+        let pending_slot = slot(order);
         match self.locked.get(&pending_slot) {
             Some(previous) if previous == order => return Ok(self.sign(order)),
             Some(_) => {
@@ -756,7 +788,12 @@ impl Authority {
         }
 
         let transfer = verified.transfer();
-        let confirmed_slot = slot(transfer);
+        // Confirmation is scoped to the (account, seq), not to a round: a
+        // certificate formed at any round spends the sequence, and confirmation
+        // checks seq/balance — never this authority's current pending lock — so
+        // a straggler lower-round certificate still confirms after authorities
+        // have voted at higher rounds.
+        let confirmed_slot = (transfer.from.clone(), transfer.from_seq);
         let order_id = verified.order.order_id();
         if let Some(previous) = self.confirmed.get(&confirmed_slot) {
             if previous == &order_id {
@@ -780,7 +817,9 @@ impl Authority {
         self.journal_append(&JournalRecord::Confirmed(verified.order.clone()))
             .map_err(|e| ConfirmError::Journal(e.to_string()))?;
         self.confirmed.insert(confirmed_slot.clone(), order_id);
-        self.locked.remove(&confirmed_slot);
+        // The seq is spent for every round, so all round locks for it go.
+        self.locked
+            .retain(|(account, seq, _), _| !(account == &transfer.from && *seq == transfer.from_seq));
         Ok(ConfirmOutcome::Applied)
     }
 }
@@ -1040,6 +1079,22 @@ mod tests {
         )
     }
 
+    fn order_at_round(
+        policy: &TransferPolicy,
+        from: &str,
+        seq: u64,
+        to: &str,
+        amount: u128,
+        round: u64,
+    ) -> SignedTransfer {
+        SignedTransfer::sign_at_round(
+            policy,
+            transfer(from, seq, to, amount),
+            round,
+            &owner_key(from),
+        )
+    }
+
     fn setup(n: u8) -> (Committee, Vec<Authority>, TransferPolicy) {
         let policy = policy();
         let committee = Committee::new(
@@ -1074,20 +1129,22 @@ mod tests {
         }
     }
 
-    // KNOWN LIMITATION — equivocation split-vote permanently locks the slot with
-    // no recovery path. This is the #1 code-verified liveness gap for the 333
-    // transferable coin (PROM 16 prom16-333-cryptocurrency-frontier, 2026-07-21).
-    // It is self-inflicted and LIVENESS-ONLY: the lock strands only the
-    // equivocator's own (account, seq) slot; third-party no-double-spend safety
-    // is preserved (no certificate is ever produced). Recovery is non-monotone and
-    // can only come from consensus (Cuttlefish/Stingray FastUnlock routed through
-    // the 333-platform HotStuff engine), NEVER a CRDT/LWW tie-break (CALM). The
-    // GREEN fix (barrier-gated SlotBump) is gated on OQ1 (total-order guarantee)
-    // and an adversarial-interleaving oracle, and is deliberately NOT attempted
-    // here — this test only pins the terminal-lock baseline the fix must move.
+    // KNOWN LIMITATION — equivocation split-vote permanently locks the slot for
+    // an UNCOOPERATIVE owner who never re-votes. This remains true by design
+    // (Guerraoui ceiling: consensusless asset transfer cannot force liveness for
+    // an owner that refuses to act). It is self-inflicted and LIVENESS-ONLY: the
+    // lock strands only the equivocator's own (account, seq) slot; third-party
+    // no-double-spend safety is preserved (no certificate is ever produced).
+    // Since the owner re-vote rounds change, a COOPERATING owner now has a
+    // recovery path — re-signing at a bumped round — pinned by
+    // `owner_revote_at_bumped_round_recovers_split_locked_slot`. This oracle
+    // pins what remains: with no re-vote, the slot stays terminal. Consensus
+    // (Cuttlefish/Stingray FastUnlock routed through the 333-platform HotStuff
+    // engine) would be needed for forced recovery WITHOUT owner cooperation,
+    // NEVER a CRDT/LWW tie-break (CALM).
     // LakatoTree: LakatosTree_333_Cryptocurrency_20260721 node `baseline-gap`
-    //   (pred recovery_paths_for_uncertified_contested_lock=0, novel
-    //    grep_hits_unlock_epoch_reconfig_in_transfer333_src=0).
+    //   (pred recovery_paths_for_uncertified_contested_lock=0 for the
+    //    UNCOOPERATIVE owner; cooperating-owner round-bump recovery landed).
     #[test]
     fn KNOWN_LIMITATION_two_two_split_vote_permanently_locks_slot_with_no_recovery() {
         // n = 4 committee, so quorum = n - f = 4 - 1 = 3.
@@ -1122,9 +1179,9 @@ mod tests {
             Certified::Failed { votes: 2, refusals: 2, contested: true },
         );
 
-        // TERMINAL: retrying never recovers. There is no unlock / SlotBump / epoch
-        // reset in the shipped crate, so the slot stays contested forever. This is
-        // the metric the fix must move (recovery rate 0.0 -> 1.0).
+        // TERMINAL for this owner: retrying the same round-0 orders never
+        // recovers. Only an owner re-vote at a bumped round opens a fresh slot,
+        // and this owner never re-votes — so the slot stays contested forever.
         for _ in 0..5 {
             let (va, ra) = certify(&order_a, &mut authorities, &committee);
             let (vb, rb) = certify(&order_b, &mut authorities, &committee);
@@ -1139,6 +1196,187 @@ mod tests {
         assert_eq!(authorities[0].ledger().balance(&"bob".into()), 0);
         assert_eq!(authorities[0].ledger().balance(&"carol".into()), 0);
         assert_eq!(authorities[0].ledger().balance(&"alice".into()), 100);
+    }
+
+    // THE HEADLINE RECEIPT for owner re-vote at a bumped round (Linera-rounds
+    // pattern, consensusless stage-1 recovery): the same 2-2 split that the
+    // KNOWN_LIMITATION oracle proves terminal for an UNCOOPERATIVE owner is
+    // recovered when the owner cooperates — re-signing ONE of the two equivocated
+    // orders at round 1 opens a fresh per-(account, seq, round) vote slot on every
+    // authority, reaches quorum, and confirms. Recovery metric 0.0 -> 1.0 for the
+    // cooperating-owner case; the uncooperative case stays locked by design
+    // (Guerraoui ceiling), pinned by the oracle above.
+    #[test]
+    fn owner_revote_at_bumped_round_recovers_split_locked_slot() {
+        // n = 4 committee, so quorum = n - f = 3.
+        let (committee, mut authorities, policy) = setup(4);
+        assert_eq!(committee.quorum(), 3);
+
+        // The exact KNOWN_LIMITATION scenario: a 2-2 equivocation split at round 0.
+        let order_a = order(&policy, "alice", 0, "bob", 10);
+        let order_b = order(&policy, "alice", 0, "carol", 10);
+        authorities[0].handle(&order_a).unwrap();
+        authorities[1].handle(&order_a).unwrap();
+        authorities[2].handle(&order_b).unwrap();
+        authorities[3].handle(&order_b).unwrap();
+        let (stuck, result) = certify(&order_a, &mut authorities, &committee);
+        assert!(stuck.is_none());
+        assert_eq!(
+            result,
+            Certified::Failed { votes: 2, refusals: 2, contested: true },
+        );
+
+        // The owner cooperates: re-signs ONE of the two orders at round 1. Every
+        // authority treats (alice, 0, 1) as a fresh vote slot even though it is
+        // locked on a different order at (alice, 0, 0), so the re-vote reaches
+        // quorum, certifies, and confirms with correct balances.
+        let retry = order_at_round(&policy, "alice", 0, "bob", 10, 1);
+        assert_ne!(retry, order_a, "the round is part of the order's identity");
+        let (verified, result) = certify(&retry, &mut authorities, &committee);
+        assert_eq!(result, Certified::Ok);
+        assert!(
+            verified.is_some(),
+            "round-1 re-vote must certify despite the round-0 split lock"
+        );
+        for authority in &authorities {
+            assert_eq!(authority.ledger().balance(&"bob".into()), 10);
+            assert_eq!(authority.ledger().balance(&"carol".into()), 0);
+            assert_eq!(authority.ledger().balance(&"alice".into()), 90);
+            assert_eq!(authority.ledger().next_seq(&"alice".into()), 1);
+        }
+    }
+
+    #[test]
+    fn authority_votes_once_per_seq_round() {
+        let (_committee, mut authorities, policy) = setup(4);
+        let order_a = order(&policy, "alice", 0, "bob", 10);
+        let order_b = order(&policy, "alice", 0, "carol", 10);
+        let authority = &mut authorities[0];
+
+        // First-seen at round 0 installs the (alice, 0, 0) lock; the exact same
+        // order re-votes idempotently, and a different order in the SAME round is
+        // equivocation — lock-on-first-seen within a round, exactly as before.
+        let first = authority.handle(&order_a).unwrap();
+        assert_eq!(authority.handle(&order_a).unwrap(), first);
+        assert!(matches!(
+            authority.handle(&order_b),
+            Err(AuthorityError::Equivocation { .. })
+        ));
+
+        // A HIGHER round is a fresh vote slot: the authority MUST accept it even
+        // though it is locked on a different order at round 0 for the same seq.
+        let order_b_r1 = order_at_round(&policy, "alice", 0, "carol", 10, 1);
+        assert!(authority.handle(&order_b_r1).is_ok());
+        // And that fresh slot is then itself locked: another round-1 order for a
+        // different transfer is equivocation again.
+        let order_a_r1 = order_at_round(&policy, "alice", 0, "bob", 10, 1);
+        assert!(matches!(
+            authority.handle(&order_a_r1),
+            Err(AuthorityError::Equivocation { .. })
+        ));
+    }
+
+    // Straggler-cert case: a certificate formed at a LOWER round must remain
+    // confirmable after the authorities have moved to higher rounds. Confirmation
+    // is certificate-driven and checks seq/balance, never the pending lock.
+    #[test]
+    fn lower_round_certificate_confirms_after_round_bump() {
+        let (committee, mut authorities, policy) = setup(4);
+        let order_a = order(&policy, "alice", 0, "bob", 10); // round 0
+        let votes = vec![
+            authorities[0].handle(&order_a).unwrap(),
+            authorities[1].handle(&order_a).unwrap(),
+            authorities[2].handle(&order_a).unwrap(),
+        ];
+        let verified = Certificate::assemble(order_a, votes, &committee)
+            .unwrap()
+            .verify(&committee)
+            .unwrap();
+
+        // Before the round-0 certificate is presented anywhere, every authority
+        // moves on and votes a DIFFERENT order at round 1.
+        let order_b_r1 = order_at_round(&policy, "alice", 0, "carol", 10, 1);
+        let round1_votes: Vec<Vote> = authorities
+            .iter_mut()
+            .map(|authority| authority.handle(&order_b_r1).unwrap())
+            .collect();
+
+        // The straggler round-0 certificate still confirms everywhere.
+        for authority in &mut authorities {
+            assert_eq!(
+                authority.confirm(&verified, &committee),
+                Ok(ConfirmOutcome::Applied)
+            );
+            assert_eq!(authority.ledger().balance(&"bob".into()), 10);
+            assert_eq!(authority.ledger().balance(&"carol".into()), 0);
+            assert_eq!(authority.ledger().next_seq(&"alice".into()), 1);
+        }
+
+        // The round-1 votes DO assemble a certificate (quorum-scoped per round),
+        // but it can never be confirmed now: the seq is spent. This is why two
+        // valid certificates at different rounds for one seq are not a
+        // double-spend — the ledger admits exactly one.
+        let round1_cert = Certificate::assemble(order_b_r1, round1_votes, &committee)
+            .expect("round-1 votes form their own quorum certificate");
+        let round1_verified = round1_cert.verify(&committee).unwrap();
+        assert_eq!(
+            authorities[0].confirm(&round1_verified, &committee),
+            Err(ConfirmError::State(Reject::StaleSequence {
+                expected: 1,
+                got: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn no_cross_round_certificate_assembly() {
+        let (committee, mut authorities, policy) = setup(4);
+        let order_r0 = order(&policy, "alice", 0, "bob", 10);
+        let order_r1 = order_at_round(&policy, "alice", 0, "bob", 10, 1);
+
+        // Same transfer payload at two rounds. Three distinct authorities vote,
+        // but one vote is over the round-1 bytes.
+        let v0a = authorities[0].handle(&order_r0).unwrap();
+        let v0b = authorities[1].handle(&order_r0).unwrap();
+        let v1c = authorities[2].handle(&order_r1).unwrap();
+
+        // A vote is bound to the exact (transfer, round) it signed: the round-1
+        // vote is not a vote for the round-0 order, so the mixed set cannot form
+        // a certificate even with 3 distinct authorities at quorum size.
+        assert!(matches!(
+            v1c.validate_for(&order_r0, &committee),
+            Err(VoteError::WrongRound { expected: 0, got: 1 })
+        ));
+        assert!(Certificate::assemble(order_r0.clone(), vec![v0a, v0b, v1c], &committee).is_none());
+
+        // Each round's votes assemble only with their own order.
+        let v1a = authorities[0].handle(&order_r1).unwrap();
+        let v1b = authorities[1].handle(&order_r1).unwrap();
+        let v1c = authorities[2].handle(&order_r1).unwrap();
+        assert!(Certificate::assemble(order_r1, vec![v1a, v1b, v1c], &committee).is_some());
+    }
+
+    #[test]
+    fn confirmed_seq_rejects_later_round_orders() {
+        let (committee, mut authorities, policy) = setup(4);
+        let order = order(&policy, "alice", 0, "bob", 10);
+        let (verified, result) = certify(&order, &mut authorities, &committee);
+        assert_eq!(result, Certified::Ok);
+        assert!(verified.is_some());
+
+        // Once the certificate is confirmed, next_seq has advanced: NO order for
+        // the old seq is accepted at ANY round, however high.
+        let late = order_at_round(&policy, "alice", 0, "carol", 10, 2);
+        for authority in &mut authorities {
+            assert_eq!(
+                authority.handle(&late),
+                Err(AuthorityError::OutOfOrder {
+                    account: "alice".into(),
+                    expected: 1,
+                    got: 0,
+                })
+            );
+        }
     }
 
     // OQ1 (total-order necessity). The contested-slot outcome is DELIVERY-ORDER
@@ -1672,12 +1910,14 @@ mod tests {
             policy_id: order.policy_id(),
             network_id: order.network_id.clone(),
             transfer: order.transfer.clone(),
+            round: order.round,
             signature: key(99).sign(&authority_signing_message(
                 &"a0".to_owned(),
                 &committee.id(),
                 &order.policy_id(),
                 &order.network_id,
                 &order.transfer,
+                order.round,
             )),
         };
         assert!(matches!(

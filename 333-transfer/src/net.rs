@@ -866,12 +866,14 @@ mod tests {
             policy_id: order.policy_id(),
             network_id: order.network_id.clone(),
             transfer: order.transfer.clone(),
+            round: order.round,
             signature: key(99).sign(&authority_signing_message(
                 &forged_authority,
                 &committee.id(),
                 &order.policy_id(),
                 &order.network_id,
                 &order.transfer,
+                order.round,
             )),
         };
         let valid = authorities[0].handle(&order).unwrap();

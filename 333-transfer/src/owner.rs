@@ -16,9 +16,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{AccountId, Transfer};
 
-const OWNER_INTENT_DOMAIN: &[u8] = b"transfer333/owner-intent/v1\0";
+const OWNER_INTENT_DOMAIN: &[u8] = b"transfer333/owner-intent/v2\0";
 const POLICY_ID_DOMAIN: &[u8] = b"transfer333/owner-policy-id/v1\0";
-const ORDER_ID_DOMAIN: &[u8] = b"transfer333/order-id/v1\0";
+const ORDER_ID_DOMAIN: &[u8] = b"transfer333/order-id/v2\0";
 pub const MAX_NETWORK_ID_BYTES: usize = 128;
 pub const MAX_ACCOUNT_ID_BYTES: usize = 256;
 
@@ -206,7 +206,12 @@ impl TransferPolicy {
         }
         owner_key
             .verify_strict(
-                &owner_signing_message(&order.policy_id, &order.network_id, transfer),
+                &owner_signing_message(
+                    &order.policy_id,
+                    &order.network_id,
+                    transfer,
+                    order.round,
+                ),
                 &order.owner_signature,
             )
             .map_err(|_| OwnerAuthError::InvalidOwnerSignature {
@@ -225,22 +230,45 @@ pub struct SignedTransfer {
     pub network_id: NetworkId,
     policy_id: PolicyId,
     pub transfer: Transfer,
+    /// Owner-declared re-vote round for the (account, seq) slot. Round 0 is the
+    /// initial attempt; an owner that caused a split vote re-signs at a higher
+    /// round to open a fresh authority vote slot for the same seq (Linera-style
+    /// rounds, consensusless stage-1 recovery). The round is inside the signed
+    /// bytes, so it cannot be rewritten without the owner key, and it is part of
+    /// the order's identity: same transfer at a different round is a different
+    /// order.
+    pub round: u64,
     owner_signature: Signature,
 }
 
 impl SignedTransfer {
+    /// Sign an initial (round 0) order. See [`SignedTransfer::sign_at_round`].
     pub fn sign(policy: &TransferPolicy, transfer: Transfer, key: &SigningKey) -> Self {
+        Self::sign_at_round(policy, transfer, 0, key)
+    }
+
+    /// Sign an order at an explicit round. A higher round opens a fresh vote
+    /// slot for the same (account, seq), which is the recovery path from an
+    /// equivocation split vote.
+    pub fn sign_at_round(
+        policy: &TransferPolicy,
+        transfer: Transfer,
+        round: u64,
+        key: &SigningKey,
+    ) -> Self {
         let network_id = policy.network_id().clone();
         let policy_id = policy.id();
         let owner_signature = key.sign(&owner_signing_message(
             &policy_id,
             &network_id,
             &transfer,
+            round,
         ));
         Self {
             network_id,
             policy_id,
             transfer,
+            round,
             owner_signature,
         }
     }
@@ -253,10 +281,22 @@ impl SignedTransfer {
         transfer: Transfer,
         owner_signature: Signature,
     ) -> Self {
+        Self::from_parts_at_round(network_id, policy_id, transfer, 0, owner_signature)
+    }
+
+    /// [`SignedTransfer::from_parts`] at an explicit decoded round.
+    pub fn from_parts_at_round(
+        network_id: NetworkId,
+        policy_id: PolicyId,
+        transfer: Transfer,
+        round: u64,
+        owner_signature: Signature,
+    ) -> Self {
         Self {
             network_id,
             policy_id,
             transfer,
+            round,
             owner_signature,
         }
     }
@@ -277,7 +317,7 @@ impl SignedTransfer {
         hasher.update(ORDER_ID_DOMAIN);
         hasher.update(self.policy_id.as_bytes());
         let mut body = Vec::new();
-        put_network_transfer_body(&mut body, &self.network_id, &self.transfer);
+        put_network_transfer_body(&mut body, &self.network_id, &self.transfer, self.round);
         hasher.update(&body);
         hasher.update(self.owner_signature.to_bytes());
         hasher.finalize().into()
@@ -319,14 +359,18 @@ fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Canonical network + transfer bytes shared by owner and authority domains.
+/// The round follows `from_seq` so the owner re-vote round is inside every
+/// signature preimage that covers the transfer.
 pub(crate) fn put_network_transfer_body(
     buf: &mut Vec<u8>,
     network_id: &NetworkId,
     transfer: &Transfer,
+    round: u64,
 ) {
     put_bytes(buf, network_id.as_str().as_bytes());
     put_bytes(buf, transfer.from.as_bytes());
     buf.extend_from_slice(&transfer.from_seq.to_le_bytes());
+    buf.extend_from_slice(&round.to_le_bytes());
     put_bytes(buf, transfer.to.as_bytes());
     buf.extend_from_slice(&transfer.amount.to_le_bytes());
 }
@@ -336,6 +380,7 @@ pub fn owner_signing_message(
     policy_id: &PolicyId,
     network_id: &NetworkId,
     transfer: &Transfer,
+    round: u64,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(
         OWNER_INTENT_DOMAIN.len()
@@ -346,7 +391,7 @@ pub fn owner_signing_message(
     );
     message.extend_from_slice(OWNER_INTENT_DOMAIN);
     message.extend_from_slice(policy_id.as_bytes());
-    put_network_transfer_body(&mut message, network_id, transfer);
+    put_network_transfer_body(&mut message, network_id, transfer, round);
     message
 }
 
