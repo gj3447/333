@@ -63,13 +63,21 @@
       "StatePreflightRejected",
       "AuthorityVoteCast",
       "TransferCertified",
-      "CertificateApplied"
+      "CertificateApplied",
+      "EffectAttested"
     ],
     "effects": [
       "BroadcastVote",
-      "BroadcastCertificate"
+      "BroadcastCertificate",
+      "BroadcastAttestation"
     ],
-    "versioning": "Signed order, vote, and certificate wire domains use v3 (v2 plus the owner re-vote round in the signed bytes), authority vote signatures use alias-bound domain v5, and unsigned v1 and pre-round v2 fail closed; mixed-cohort rolling upgrade is not promised."
+    "versioning": "Signed order, vote, and certificate wire domains use v3 (v2 plus the owner re-vote round in the signed bytes), authority vote signatures use alias-bound domain v5, effect attestations use the fresh transfer333/effect-attestation/v1 signing domain and transfer333/wire-effect-attestation/v1 wire domain (tag 3), and unsigned v1 and pre-round v2 fail closed; mixed-cohort rolling upgrade is not promised."
+  },
+  "finality": {
+    "certificate": "PROVISIONAL. A bare quorum Certificate (a tx-cert: a quorum of votes) proves only certificate uniqueness (FastPay Lemma A.1) — never that any authority applied the order. A within-f Byzantine equivocator can unicast its completing vote so a certificate assembles at the client while no honest node applies (the withholding fork).",
+    "effect_certificate": "FINAL. Client finality requires an EffectCert: a quorum of distinct authority EffectAttestations over the same (committee_id, account, seq, order_id), each verified against committee keys (transfer333::effect::is_final_effectcert).",
+    "attestation_semantics": "attest-iff-applied. An authority serves its signed EffectAttestation for (account, seq) iff Authority::confirm genuinely committed the ledger apply (debit + credit + sequence advance); every rejection path (stale seq, insufficient balance, wrong committee/policy, bad owner proof, durability fail-stop) produces no attestation. Crash-recovery replay re-derives attestations only by re-driving the same apply.",
+    "remaining_work": "M4: multi-decider withholding harness (system-level client-safety proof) and pacemaker/liveness for the safe stall the withholding attack degrades to."
   },
   "invariants": [
     "No owner-authentication failure may create a vote, advance a sequence, mutate a ledger, or occupy a slot lock.",
@@ -82,7 +90,9 @@
     "Confirmation is certificate-driven on (account, sequence): a certificate formed at any round spends the sequence, so a straggler lower-round certificate still confirms after authorities have voted at higher rounds, and no second certificate for that sequence can ever apply.",
     "A certificate is valid only when its owner proof and a distinct authority quorum both validate for the same policy, committee, network, and transfer.",
     "One authority public key may occupy exactly one committee identity, and the authority alias is covered by every vote signature.",
-    "Invalid votes are verified before collector deduplication and cannot poison a signer slot."
+    "Invalid votes are verified before collector deduplication and cannot poison a signer slot.",
+    "An authority emits an effect attestation for (account, sequence) only after the certificate's ledger apply genuinely committed; every confirmation rejection emits none (attest-iff-applied).",
+    "An EffectCert requires a quorum of distinct, committee-verified attestations bound to the same (committee, account, sequence, order id); duplicate signers, cross-committee signatures, and mis-bound slots never count."
   ],
   "ports": [
     "AuthorityNet",

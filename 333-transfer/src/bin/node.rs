@@ -560,6 +560,13 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                                     balances_json(auth.ledger()),
                                     auth.ledger().total_supply()
                                 ));
+                                // Attest-iff-applied: only here, after the
+                                // committed apply, does the attestation exist.
+                                let account = v.transfer().from.clone();
+                                let seq = v.transfer().from_seq;
+                                if let Some(attestation) = auth.attestation_for(&account, seq) {
+                                    let _ = endpoint.broadcast_attestation(attestation);
+                                }
                             }
                             Ok(ConfirmOutcome::AlreadyApplied) => {}
                             Err(error) => {
@@ -584,6 +591,10 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                 }
                 AuthorityMsg::Vote(_) => {
                     // Authorities ignore peer votes; the submit client assembles.
+                }
+                AuthorityMsg::Attestation(_) => {
+                    // Authorities ignore peer attestations; clients collect
+                    // them for EffectCert finality.
                 }
             }
         }

@@ -21,6 +21,7 @@ use gossip333::{Event, GossipProtocol, InMemoryPlumtree, Msg, MsgId};
 use identity333::NodeId;
 
 use crate::authority::{Certificate, Vote};
+use crate::effect::EffectAttestation;
 use crate::net::{AuthorityNet, InMemoryAuthorityMesh, NetError};
 use crate::wire::{decode_authority_msg, encode_authority_msg, AuthorityMsg};
 use crate::SignedTransfer;
@@ -408,6 +409,10 @@ impl AuthorityNet for EpidemicEndpoint {
 
     fn broadcast_cert(&self, c: Certificate) -> Result<(), NetError> {
         self.broadcast_msg(AuthorityMsg::Cert(c))
+    }
+
+    fn broadcast_attestation(&self, a: EffectAttestation) -> Result<(), NetError> {
+        self.broadcast_msg(AuthorityMsg::Attestation(a))
     }
 
     fn poll(&self) -> Vec<AuthorityMsg> {

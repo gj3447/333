@@ -1,183 +1,69 @@
 //! # EffectCert client-finality predicate (applied-at-quorum, Sui-Lutris effect-cert).
 //!
-//! ## ⚠️ 5-lens Naesengmoon: "closes the withholding fork" headline RETRACTED (2026-07-21, BLOCKED 5/5 FATAL)
+//! ## Status (M3, 2026-07-23): the production wiring LANDED — honest scoping kept.
 //!
-//! A closing 5-lens pass BLOCKED the claim that this brick PROVES the withholding
-//! fork closed. Accepted. The **design is sound** (migrating finality from
-//! cert-ASSEMBLED to APPLIED-AT-QUORUM is the correct fix, credited by all lenses),
-//! but the earlier proof was **VACUOUS, not unsound**:
-//! * TAUTOLOGY: the withholding test hand-supplied the attestation set `{a0}` and
-//!   observed `is_final = false` — which holds because `1 < quorum`, a fact about the
-//!   integer 1, identical under any adversary or none. The load-bearing lemma (honest
-//!   `a2,a3` never received `a0`'s completing vote, so they could not apply and thus
-//!   cannot attest, confining the equivocator to `<= f < quorum` attestations) was
-//!   argued in prose, never DERIVED in code.
-//! * ATTESTATION != APPLICATION: [`EffectAttestation::is_valid`] checks only a
-//!   signature; nothing binds it to an actual `confirm()`/apply, and attestation
-//!   production is NOT wired into `transfer333::authority::confirm()`. That absent
-//!   wire is the exact half in which the proof would live.
-//! * The `n=7` "n-f vs 2f+1" test was mis-designed: `n=7=3f+1` gives `n-f == 2f+1 == 5`,
-//!   so it could not witness the distinction its name asserts (fixed below to `n=5`).
+//! The canonical [`EffectAttestation`] / [`EffectCert`] / [`is_final_effectcert`]
+//! types now live in **`transfer333::effect`** (re-exported here; the local
+//! duplicates from the predicate-only milestone are retired), and
+//! **attest-iff-applied is wired into the real `transfer333::authority::
+//! confirm()`**: an authority serves an attestation for `(account, seq)` iff its
+//! ledger apply genuinely committed (debit + credit + sequence advance), with
+//! every rejection path producing none. The withholding-safety and adversary's-
+//! dilemma properties are DERIVED through that real confirm path in
+//! `transfer333::effect::tests` (`withholding_authority_blocks_effectcert_finality`,
+//! `attestation_emitted_only_on_applied_confirm`) — no hand-supplied attestation
+//! sets (the 3e03d76 vacuity bug, fixed there and here).
 //!
-//! **Honest claim now:** these tests establish the EffectCert PREDICATE
-//! ([`is_final_effectcert`] requires a quorum of distinct valid apply-attestations; a
-//! bare `Certificate` is provisional), plus an **apply-gated MODEL** (an authority
-//! attests only an order it could actually confirm, so the withholding set is DERIVED
-//! not hand-picked), plus the quorum hard core at `n != 3f+1` and cross-committee
-//! rejection. They do **NOT** prove the system closes the fork: that requires wiring
-//! **attest-iff-applied into `transfer333::authority::confirm()`** (the production
-//! integration, the remaining load-bearing work) and a griefing/liveness argument (a
-//! single within-`f` equivocator that withholds converts the fork into a permanent
-//! honest STALL = finality-DoS on the target slot, resolved only by the agreement/
-//! recovery leg — a separate milestone). KG:
+//! **Still honestly scoped:** this establishes the predicate + the production
+//! wiring. It does NOT yet prove SYSTEM client-safety closes the withholding
+//! fork: that needs the multi-decider withholding harness (concurrent clients /
+//! deciders racing a within-f equivocator) and the griefing/liveness argument
+//! (a withholding equivocator converts premature finalization into a safe
+//! honest STALL = finality-DoS on the target slot, resolved only by the
+//! agreement/recovery leg — M4, a separate milestone). KG:
 //! `ac-333coin-effectcert-brick-is-predicate-not-wired-system-proof-2026-07-21`.
 //!
-//! Original design context (kept): the recovery client-safety is inseparable from
-//! The 5-lens re-verification showed the recovery's client-safety is INSEPARABLE
-//! from the client finality predicate: under the shipped `cert-exists` rule (a bare
-//! verifying `transfer333::Certificate` = final, FastPay Lemma A.1), a within-`f`
-//! Byzantine equivocator can UNICAST its completing vote to a client so a certificate
-//! is assembled AT THE CLIENT but applied at NO honest node — the client finalizes
-//! while every honest node stalls. KG:
+//! Original design context (kept): the recovery client-safety is inseparable
+//! from the client finality predicate: under the shipped `cert-exists` rule (a
+//! bare verifying `transfer333::Certificate` = final, FastPay Lemma A.1), a
+//! within-`f` Byzantine equivocator can UNICAST its completing vote to a client
+//! so a certificate is assembled AT THE CLIENT but applied at NO honest node —
+//! the client finalizes while every honest node stalls. KG:
 //! `ac-333coin-harness-nofork-is-agreement-object-not-client-finality-2026-07-21`,
 //! `lesson-333-recovery-client-safety-inseparable-from-effectcert-2026-07-21`.
 //!
 //! **The brick:** migrate client finality from *cert-assembled* to *applied-at-
-//! quorum*. A bare transfer `Certificate` (a **tx-cert**: a quorum of VOTES) is only
-//! PROVISIONAL. Finality requires an **EffectCert**: a quorum of authorities each
-//! attesting it APPLIED the order at the slot. This is the Sui-Lutris tx-cert vs
-//! effect-cert distinction. An authority attests the effect ONLY if it confirmed the
-//! cert (i.e. it actually holds the votes and applied). In the withholding attack the
-//! honest authorities never receive the equivocator's completing vote, so they never
-//! assemble/apply the cert, so no EffectCert forms — and the client, requiring an
-//! EffectCert, correctly WITHHOLDS finality. The premature finalization is converted
-//! into a safe stall (liveness, resolved by the agreement leg + a view synchronizer,
+//! quorum*. A bare transfer `Certificate` (a **tx-cert**: a quorum of VOTES) is
+//! only PROVISIONAL. Finality requires an **EffectCert**: a quorum of
+//! authorities each attesting it APPLIED the order at the slot. This is the
+//! Sui-Lutris tx-cert vs effect-cert distinction. An authority attests the
+//! effect ONLY if it confirmed the cert (i.e. it actually holds the votes and
+//! applied). In the withholding attack the honest authorities never receive the
+//! equivocator's completing vote, so they never assemble/apply the cert, so no
+//! EffectCert forms — and the client, requiring an EffectCert, correctly
+//! WITHHOLDS finality. The premature finalization is converted into a safe
+//! stall (liveness, resolved by the agreement leg + a view synchronizer,
 //! separate milestone).
 //!
-//! Scope: the finality predicate + its withholding-safety, over `transfer333`'s real
-//! `Certificate`/`Committee`/`quorum` types. Not in scope: wiring the effect-
-//! attestation into `transfer333::authority::confirm()` production path, and liveness.
+//! Scope: the finality predicate + its withholding-safety, over `transfer333`'s
+//! real `Certificate`/`Committee`/`quorum` types. Not in scope: the multi-
+//! decider withholding harness and liveness (M4).
 //! KG: `prom16-333-optionA-total-order-leg`.
 
-use std::collections::BTreeSet;
-use transfer333::{Certificate, Committee, Signature, VerifyingKey};
+use transfer333::Certificate;
 
-/// Domain separation for an effect (apply) attestation, distinct from the authority
-/// VOTE domain so an effect attestation can never be replayed as a vote or vice versa.
-const EFFECT_DOMAIN: &[u8] = b"333/slot-effect-applied/v1\0";
+// Canonical EffectCert types: defined in `transfer333::effect` (the crate that
+// owns `Authority::confirm`), re-exported so this module's public API keeps
+// compiling unchanged.
+pub use transfer333::{
+    effect_message, is_final_effectcert, EffectAttestation, EffectCert,
+};
 
-/// Canonical message an authority signs to attest it APPLIED `order_id` at
-/// `(account, seq)` under a specific committee.
-pub fn effect_message(
-    committee_id: &[u8; 32],
-    account: &str,
-    seq: u64,
-    order_id: &[u8; 32],
-) -> Vec<u8> {
-    let mut m = Vec::with_capacity(EFFECT_DOMAIN.len() + 32 + 8 + account.len() + 8 + 32);
-    m.extend_from_slice(EFFECT_DOMAIN);
-    m.extend_from_slice(committee_id);
-    m.extend_from_slice(&(account.len() as u64).to_le_bytes());
-    m.extend_from_slice(account.as_bytes());
-    m.extend_from_slice(&seq.to_le_bytes());
-    m.extend_from_slice(order_id);
-    m
-}
-
-/// One authority's signed attestation that it applied `order_id` at the slot.
-#[derive(Clone, Debug)]
-pub struct EffectAttestation {
-    /// The attesting authority id (a string alias, as in `transfer333`).
-    pub authority: String,
-    /// The committee the attestation is bound to.
-    pub committee_id: [u8; 32],
-    /// Slot account.
-    pub account: String,
-    /// Slot sequence.
-    pub seq: u64,
-    /// The applied order's digest (`SignedTransfer::order_id`).
-    pub order_id: [u8; 32],
-    /// Ed25519 signature over [`effect_message`].
-    pub signature: Signature,
-}
-
-impl EffectAttestation {
-    /// Verify this attestation binds to `committee` and carries a valid signature by
-    /// the named authority's committee key.
-    pub fn is_valid(&self, committee: &Committee) -> bool {
-        if self.committee_id != *committee.id().as_bytes() {
-            return false;
-        }
-        let key: &VerifyingKey = match committee.key_of(&self.authority) {
-            Some(k) => k,
-            None => return false,
-        };
-        let msg = effect_message(&self.committee_id, &self.account, self.seq, &self.order_id);
-        key.verify_strict(&msg, &self.signature).is_ok()
-    }
-}
-
-/// An EffectCert: a quorum of distinct authorities each attesting they applied
-/// `order_id` at `(account, seq)`. This is the FINALITY object — its existence, not a
-/// bare tx-cert, is what makes an order final to a client.
-#[derive(Clone, Debug)]
-pub struct EffectCert {
-    account: String,
-    seq: u64,
-    order_id: [u8; 32],
-}
-
-impl EffectCert {
-    /// The finalized order digest.
-    pub fn order_id(&self) -> [u8; 32] {
-        self.order_id
-    }
-
-    /// Assemble an EffectCert iff at least `quorum` DISTINCT authorities validly
-    /// attest they applied the SAME `order_id` at the SAME slot. Returns `None`
-    /// otherwise — the client is not final.
-    pub fn assemble(
-        account: &str,
-        seq: u64,
-        order_id: [u8; 32],
-        attestations: &[EffectAttestation],
-        committee: &Committee,
-    ) -> Option<Self> {
-        let mut distinct = BTreeSet::new();
-        for a in attestations {
-            if a.account == account
-                && a.seq == seq
-                && a.order_id == order_id
-                && a.is_valid(committee)
-            {
-                distinct.insert(a.authority.clone());
-            }
-        }
-        if distinct.len() >= committee.quorum() {
-            Some(Self { account: account.to_string(), seq, order_id })
-        } else {
-            None
-        }
-    }
-}
-
-/// **The migrated client finality predicate.** An order is final to a client iff a
-/// valid [`EffectCert`] (quorum of apply-attestations) can be assembled from the
-/// client's collected `attestations`. A bare transfer `Certificate` is NOT final.
-pub fn is_final_effectcert(
-    account: &str,
-    seq: u64,
-    order_id: [u8; 32],
-    attestations: &[EffectAttestation],
-    committee: &Committee,
-) -> bool {
-    EffectCert::assemble(account, seq, order_id, attestations, committee).is_some()
-}
-
-/// **The OLD, unsafe predicate** (kept only to demonstrate the fork it permits): a
-/// bare verifying transfer `Certificate` treated as final. This is exactly what the
-/// withholding attack exploits.
-pub fn is_final_cert_exists(cert: &Certificate, committee: &Committee) -> bool {
+/// **The OLD, unsafe predicate** (kept only to demonstrate the fork it
+/// permits): a bare verifying transfer `Certificate` treated as final. This is
+/// exactly what the withholding attack exploits; clients must use
+/// [`is_final_effectcert`].
+pub fn is_final_cert_exists(cert: &Certificate, committee: &transfer333::Committee) -> bool {
     cert.verify(committee).is_some()
 }
 
@@ -186,8 +72,8 @@ mod tests {
     use super::*;
     use ed25519_dalek::Signer;
     use transfer333::{
-        authority_signing_message, Authority, Certificate, Ledger, NetworkId, OwnerRegistry,
-        SignedTransfer, SigningKey, Transfer, TransferPolicy, Vote,
+        authority_signing_message, Authority, Certificate, Committee, Ledger, NetworkId,
+        OwnerRegistry, SignedTransfer, SigningKey, Transfer, TransferPolicy, Vote,
     };
 
     fn key(seed: u8) -> SigningKey {
@@ -264,11 +150,10 @@ mod tests {
     /// which holds the cert, could attest, and one attestation is below quorum.
     fn attest(idx: u8, committee: &Committee, account: &str, seq: u64, order_id: [u8; 32]) -> EffectAttestation {
         let id = format!("a{idx}");
-        let cid = *committee.id().as_bytes();
-        let msg = effect_message(&cid, account, seq, &order_id);
+        let msg = effect_message(&committee.id(), account, seq, &order_id);
         EffectAttestation {
             authority: id,
-            committee_id: cid,
+            committee_id: committee.id(),
             account: account.to_string(),
             seq,
             order_id,
@@ -277,10 +162,11 @@ mod tests {
     }
 
     // An authority attests order X only if it could actually CONFIRM/apply X — i.e. it
-    // holds a valid quorum certificate for X from its OWN evidence. Models the
-    // attest-iff-applied binding (the confirm()->attest wire; not yet wired into
-    // transfer333::authority::confirm(), disclosed in the module header), so the
-    // attestation set is DERIVED from what each node holds, not hand-picked.
+    // holds a valid quorum certificate for X from its OWN evidence. This MODELS the
+    // attest-iff-applied binding at the predicate level so the withholding set is
+    // DERIVED from what each node holds, not hand-picked; the production wire itself
+    // (confirm() -> attestation_for) landed in M3 and is driven end-to-end in
+    // `transfer333::effect::tests`.
     fn attest_if_can_confirm(
         idx: u8,
         own_votes: &[Vote],

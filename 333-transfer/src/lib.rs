@@ -71,6 +71,7 @@ use std::collections::BTreeMap;
 use crdt333::{CausalBroadcast, CausalMsg, VectorClockBroadcaster};
 
 pub mod authority;
+pub mod effect;
 pub mod epidemic;
 pub mod journal;
 pub mod net;
@@ -88,6 +89,10 @@ pub use authority::{
     Certificate, CertificateError, Certified, Committee, CommitteeId, ConfirmError,
     ConfirmOutcome, Verified, Vote, VoteError, MAX_AUTHORITY_ID_BYTES, MAX_COMMITTEE_MEMBERS,
 };
+pub use effect::{
+    effect_message, is_final_effectcert, EffectAttestation, EffectCert,
+    EFFECT_ATTESTATION_DOMAIN,
+};
 pub use epidemic::{
     mesh_all_eager, mesh_with_dropped_eager_edge, msg_id_of, peer_node_id, pump, EpidemicEndpoint,
     EpidemicNetwork,
@@ -97,9 +102,9 @@ pub use journal::{Journal, JournalError, JournalRecord, MemJournal, NullJournal,
 pub use journal::FileJournal;
 pub use net::{
     authority_handle_round, certify_via_mesh, certify_via_mesh_rounds,
-    certify_via_mesh_rounds_with_pause, collect_until_quorum, confirm_from_mesh,
-    disseminate_certificate, disseminate_certificate_with_pause, AuthorityMsg, AuthorityNet,
-    InMemoryAuthorityMesh, MeshEndpoint, MeshLedger, NetError, VoteCollector,
+    certify_via_mesh_rounds_with_pause, collect_effect_attestations, collect_until_quorum,
+    confirm_from_mesh, disseminate_certificate, disseminate_certificate_with_pause, AuthorityMsg,
+    AuthorityNet, InMemoryAuthorityMesh, MeshEndpoint, MeshLedger, NetError, VoteCollector,
 };
 pub use owner::{
     owner_signing_message, NetworkId, NetworkIdError, OwnerAuthError, OwnerRegistry,
@@ -109,8 +114,9 @@ pub use owner::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use tcp::{TcpAuthorityNet, TcpEndpoint};
 pub use wire::{
-    decode_authority_msg, decode_certificate, decode_transfer, decode_vote, encode_authority_msg,
-    encode_certificate, encode_transfer, encode_vote, WireError, TAG_CERT, TAG_ORDER, TAG_VOTE,
+    decode_attestation, decode_authority_msg, decode_certificate, decode_transfer, decode_vote,
+    encode_attestation, encode_authority_msg, encode_certificate, encode_transfer, encode_vote,
+    WireError, TAG_ATTESTATION, TAG_CERT, TAG_ORDER, TAG_VOTE,
 };
 // Re-exported so callers can build authorities/committees (the public API takes
 // Ed25519 keys) and inspect vote signatures without a direct ed25519-dalek dep.
@@ -370,6 +376,12 @@ impl Ledger {
     /// closes the gap the bare `apply` (honest-owner only) leaves open. See
     /// `authority.rs` and the `equivocation_barred_*` / `byzantine_authority_*`
     /// tests.
+    ///
+    /// CLIENT FINALITY NOTE (M3): the certificate this path consumes is
+    /// PROVISIONAL evidence of settlement, not client finality. A certificate
+    /// can exist (assembled at the client from a unicast completing vote)
+    /// while no honest authority ever applied it. Client finality requires an
+    /// EffectCert — a quorum of apply-attestations; see `effect.rs`.
     pub fn apply_certified(
         &mut self,
         cert: &Certificate,

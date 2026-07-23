@@ -2,7 +2,8 @@
 //
 // Domain-separated, length-prefixed wire codec for authority-path messages.
 // Mirrors `signing_message` style (domain tag + u64 LE length prefixes) so
-// Transfer / Vote / Certificate can leave the process without reinventing QC.
+// Transfer / Vote / Certificate / EffectAttestation can leave the process
+// without reinventing QC.
 //
 // Step 8: `AuthorityMsg` framing = 1-byte tag + domain-tagged body. TCP uses
 // this payload under a u32-BE length prefix (see `tcp` module / 333-wire style).
@@ -12,6 +13,7 @@ use ed25519_dalek::Signature;
 use crate::authority::{
     Certificate, CommitteeId, Vote, MAX_AUTHORITY_ID_BYTES, MAX_COMMITTEE_MEMBERS,
 };
+use crate::effect::EffectAttestation;
 use crate::owner::{
     NetworkId, PolicyId, SignedTransfer, MAX_ACCOUNT_ID_BYTES, MAX_NETWORK_ID_BYTES,
 };
@@ -20,20 +22,25 @@ use crate::Transfer;
 const DOMAIN_TRANSFER: &[u8] = b"transfer333/wire-signed-order/v3\0";
 const DOMAIN_VOTE: &[u8] = b"transfer333/wire-vote/v3\0";
 const DOMAIN_CERT: &[u8] = b"transfer333/wire-cert/v3\0";
+// NEW domain for the M3 effect attestation — never a reuse of a v3 tag for a
+// different layout.
+const DOMAIN_ATTESTATION: &[u8] = b"transfer333/wire-effect-attestation/v1\0";
 pub const MAX_CERTIFICATE_VOTES: usize = MAX_COMMITTEE_MEMBERS;
 
 /// Wire tag for [`AuthorityMsg`] over TCP / framed streams.
 pub const TAG_ORDER: u8 = 0;
 pub const TAG_VOTE: u8 = 1;
 pub const TAG_CERT: u8 = 2;
+pub const TAG_ATTESTATION: u8 = 3;
 
-/// Messages that travel the authority mesh (orders, signed votes, certificates).
-/// Shared by the in-memory mesh and the TCP backend.
+/// Messages that travel the authority mesh (orders, signed votes, certificates,
+/// effect attestations). Shared by the in-memory mesh and the TCP backend.
 #[derive(Debug, Clone)]
 pub enum AuthorityMsg {
     Order(SignedTransfer),
     Vote(Vote),
     Cert(Certificate),
+    Attestation(EffectAttestation),
 }
 
 /// Why a byte stream could not be decoded into an authority message.
@@ -51,7 +58,7 @@ pub enum WireError {
         max: usize,
     },
     TooManyVotes { count: u64, max: usize },
-    /// Unknown `AuthorityMsg` tag (not Order/Vote/Cert).
+    /// Unknown `AuthorityMsg` tag (not Order/Vote/Cert/Attestation).
     UnknownTag(u8),
 }
 
@@ -317,6 +324,57 @@ pub fn decode_certificate(bytes: &[u8]) -> Result<Certificate, WireError> {
     Ok(Certificate { order, votes })
 }
 
+// --- effect attestation codec (M3) ---------------------------------------------
+
+fn put_attestation_body(buf: &mut Vec<u8>, a: &EffectAttestation) {
+    put_str(buf, &a.authority);
+    buf.extend_from_slice(a.committee_id.as_bytes());
+    put_str(buf, &a.account);
+    buf.extend_from_slice(&a.seq.to_le_bytes());
+    buf.extend_from_slice(&a.order_id);
+    buf.extend_from_slice(&a.signature.to_bytes());
+}
+
+fn take_attestation_body(input: &mut &[u8]) -> Result<EffectAttestation, WireError> {
+    let authority = take_str(input, "attestation.authority", MAX_AUTHORITY_ID_BYTES)?;
+    let committee_id = take_committee_id(input)?;
+    let account = take_str(input, "attestation.account", MAX_ACCOUNT_ID_BYTES)?;
+    let seq = take_u64(input)?;
+    let order_id: [u8; 32] = take(input, 32)?
+        .try_into()
+        .expect("take returned exactly 32 order-id bytes");
+    let signature = take_signature(input)?;
+    Ok(EffectAttestation {
+        authority,
+        committee_id,
+        account,
+        seq,
+        order_id,
+        signature,
+    })
+}
+
+/// Encode a signed `EffectAttestation` (authority + slot binding + 64-byte
+/// Ed25519 sig) under the fresh v1 attestation domain.
+pub fn encode_attestation(a: &EffectAttestation) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(160 + a.authority.len() + a.account.len());
+    buf.extend_from_slice(DOMAIN_ATTESTATION);
+    put_attestation_body(&mut buf, a);
+    buf
+}
+
+/// Decode a domain-tagged `EffectAttestation`. Validity is NOT checked here —
+/// callers must still run `EffectAttestation::is_valid`.
+pub fn decode_attestation(bytes: &[u8]) -> Result<EffectAttestation, WireError> {
+    let mut input = bytes;
+    expect_domain(&mut input, DOMAIN_ATTESTATION)?;
+    let a = take_attestation_body(&mut input)?;
+    if !input.is_empty() {
+        return Err(WireError::Truncated);
+    }
+    Ok(a)
+}
+
 // --- AuthorityMsg frame (1-byte tag + domain body) ---------------------------
 
 /// Encode an [`AuthorityMsg`] as `tag || domain-tagged-body`.
@@ -344,6 +402,13 @@ pub fn encode_authority_msg(msg: &AuthorityMsg) -> Vec<u8> {
             out.extend_from_slice(&body);
             out
         }
+        AuthorityMsg::Attestation(a) => {
+            let body = encode_attestation(a);
+            let mut out = Vec::with_capacity(1 + body.len());
+            out.push(TAG_ATTESTATION);
+            out.extend_from_slice(&body);
+            out
+        }
     }
 }
 
@@ -358,6 +423,7 @@ pub fn decode_authority_msg(bytes: &[u8]) -> Result<AuthorityMsg, WireError> {
         TAG_ORDER => Ok(AuthorityMsg::Order(decode_transfer(body)?)),
         TAG_VOTE => Ok(AuthorityMsg::Vote(decode_vote(body)?)),
         TAG_CERT => Ok(AuthorityMsg::Cert(decode_certificate(body)?)),
+        TAG_ATTESTATION => Ok(AuthorityMsg::Attestation(decode_attestation(body)?)),
         other => Err(WireError::UnknownTag(other)),
     }
 }
@@ -684,6 +750,53 @@ mod tests {
         let back = decode_vote(&encode_vote(&v)).unwrap();
         assert_eq!(back, v);
         assert!(back.validate_for(&order, &committee).is_ok());
+    }
+
+    #[test]
+    fn attestation_round_trip_and_frame() {
+        let (committee, mut auth, policy) = setup(4);
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 30);
+        let votes: Vec<Vote> = auth
+            .iter_mut()
+            .take(3)
+            .map(|a| a.handle(&order).unwrap())
+            .collect();
+        let verified = Certificate::assemble(order, votes, &committee)
+            .unwrap()
+            .verify(&committee)
+            .unwrap();
+        auth[0].confirm(&verified, &committee).unwrap();
+        let attestation = auth[0]
+            .attestation_for(&"alice".to_string(), 0)
+            .expect("applied confirm attests");
+
+        let back = decode_attestation(&encode_attestation(&attestation)).unwrap();
+        assert_eq!(back, attestation);
+        assert!(back.is_valid(&committee));
+
+        let framed = decode_authority_msg(&encode_authority_msg(&AuthorityMsg::Attestation(
+            attestation.clone(),
+        )))
+        .unwrap();
+        match framed {
+            AuthorityMsg::Attestation(got) => {
+                assert_eq!(got, attestation);
+                assert!(got.is_valid(&committee));
+            }
+            _ => panic!("expected Attestation"),
+        }
+
+        // A corrupted attestation frame must never decode to a valid one.
+        let mut bytes = encode_authority_msg(&AuthorityMsg::Attestation(attestation));
+        let idx = bytes.len() - 1;
+        bytes[idx] ^= 0x01;
+        match decode_authority_msg(&bytes) {
+            Ok(AuthorityMsg::Attestation(tampered)) => {
+                assert!(!tampered.is_valid(&committee));
+            }
+            Ok(_) => panic!("expected Attestation after tag-preserving tamper"),
+            Err(_) => {}
+        }
     }
 
     #[test]

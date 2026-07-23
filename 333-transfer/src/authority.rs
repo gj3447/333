@@ -13,6 +13,7 @@ use std::fmt;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+use crate::effect::{effect_message, EffectAttestation};
 use crate::journal::{Journal, JournalError, JournalRecord, NullJournal, SnapshotData};
 use crate::owner::{
     put_network_transfer_body, NetworkId, OwnerAuthError, PolicyId, SignedTransfer,
@@ -609,6 +610,36 @@ impl Authority {
         &self.ledger
     }
 
+    /// This authority's signed effect attestation for `(account, seq)`, if and
+    /// only if it genuinely APPLIED an order at that slot.
+    ///
+    /// Attest-iff-applied is structural here, not a convention: the attestation
+    /// is derived from `confirmed`, which `confirm` populates ONLY after
+    /// `Ledger::apply` has committed the debit + credit + sequence advance (and
+    /// which crash-recovery replay re-populates only by re-driving that same
+    /// apply). Every rejection path leaves `confirmed` untouched, so a failed
+    /// confirmation yields `None`. Ed25519 is deterministic, so repeated calls
+    /// return the same signature — the attestation is a stable fact about the
+    /// apply, not fresh evidence per query. See `effect.rs` for the finality
+    /// model.
+    pub fn attestation_for(&self, account: &AccountId, seq: u64) -> Option<EffectAttestation> {
+        let order_id = *self.confirmed.get(&(account.clone(), seq))?;
+        let signature = self.signing.sign(&effect_message(
+            &self.committee_id,
+            account,
+            seq,
+            &order_id,
+        ));
+        Some(EffectAttestation {
+            authority: self.id.clone(),
+            committee_id: self.committee_id,
+            account: account.clone(),
+            seq,
+            order_id,
+            signature,
+        })
+    }
+
     fn sign(&self, order: &SignedTransfer) -> Vote {
         let committee_id = self.committee_id;
         let policy_id = order.policy_id();
@@ -732,6 +763,11 @@ impl Authority {
     /// `Verified`. Policy and owner proof are rechecked locally. `Ledger::apply`
     /// performs all state checks before its commit, and lock/confirmation state
     /// changes only after a successful apply.
+    ///
+    /// A successful (`Applied`) or idempotent (`AlreadyApplied`) outcome makes
+    /// this authority's [`EffectAttestation`] for the slot available via
+    /// [`Authority::attestation_for`] — attest-iff-applied. Every error path
+    /// produces no attestation.
     pub fn confirm(
         &mut self,
         verified: &Verified,

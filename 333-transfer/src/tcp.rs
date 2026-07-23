@@ -23,6 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::authority::{Certificate, Vote};
+use crate::effect::EffectAttestation;
 use crate::net::{AuthorityMsg, AuthorityNet, NetError};
 use crate::wire::{decode_authority_msg, encode_authority_msg};
 use crate::SignedTransfer;
@@ -198,6 +199,10 @@ impl AuthorityNet for TcpEndpoint {
 
     fn broadcast_cert(&self, c: Certificate) -> Result<(), NetError> {
         self.write_all(&AuthorityMsg::Cert(c))
+    }
+
+    fn broadcast_attestation(&self, a: EffectAttestation) -> Result<(), NetError> {
+        self.write_all(&AuthorityMsg::Attestation(a))
     }
 
     fn poll(&self) -> Vec<AuthorityMsg> {

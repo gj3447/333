@@ -27,7 +27,8 @@ use std::time::Duration;
 use crate::authority::{
     Authority, AuthorityError, Certificate, Certified, Committee, Verified, Vote,
 };
-use crate::{Ledger, Reject, SignedTransfer};
+use crate::effect::EffectAttestation;
+use crate::{AccountId, Ledger, Reject, SignedTransfer};
 
 pub use crate::wire::AuthorityMsg;
 
@@ -44,10 +45,12 @@ pub enum NetError {
 
 /// Object-safe broadcast + poll surface for committee authorities (and clients).
 ///
-/// - `broadcast_order` — client → authorities (transfer intent)
-/// - `broadcast_vote`  — authority → mesh (signed vote)
-/// - `broadcast_cert`  — optional cert fan-out after assembly
-/// - `poll`            — drain this endpoint's inbox
+/// - `broadcast_order`       — client → authorities (transfer intent)
+/// - `broadcast_vote`        — authority → mesh (signed vote)
+/// - `broadcast_cert`        — optional cert fan-out after assembly
+/// - `broadcast_attestation` — authority → mesh (effect attestation after a
+///   genuinely applied confirm; clients collect these for EffectCert finality)
+/// - `poll`                  — drain this endpoint's inbox
 /// `Send + Sync` on native, no bound on wasm32.
 ///
 /// A browser endpoint holds JS handles (`RtcDataChannel` and friends) which are
@@ -68,6 +71,7 @@ pub trait AuthorityNet: MaybeSendSync {
     fn broadcast_order(&self, order: SignedTransfer) -> Result<(), NetError>;
     fn broadcast_vote(&self, v: Vote) -> Result<(), NetError>;
     fn broadcast_cert(&self, c: Certificate) -> Result<(), NetError>;
+    fn broadcast_attestation(&self, a: EffectAttestation) -> Result<(), NetError>;
     fn poll(&self) -> Vec<AuthorityMsg>;
 }
 
@@ -219,6 +223,10 @@ impl AuthorityNet for MeshEndpoint {
         self.mesh.fanout(AuthorityMsg::Cert(c))
     }
 
+    fn broadcast_attestation(&self, a: EffectAttestation) -> Result<(), NetError> {
+        self.mesh.fanout(AuthorityMsg::Attestation(a))
+    }
+
     fn poll(&self) -> Vec<AuthorityMsg> {
         self.mesh.drain(&self.me)
     }
@@ -315,17 +323,10 @@ pub fn certify_via_mesh(
             let verified = cert
                 .verify(committee)
                 .expect("assembled certificate verifies");
-            // 4. Disseminate cert; authorities confirm from their mailboxes.
+            // 4. Disseminate cert; authorities confirm from their mailboxes and
+            // broadcast their effect attestations (same path as Step 7).
             let _ = client.broadcast_cert(cert);
-            for (auth, ep) in authorities.iter_mut().zip(auth_endpoints.iter()) {
-                for msg in ep.poll() {
-                    if let AuthorityMsg::Cert(c) = msg {
-                        if let Some(v) = c.verify(committee) {
-                            let _ = auth.confirm(&v, committee);
-                        }
-                    }
-                }
-            }
+            confirm_from_mesh(authorities, auth_endpoints, committee);
             (Some(verified), Certified::Ok)
         }
         None => (
@@ -623,6 +624,11 @@ pub fn disseminate_certificate_with_pause<B: AuthorityNet + ?Sized, L: Authority
 /// Remote authorities drain their mailboxes for `Cert` messages, verify against
 /// the local committee, and call existing `Authority::confirm` (advances
 /// `next_expected`) — no shared in-process confirm loop.
+///
+/// After a successful confirm each authority broadcasts its
+/// [`EffectAttestation`] (attest-iff-applied: `Authority::attestation_for`
+/// yields one only when the apply genuinely committed), so a client polling
+/// the mesh can collect an EffectCert. A failed confirm broadcasts nothing.
 pub fn confirm_from_mesh<N: AuthorityNet>(
     authorities: &mut [Authority],
     auth_endpoints: &[N],
@@ -637,11 +643,50 @@ pub fn confirm_from_mesh<N: AuthorityNet>(
         for msg in ep.poll() {
             if let AuthorityMsg::Cert(c) = msg {
                 if let Some(v) = c.verify(committee) {
-                    let _ = auth.confirm(&v, committee);
+                    if auth.confirm(&v, committee).is_ok() {
+                        let account = v.transfer().from.clone();
+                        let seq = v.transfer().from_seq;
+                        if let Some(attestation) = auth.attestation_for(&account, seq) {
+                            // Fan-out the attestation; ignore mesh-down here
+                            // (collectors will simply see fewer attestations).
+                            let _ = ep.broadcast_attestation(attestation);
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Client-side EffectCert collection: drain `collector`'s mailbox for
+/// `Attestation` messages and keep the DISTINCT, committee-valid ones bound to
+/// exactly `(account, seq, order_id)`. Feed the result to
+/// [`crate::is_final_effectcert`] / [`crate::EffectCert::assemble`]; a bare
+/// certificate is only provisional until this yields a quorum.
+pub fn collect_effect_attestations<N: AuthorityNet + ?Sized>(
+    collector: &N,
+    account: &AccountId,
+    seq: u64,
+    order_id: [u8; 32],
+    committee: &Committee,
+) -> Vec<EffectAttestation> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for msg in collector.poll() {
+        if let AuthorityMsg::Attestation(a) = msg {
+            // Validate before dedupe for the same reason as VoteCollector: an
+            // invalid attestation claiming a real id may not occupy that id.
+            if &a.account == account
+                && a.seq == seq
+                && a.order_id == order_id
+                && a.is_valid(committee)
+                && seen.insert(a.authority.clone())
+            {
+                out.push(a);
+            }
+        }
+    }
+    out
 }
 
 /// Multi-round certification path (Steps 5–7 composed):
@@ -1020,5 +1065,33 @@ mod tests {
             ep.broadcast_order(tx("a", 0, "b", 1)),
             Err(NetError::Closed)
         );
+    }
+
+    // M3 transport path: after a mesh certification the authorities' real
+    // confirms broadcast their effect attestations, and the client collects a
+    // quorum from its own mailbox -> EffectCert finality over the wire, with no
+    // in-process hand-off of attestation sets.
+    #[test]
+    fn mesh_confirm_broadcasts_attestations_client_assembles_effectcert() {
+        let (committee, mut authorities, _mesh, endpoints, client) = setup_mesh(4);
+        let t = tx("alice", 0, "bob", 30);
+        let oid = t.order_id();
+        let (verified, status) =
+            certify_via_mesh(&t, &mut authorities, &endpoints, &client, &committee);
+        assert_eq!(status, Certified::Ok);
+        assert!(verified.is_some());
+
+        let attestations =
+            collect_effect_attestations(&client, &"alice".to_string(), 0, oid, &committee);
+        assert_eq!(
+            attestations.len(),
+            4,
+            "every applied authority's attestation reached the client mailbox"
+        );
+        assert!(crate::is_final_effectcert("alice", 0, oid, &attestations, &committee));
+
+        // The same drain yields nothing for a slot nothing applied at.
+        assert!(collect_effect_attestations(&client, &"alice".to_string(), 1, oid, &committee)
+            .is_empty());
     }
 }
