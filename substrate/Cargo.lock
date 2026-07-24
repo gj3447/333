@@ -2608,6 +2608,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "p333-cli"
+version = "0.0.0"
+dependencies = [
+ "p333-ltdd",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "p333-consensus"
 version = "0.0.0"
 dependencies = [

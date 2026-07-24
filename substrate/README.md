@@ -40,6 +40,15 @@ docker run --rm \
 | `crates/billing` | **credits as owned objects** — composes Lane A + metering: a relay debit is a finalized owned-object spend (replay-safe, no double-debit) *and* equals the metered cost (conservation). The combined `ooptdd` gate (conservation `invariant` + finalized + no-replay) is GREEN at `queryable_causal`; a free-riding forward or a replayed debit turns it RED | **receipt #8 green** |
 | `crates/relay-billing` | **real-relay byte metering** — forwards a request-response payload over an *actual* Circuit-Relay-v2 connection (server = `crates/relay`) and meters + bills it end-to-end; the relayed delivery is proven by the ack, then the bytes become a finalized owned-object debit. Closes the metering↔relay wiring on the **real relay**, not the in-process `Loopback` | **green** |
 | `crates/wal` | **durability substrate (P0-1)** — write-ahead log absorbed as *design invariants* from etcd `server/storage/wal` @6006f405 (rolling crc32c chain, torn-tail zero-sector repair, tmpdir-rename create, crc-handoff cuts, poisoned-handle fsyncgate). `sync()` → `DurableReceipt` is the ack boundary: nothing externalizes before the receipt. LTDD-verified: abort-crash recovery keeps the receipted prefix intact; a byte flip in the synced region turns reopen RED (`CrcMismatch`/`CorruptFrame`, never auto-repaired) | **green** |
+| `crates/p333-cli` | `p333` CLI — thin wrapper over the verification surface, not a reinvention: `p333 gate run` drives `verify/run_gates.sh`, `p333 gate inject` replays one injected-adversary RED check through the same ooptdd route, `p333 receipt verify` re-judges a committed receipt against its declared schema + every sha256 binding | **green** |
+
+## CLI
+
+```sh
+cargo run -p p333-cli -- gate run                              # the official suite (container + ooptdd)
+cargo run -p p333-cli -- gate inject <trace> <gate> '<event-json>'   # one injected RED probe
+cargo run -p p333-cli -- receipt verify verify/receipts/<file>.json  # schema + sha256 bindings
+```
 
 ## Verification (LTDD)
 

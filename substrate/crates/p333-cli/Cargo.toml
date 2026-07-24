@@ -1,0 +1,21 @@
+[package]
+name = "p333-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "p333 substrate CLI — drives the official ooptdd gate suite (verify/run_gates.sh) and re-validates receipt artifacts against their declared schema + sha256 bindings. Thin wrapper: wraps what the repo already has, never reinvents the gates."
+
+[[bin]]
+name = "p333"
+path = "src/main.rs"
+
+[dependencies]
+# The LTDD envelope vocabulary (Event::from_ooptdd_json) — the injected adversary
+# must be a well-formed envelope, judged by the same type the emitters use.
+p333-ltdd = { path = "../ltdd" }
+# Both already in the workspace lockfile: receipts are JSON, bindings are sha256.
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
