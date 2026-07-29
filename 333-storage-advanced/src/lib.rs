@@ -20,7 +20,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use content333::{BlockStore, Cid, ContentError};
@@ -40,6 +40,10 @@ pub enum AdvError {
     EmptyPayload,
     #[error("replication: quorum not met ({ok}/{need})")]
     NoQuorum { ok: usize, need: usize },
+    #[error("replication: quorum must be greater than zero, got {quorum}")]
+    InvalidQuorum { quorum: usize },
+    #[error("replication: content id mismatch (expected {expected}, actual {actual})")]
+    CidMismatch { expected: Cid, actual: Cid },
     #[error("replication: no replicas configured")]
     NoReplicas,
     #[error("crypto: decryption failed")]
@@ -104,7 +108,11 @@ impl ECEncoder for XorParityEncoder {
         for i in 0..self.k {
             let start = i * shard_len;
             let end = ((i + 1) * shard_len).min(payload.len());
-            let mut s = if start < end { payload[start..end].to_vec() } else { Vec::new() };
+            let mut s = if start < end {
+                payload[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
             s.resize(shard_len, 0);
             data_shards.push(s);
         }
@@ -120,14 +128,20 @@ impl ECEncoder for XorParityEncoder {
             out.push(Shard { index: i, data: d });
         }
         for j in 0..self.m {
-            out.push(Shard { index: self.k + j, data: parity.clone() });
+            out.push(Shard {
+                index: self.k + j,
+                data: parity.clone(),
+            });
         }
         Ok(out)
     }
 
     fn decode(&self, shards: &[Shard]) -> Result<Vec<u8>, AdvError> {
         if shards.is_empty() {
-            return Err(AdvError::NotEnoughShards { have: 0, need: self.k });
+            return Err(AdvError::NotEnoughShards {
+                have: 0,
+                need: self.k,
+            });
         }
         let shard_len = shards[0].data.len();
         let mut by_idx: BTreeMap<usize, &Shard> = BTreeMap::new();
@@ -243,22 +257,38 @@ impl QuorumReplication {
 impl ReplicationStrategy for QuorumReplication {
     fn put(
         &self,
-        _cid: &Cid,
+        cid: &Cid,
         bytes: &[u8],
         replicas: &[ReplicaId],
     ) -> Result<Vec<ReplicaId>, AdvError> {
+        if self.quorum == 0 {
+            return Err(AdvError::InvalidQuorum {
+                quorum: self.quorum,
+            });
+        }
         if replicas.is_empty() {
             return Err(AdvError::NoReplicas);
         }
+        let actual = Cid::of(bytes);
+        if actual != *cid {
+            return Err(AdvError::CidMismatch {
+                expected: *cid,
+                actual,
+            });
+        }
         let stores = self.stores.lock().unwrap();
         let faulty = self.faulty.lock().unwrap();
+        let mut seen = HashSet::new();
         let mut acked = Vec::new();
         for r in replicas {
+            if !seen.insert(r.clone()) {
+                continue;
+            }
             if faulty.contains(r) {
                 continue;
             }
             if let Some(s) = stores.get(r) {
-                if s.put(bytes.to_vec()).is_ok() {
+                if matches!(s.put(bytes.to_vec()), Ok(stored_cid) if stored_cid == *cid) {
                     acked.push(r.clone());
                 }
             }
@@ -277,14 +307,28 @@ impl ReplicationStrategy for QuorumReplication {
             return Err(AdvError::NoReplicas);
         }
         let stores = self.stores.lock().unwrap();
+        let mut first_mismatch = None;
         for r in replicas {
             if let Some(s) = stores.get(r) {
                 if let Ok(b) = s.get(cid) {
-                    return Ok((b, r.clone()));
+                    let actual = Cid::of(&b);
+                    if actual == *cid {
+                        return Ok((b, r.clone()));
+                    }
+                    first_mismatch.get_or_insert(actual);
                 }
             }
         }
-        Err(AdvError::Backend(format!("cid {} not found on any replica", cid)))
+        if let Some(actual) = first_mismatch {
+            return Err(AdvError::CidMismatch {
+                expected: *cid,
+                actual,
+            });
+        }
+        Err(AdvError::Backend(format!(
+            "cid {} not found on any replica",
+            cid
+        )))
     }
 }
 
@@ -311,19 +355,36 @@ impl PrimaryBackup {
 impl ReplicationStrategy for PrimaryBackup {
     fn put(
         &self,
-        _cid: &Cid,
+        cid: &Cid,
         bytes: &[u8],
         replicas: &[ReplicaId],
     ) -> Result<Vec<ReplicaId>, AdvError> {
+        let actual = Cid::of(bytes);
+        if actual != *cid {
+            return Err(AdvError::CidMismatch {
+                expected: *cid,
+                actual,
+            });
+        }
         let stores = self.stores.lock().unwrap();
         let primary = stores.get(&self.primary).ok_or(AdvError::NoReplicas)?;
-        primary
+        let primary_cid = primary
             .put(bytes.to_vec())
             .map_err(|e| AdvError::Backend(e.to_string()))?;
+        if primary_cid != *cid {
+            return Err(AdvError::CidMismatch {
+                expected: *cid,
+                actual: primary_cid,
+            });
+        }
         let mut acked = vec![self.primary.clone()];
+        let mut seen = HashSet::from([self.primary.clone()]);
         for r in replicas.iter().filter(|r| **r != self.primary) {
+            if !seen.insert(r.clone()) {
+                continue;
+            }
             if let Some(s) = stores.get(r) {
-                if s.put(bytes.to_vec()).is_ok() {
+                if matches!(s.put(bytes.to_vec()), Ok(stored_cid) if stored_cid == *cid) {
                     acked.push(r.clone());
                 }
             }
@@ -334,7 +395,16 @@ impl ReplicationStrategy for PrimaryBackup {
     fn get(&self, cid: &Cid, _replicas: &[ReplicaId]) -> Result<(Vec<u8>, ReplicaId), AdvError> {
         let stores = self.stores.lock().unwrap();
         let primary = stores.get(&self.primary).ok_or(AdvError::NoReplicas)?;
-        let bytes = primary.get(cid).map_err(|e| AdvError::Backend(e.to_string()))?;
+        let bytes = primary
+            .get(cid)
+            .map_err(|e| AdvError::Backend(e.to_string()))?;
+        let actual = Cid::of(&bytes);
+        if actual != *cid {
+            return Err(AdvError::CidMismatch {
+                expected: *cid,
+                actual,
+            });
+        }
         Ok((bytes, self.primary.clone()))
     }
 }
@@ -394,7 +464,11 @@ impl XorCipherMetadata {
 impl EncryptedMetadata for XorCipherMetadata {
     fn put_encrypted(&self, path: &str, key: &[u8], plaintext: &[u8]) -> Result<(), AdvError> {
         let ks = Self::keystream(key, plaintext.len());
-        let ciphertext: Vec<u8> = plaintext.iter().zip(ks.iter()).map(|(a, b)| a ^ b).collect();
+        let ciphertext: Vec<u8> = plaintext
+            .iter()
+            .zip(ks.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
         let mac = Self::mac_of(key, &ciphertext);
         self.inner
             .write()
@@ -428,11 +502,18 @@ impl EncryptedMetadata for XorCipherMetadata {
             return Err(AdvError::DecryptFailed);
         }
         let ks = Self::keystream(key, ciphertext.len());
-        Ok(ciphertext.iter().zip(ks.iter()).map(|(a, b)| a ^ b).collect())
+        Ok(ciphertext
+            .iter()
+            .zip(ks.iter())
+            .map(|(a, b)| a ^ b)
+            .collect())
     }
 
     fn has(&self, path: &str) -> bool {
-        self.inner.read().map(|g| g.contains_key(path)).unwrap_or(false)
+        self.inner
+            .read()
+            .map(|g| g.contains_key(path))
+            .unwrap_or(false)
     }
 }
 
@@ -497,7 +578,10 @@ impl InMemoryOpfs {
 
 impl OpfsBackend for InMemoryOpfs {
     fn acquire_writer(&self, path: &str) -> Result<WriterGuard, AdvError> {
-        let mut g = self.locks.lock().map_err(|e| AdvError::Backend(e.to_string()))?;
+        let mut g = self
+            .locks
+            .lock()
+            .map_err(|e| AdvError::Backend(e.to_string()))?;
         if g.contains(path) {
             return Err(AdvError::OpfsConcurrentWrite(path.into()));
         }
@@ -562,12 +646,17 @@ impl<O: OpfsBackend> BlockStore for OpfsBlockStore<O> {
     }
 
     fn get(&self, cid: &Cid) -> Result<Vec<u8>, ContentError> {
-        self.opfs
+        let bytes = self
+            .opfs
             .read_sync(&Self::path_for(cid))
             .map_err(|e| match e {
                 AdvError::OpfsNotFound(_) => ContentError::NotFound(*cid),
                 other => ContentError::Backend(other.to_string()),
-            })
+            })?;
+        if Cid::of(&bytes) != *cid {
+            return Err(ContentError::Integrity(*cid));
+        }
+        Ok(bytes)
     }
 
     fn has(&self, cid: &Cid) -> bool {
@@ -588,7 +677,47 @@ impl<O: OpfsBackend> BlockStore for OpfsBlockStore<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use content333::InMemoryBlockStore;
+    use content333::{ContentError, InMemoryBlockStore};
+
+    struct WrongCidStore;
+
+    impl BlockStore for WrongCidStore {
+        fn put(&self, _bytes: Vec<u8>) -> Result<Cid, ContentError> {
+            Ok(Cid::of(b"wrong-cid"))
+        }
+
+        fn get(&self, cid: &Cid) -> Result<Vec<u8>, ContentError> {
+            Err(ContentError::NotFound(*cid))
+        }
+
+        fn has(&self, _cid: &Cid) -> bool {
+            false
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    struct WrongBytesStore;
+
+    impl BlockStore for WrongBytesStore {
+        fn put(&self, bytes: Vec<u8>) -> Result<Cid, ContentError> {
+            Ok(Cid::of(&bytes))
+        }
+
+        fn get(&self, _cid: &Cid) -> Result<Vec<u8>, ContentError> {
+            Ok(b"corrupt bytes".to_vec())
+        }
+
+        fn has(&self, _cid: &Cid) -> bool {
+            true
+        }
+
+        fn len(&self) -> usize {
+            1
+        }
+    }
 
     // ---- ECEncoder tests -----------------------------------------------------
 
@@ -673,6 +802,67 @@ mod tests {
     }
 
     #[test]
+    fn quorum_counts_distinct_replica_ids_only() {
+        let q = QuorumReplication::new(2);
+        q.attach("r0".into(), Arc::new(InMemoryBlockStore::new()));
+        let replicas = vec!["r0".into(), "r0".into()];
+        let bytes = b"one physical replica".to_vec();
+        let cid = Cid::of(&bytes);
+
+        let err = q.put(&cid, &bytes, &replicas).unwrap_err();
+
+        assert!(matches!(err, AdvError::NoQuorum { ok: 1, need: 2 }));
+    }
+
+    #[test]
+    fn quorum_rejects_requested_cid_that_does_not_bind_bytes() {
+        let q = QuorumReplication::new(1);
+        q.attach("r0".into(), Arc::new(InMemoryBlockStore::new()));
+        let replicas = vec!["r0".into()];
+        let requested = Cid::of(b"different payload");
+
+        assert!(q.put(&requested, b"actual payload", &replicas).is_err());
+    }
+
+    #[test]
+    fn quorum_rejects_store_ack_bound_to_wrong_cid() {
+        let q = QuorumReplication::new(1);
+        q.attach("r0".into(), Arc::new(WrongCidStore));
+        let replicas = vec!["r0".into()];
+        let bytes = b"actual payload";
+        let cid = Cid::of(bytes);
+
+        assert!(q.put(&cid, bytes, &replicas).is_err());
+    }
+
+    #[test]
+    fn zero_quorum_is_rejected() {
+        let q = QuorumReplication::new(0);
+        q.attach("r0".into(), Arc::new(InMemoryBlockStore::new()));
+        let replicas = vec!["r0".into()];
+        let bytes = b"payload";
+        let cid = Cid::of(bytes);
+
+        assert!(q.put(&cid, bytes, &replicas).is_err());
+    }
+
+    #[test]
+    fn quorum_skips_replica_returning_bytes_for_wrong_cid() {
+        let q = QuorumReplication::new(2);
+        q.attach("corrupt".into(), Arc::new(WrongBytesStore));
+        q.attach("honest".into(), Arc::new(InMemoryBlockStore::new()));
+        let replicas = vec!["corrupt".into(), "honest".into()];
+        let bytes = b"expected payload";
+        let cid = Cid::of(bytes);
+        q.put(&cid, bytes, &replicas).unwrap();
+
+        let (got, who) = q.get(&cid, &replicas).unwrap();
+
+        assert_eq!(got, bytes);
+        assert_eq!(who, "honest");
+    }
+
+    #[test]
     fn primary_backup_reads_always_from_primary() {
         let pb = PrimaryBackup::new("p".into());
         let p_store = Arc::new(InMemoryBlockStore::new());
@@ -690,11 +880,35 @@ mod tests {
     }
 
     #[test]
+    fn primary_rejects_store_ack_bound_to_wrong_cid() {
+        let pb = PrimaryBackup::new("p".into());
+        pb.attach("p".into(), Arc::new(WrongCidStore));
+        let replicas = vec!["p".into()];
+        let bytes = b"actual payload";
+        let cid = Cid::of(bytes);
+
+        assert!(pb.put(&cid, bytes, &replicas).is_err());
+    }
+
+    #[test]
+    fn primary_rejects_bytes_that_do_not_match_requested_cid() {
+        let pb = PrimaryBackup::new("p".into());
+        pb.attach("p".into(), Arc::new(WrongBytesStore));
+        let bytes = b"expected payload";
+        let cid = Cid::of(bytes);
+
+        assert!(pb.get(&cid, &[]).is_err());
+    }
+
+    #[test]
     fn replication_no_replicas_errors() {
         let q = QuorumReplication::new(1);
         let bytes = b"x".to_vec();
         let cid = Cid::of(&bytes);
-        assert!(matches!(q.put(&cid, &bytes, &[]), Err(AdvError::NoReplicas)));
+        assert!(matches!(
+            q.put(&cid, &bytes, &[]),
+            Err(AdvError::NoReplicas)
+        ));
     }
 
     // ---- EncryptedMetadata tests --------------------------------------------
@@ -786,8 +1000,25 @@ mod tests {
     }
 
     #[test]
+    fn opfs_block_store_rehashes_bytes_on_read() {
+        let opfs = Arc::new(InMemoryOpfs::new(1024));
+        let store = OpfsBlockStore { opfs: opfs.clone() };
+        let cid = Cid::of(b"expected payload");
+        let path = OpfsBlockStore::<InMemoryOpfs>::path_for(&cid);
+        opfs.acquire_writer(&path)
+            .unwrap()
+            .write(b"corrupt bytes")
+            .unwrap();
+
+        assert!(matches!(store.get(&cid), Err(ContentError::Integrity(got)) if got == cid));
+    }
+
+    #[test]
     fn opfs_missing_path_errors() {
         let opfs = InMemoryOpfs::new(1024);
-        assert!(matches!(opfs.read_sync("/nope"), Err(AdvError::OpfsNotFound(_))));
+        assert!(matches!(
+            opfs.read_sync("/nope"),
+            Err(AdvError::OpfsNotFound(_))
+        ));
     }
 }
