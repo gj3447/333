@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use transfer333::{
     Authority, AuthorityError, AuthorityMsg, AuthorityNet, Certificate, Certified, Committee,
-    ConfirmError, ConfirmOutcome, FileJournal, Ledger, NetworkId, OwnerAuthError, OwnerRegistry,
-    SignedTransfer, SigningKey,
+    ConfirmError, ConfirmOutcome, EpochCert, EpochError, EpochProposal, EpochVote, FenceOutcome,
+    FileJournal, InstallOutcome, Ledger, NetworkId, OwnerAuthError, OwnerRegistry, SignedTransfer,
+    SigningKey,
     TcpAuthorityNet, Transfer, TransferPolicy, VerifyingKey, VoteCollector,
 };
 use zeroize::Zeroizing;
@@ -40,6 +41,13 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Some("reconfig") => match run_reconfig(&args[2..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("reconfig error: {e}");
+                ExitCode::from(1)
+            }
+        },
         _ => {
             usage();
             ExitCode::from(1)
@@ -52,6 +60,8 @@ fn usage() {
         "usage:
   node authority --id <a0> (--key-file <hex-key-file> | --dev-seed <0>) --network-id <deployment> --owner-roster alice=<pubhex>,bob=<pubhex> --listen <127.0.0.1:PORT> --peers <addr,addr,...> --committee a0=<pubhex>,a1=<pubhex>,... [--genesis alice=100,bob=0] [--journal <path>] [--rounds-idle-exit <n>]
   node submit (--key-file <hex-key-file> | --dev-seed <42>) --network-id <deployment> --owner-roster alice=<pubhex>,bob=<pubhex> --listen <127.0.0.1:PORT> --peers <authority_addrs,...> --committee a0=<pubhex>,... --transfer <alice:0:bob:30> [--max-rounds 200] [--pause-ms 10]
+  node reconfig --network-id <deployment> --owner-roster alice=<pubhex>,... --listen <127.0.0.1:PORT> --peers <authority_addrs,...> --committee <current roster> --next-committee <new roster> --epoch <n> [--max-rounds 300] [--pause-ms 10]
+  node authority ... [--observe]  (observer boot for a not-yet-member joining via epoch change)
 
 `--dev-seed` is deterministic debug-build scaffolding only and is rejected by
 release builds. Production rosters contain public keys; private authority/owner
@@ -66,6 +76,10 @@ struct Flags {
 }
 
 impl Flags {
+    /// Boolean switches that take no value (e.g. `--observe`). Everything
+    /// else still requires one — a missing value must stay a loud error.
+    const BOOLEAN: &'static [&'static str] = &["observe"];
+
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut map = BTreeMap::new();
         let mut i = 0;
@@ -79,6 +93,12 @@ impl Flags {
                 return Err("empty flag".into());
             }
             i += 1;
+            if Self::BOOLEAN.contains(&key.as_str())
+                && (i >= args.len() || args[i].starts_with("--"))
+            {
+                map.insert(key, "true".to_string());
+                continue;
+            }
             if i >= args.len() {
                 return Err(format!("flag --{key} requires a value"));
             }
@@ -205,7 +225,7 @@ fn load_signing_key(flags: &Flags) -> Result<SigningKey, String> {
 }
 
 /// Public-key-only authority roster. Private seeds never appear in this value.
-fn parse_committee(s: &str, policy: TransferPolicy) -> Result<Committee, String> {
+fn parse_roster(s: &str) -> Result<Vec<(String, VerifyingKey)>, String> {
     let mut members = Vec::new();
     for part in s.split(',') {
         let part = part.trim();
@@ -219,6 +239,12 @@ fn parse_committee(s: &str, policy: TransferPolicy) -> Result<Committee, String>
         let key = parse_verifying_key(public_hex.trim(), "committee public key")?;
         members.push((id, key));
     }
+    Ok(members)
+}
+
+/// Public-key-only authority roster. Private seeds never appear in this value.
+fn parse_committee(s: &str, policy: TransferPolicy) -> Result<Committee, String> {
+    let members = parse_roster(s)?;
     Committee::new(members, policy).ok_or_else(|| "empty or duplicate committee".into())
 }
 
@@ -347,7 +373,7 @@ fn run_authority(args: &[String]) -> Result<(), String> {
         Some(path) => {
             let journal = FileJournal::open(path)
                 .map_err(|e| format!("--journal {path}: {e}"))?;
-            Authority::recover(id.clone(), signing_key, policy, committee.id(), ledger, journal)
+            Authority::recover(id.clone(), signing_key, policy.clone(), committee.id(), ledger, journal)
                 .map_err(|e| format!("journal recovery failed: {e}"))?
         }
         None => {
@@ -356,16 +382,26 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                  forget them and this authority may sign a conflicting order for a \
                  slot it already voted on. Do not use for a durable deployment."
             );
-            Authority::new(id.clone(), signing_key, policy, committee.id(), ledger)
+            Authority::new(id.clone(), signing_key, policy.clone(), committee.id(), ledger)
         }
     };
-    // Public key must match committee entry for this id.
+    // Public key must match committee entry for this id. With `--observe` a
+    // non-member may boot as a passive observer (committee-reconfiguration
+    // M3 join path: it converges via old-epoch certificates, installs the
+    // epoch change, and starts voting only once it IS a member). Without the
+    // flag, a missing membership is a config mistake and a hard error.
+    let observe = flags.get("observe").is_some();
     if let Some(expected) = committee.key_of(&id) {
         if auth.verifying_key() != *expected {
             return Err(format!(
                 "authority --id {id} private key does not match --committee public key"
             ));
         }
+    } else if observe {
+        eprintln!(
+            "warning: authority id {id} not in --committee; booting as OBSERVER \
+             (votes ignored until an epoch change makes it a member)"
+        );
     } else {
         return Err(format!("authority id {id} not in --committee"));
     }
@@ -405,6 +441,9 @@ fn run_authority(args: &[String]) -> Result<(), String> {
     });
 
     let endpoint = net.endpoint();
+    // The committee the daemon validates against. Swapped to the next roster
+    // the moment an installed epoch change completes (committee-reconfig M3).
+    let mut committee = committee;
     // Anti-entropy, receiver-independent half (audit 2026-07-15 P1): a
     // certificate is public, self-authenticating evidence — re-presenting it
     // is always safe (`confirm` is idempotent: AlreadyApplied). The daemon
@@ -413,6 +452,9 @@ fn run_authority(args: &[String]) -> Result<(), String> {
     // converges level-triggered instead of staying locked on an old seq
     // forever. No request/response protocol: just periodic re-presentation.
     let mut applied_certs: HashMap<(String, u64), Certificate> = HashMap::new();
+    // Epoch certificates get the same re-presentation (M3/M5): a straggler
+    // that missed the change converges to the new epoch the same way.
+    let mut applied_epoch_certs: HashMap<u64, EpochCert> = HashMap::new();
     // ~100 idle rounds ≈ 0.7s at this loop's sleep pace; quiet-period-only
     // rebroadcast self-throttles under load.
     const REBROADCAST_IDLE_ROUNDS: usize = 100;
@@ -420,11 +462,22 @@ fn run_authority(args: &[String]) -> Result<(), String> {
     // Level-triggered (re-)dial of missing mesh peers, ~50 rounds ≈ 0.35s.
     const REDIAL_INTERVAL_ROUNDS: usize = 50;
     let mut since_redial = 0usize;
+    // Epoch-change daemon state (M3): the quiet window for signing an epoch
+    // vote is the same cadence as the re-presentation above — the frontier
+    // must be stable (no new cert_applied) for the whole window.
+    const QUIET_ROUNDS_FOR_EPOCH_VOTE: u64 = 100;
+    let mut loop_tick: u64 = 0;
+    let mut frontier_changed_at: u64 = 0;
+    let mut epoch_vote_sent = false;
+    // An epoch cert parked in Installing (frontier catch-up); the committee
+    // swaps when coverage completes.
+    let mut pending_epoch_cert: Option<EpochCert> = None;
     let mut idle_rounds = 0usize;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        loop_tick += 1;
 
         since_redial += 1;
         if since_redial >= REDIAL_INTERVAL_ROUNDS {
@@ -456,12 +509,32 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                     }
                     order_ids.push_str(&order_id_hex(&cert.order));
                 }
+                for ec in applied_epoch_certs.values() {
+                    let _ = endpoint.broadcast_epoch_cert(ec.clone());
+                }
                 emit(&format!(
-                    "{{\"event\":\"cert_rebroadcast\",\"authority\":\"{}\",\"certs\":{},\"order_ids\":\"{}\"}}",
+                    "{{\"event\":\"cert_rebroadcast\",\"authority\":\"{}\",\"certs\":{},\"epoch_certs\":{},\"order_ids\":\"{}\"}}",
                     escape_json(&id),
                     applied_certs.len(),
+                    applied_epoch_certs.len(),
                     escape_json(&order_ids)
                 ));
+            }
+            // Quiet window (design §5): sign the epoch vote only after the
+            // frontier has been stable for the whole window — the signature
+            // binds exactly that stable state.
+            if !epoch_vote_sent
+                && loop_tick.saturating_sub(frontier_changed_at) >= QUIET_ROUNDS_FOR_EPOCH_VOTE
+            {
+                if let Ok(vote) = auth.sign_epoch_vote() {
+                    emit(&format!(
+                        "{{\"event\":\"epoch_vote_cast\",\"authority\":\"{}\",\"epoch\":{}}}",
+                        escape_json(&id),
+                        vote.epoch
+                    ));
+                    let _ = endpoint.broadcast_epoch_vote(vote);
+                    epoch_vote_sent = true;
+                }
             }
             if let Some(n) = idle_exit {
                 if idle_rounds >= n {
@@ -630,7 +703,14 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                 },
                 AuthorityMsg::Cert(c) => {
                     if let Some(v) = c.verify(&committee) {
-                        match auth.confirm(&v, &committee) {
+                        // Observers follow the log without the self-membership
+                        // binding (join path); members take the strict check.
+                        let outcome = if observe {
+                            auth.confirm_as_observer(&v, &committee)
+                        } else {
+                            auth.confirm(&v, &committee)
+                        };
+                        match outcome {
                             Ok(ConfirmOutcome::Applied) => {
                                 emit(&format!(
                                     "{{\"event\":\"cert_applied\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"epoch\":{},\"balances\":{},\"total_supply\":{}}}",
@@ -648,6 +728,7 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                                 // Retain for quiet-period anti-entropy
                                 // re-presentation (see applied_certs above).
                                 applied_certs.insert((account.clone(), seq), c.clone());
+                                frontier_changed_at = loop_tick;
                                 if let Some(attestation) = auth.attestation_for(&account, seq) {
                                     let _ = endpoint.broadcast_attestation(attestation);
                                 }
@@ -687,13 +768,115 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                     // Authorities ignore peer attestations; clients collect
                     // them for EffectCert finality.
                 }
-                AuthorityMsg::EpochProposal(_)
-                | AuthorityMsg::EpochVote(_)
-                | AuthorityMsg::EpochCert(_) => {
-                    // M2 wires the epoch FSM. Until then epoch messages are
-                    // inert here — M1 has no producer, so receiving one is a
-                    // version-skew no-op, never a crash.
+                AuthorityMsg::EpochProposal(p) => {
+                    match auth.fence(p.clone()) {
+                        Ok(FenceOutcome::Fenced { next_committee_id }) => {
+                            epoch_vote_sent = false;
+                            frontier_changed_at = loop_tick; // fence restarts the quiet window
+                            emit(&format!(
+                                "{{\"event\":\"epoch_fenced\",\"authority\":\"{}\",\"epoch\":{},\"next_committee\":\"{}\"}}",
+                                escape_json(&id),
+                                p.epoch,
+                                escape_json(&next_committee_id.to_string())
+                            ));
+                        }
+                        Ok(other) => {
+                            emit(&format!(
+                                "{{\"event\":\"epoch_fence_ignored\",\"authority\":\"{}\",\"epoch\":{},\"outcome\":\"{}\"}}",
+                                escape_json(&id),
+                                p.epoch,
+                                escape_json(&format!("{other:?}"))
+                            ));
+                        }
+                        Err(e) => {
+                            emit(&format!(
+                                "{{\"event\":\"epoch_fence_rejected\",\"authority\":\"{}\",\"epoch\":{},\"error\":\"{}\"}}",
+                                escape_json(&id),
+                                p.epoch,
+                                escape_json(&format!("{e:?}"))
+                            ));
+                        }
+                    }
                 }
+                AuthorityMsg::EpochVote(_) => {
+                    // Authorities ignore peer epoch votes; the reconfig client
+                    // collects them (mirrors user Vote handling).
+                }
+                AuthorityMsg::EpochCert(c) => {
+                    match auth.install_epoch_cert(&c, &committee) {
+                        Ok(InstallOutcome::Installed) => {
+                            emit(&format!(
+                                "{{\"event\":\"epoch_installed\",\"authority\":\"{}\",\"epoch\":{}}}",
+                                escape_json(&id),
+                                c.epoch
+                            ));
+                            committee = Committee::with_epoch(
+                                c.next_roster.clone(),
+                                policy.clone(),
+                                c.epoch,
+                            )
+                            .expect("roster validated at install");
+                            epoch_vote_sent = true;
+                            applied_epoch_certs.insert(c.epoch, c.clone());
+                        }
+                        Ok(InstallOutcome::Installing) => {
+                            emit(&format!(
+                                "{{\"event\":\"epoch_installing\",\"authority\":\"{}\",\"epoch\":{}}}",
+                                escape_json(&id),
+                                c.epoch
+                            ));
+                            pending_epoch_cert = Some(c.clone());
+                            applied_epoch_certs.insert(c.epoch, c.clone());
+                        }
+                        Ok(other) => {
+                            emit(&format!(
+                                "{{\"event\":\"epoch_install_ignored\",\"authority\":\"{}\",\"epoch\":{},\"outcome\":\"{}\"}}",
+                                escape_json(&id),
+                                c.epoch,
+                                escape_json(&format!("{other:?}"))
+                            ));
+                        }
+                        Err(EpochError::ConflictingCert) => {
+                            emit(&format!(
+                                "{{\"event\":\"epoch_conflicting\",\"authority\":\"{}\",\"epoch\":{}}}",
+                                escape_json(&id),
+                                c.epoch
+                            ));
+                            return Err(
+                                "conflicting valid epoch certs: old committee's Byzantine budget exceeded"
+                                    .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            emit(&format!(
+                                "{{\"event\":\"epoch_install_rejected\",\"authority\":\"{}\",\"epoch\":{},\"error\":\"{}\"}}",
+                                escape_json(&id),
+                                c.epoch,
+                                escape_json(&format!("{e:?}"))
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // Coverage completion (design §5): an epoch cert parked in Installing
+        // activates the moment the local frontier covers the committed one —
+        // the committee swap happens exactly then, never earlier.
+        if let Some(pc) = &pending_epoch_cert {
+            if auth.epoch() == pc.epoch {
+                emit(&format!(
+                    "{{\"event\":\"epoch_installed\",\"authority\":\"{}\",\"epoch\":{},\"via\":\"coverage\"}}",
+                    escape_json(&id),
+                    pc.epoch
+                ));
+                committee = Committee::with_epoch(
+                    pc.next_roster.clone(),
+                    policy.clone(),
+                    pc.epoch,
+                )
+                .expect("roster validated at install");
+                epoch_vote_sent = true;
+                pending_epoch_cert = None;
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -810,6 +993,165 @@ fn run_submit(args: &[String]) -> Result<ExitCode, String> {
                 order_id_hex(&order),
                 escape_json(&transfer_str(&order.transfer)),
                 escape_json(&reason)
+            ));
+            ExitCode::from(2)
+        }
+    };
+
+    net.shutdown();
+    Ok(code)
+}
+
+// --- reconfig subcommand (committee-reconfiguration M3) ----------------------
+
+/// Operator path for an epoch change: broadcast the proposal, collect the
+/// fenced authorities' epoch votes until one frontier digest has quorum, then
+/// assemble and broadcast the epoch certificate. Level-triggered like submit:
+/// the proposal is re-broadcast every window, so a late or missed authority
+/// delays the change instead of killing it.
+fn run_reconfig(args: &[String]) -> Result<ExitCode, String> {
+    let flags = Flags::parse(args).map_err(|e| {
+        usage();
+        e
+    })?;
+    let network_id = parse_network_id(flags.require("network-id")?)?;
+    let owners = parse_owner_roster(flags.require("owner-roster")?)?;
+    let policy = TransferPolicy::new(network_id.clone(), owners);
+    let listen = parse_listen(flags.require("listen")?)?;
+    let peers = parse_peers(flags.require("peers")?)?;
+    let committee = parse_committee(flags.require("committee")?, policy.clone())?;
+    let next_roster = parse_roster(flags.require("next-committee")?)?;
+    let epoch: u64 = flags
+        .require("epoch")?
+        .parse()
+        .map_err(|_| "bad --epoch".to_string())?;
+    if epoch != committee.epoch() + 1 {
+        return Err(format!(
+            "--epoch {epoch} is not current+1 ({})",
+            committee.epoch() + 1
+        ));
+    }
+    let next_committee = Committee::with_epoch(next_roster.clone(), policy.clone(), epoch)
+        .ok_or("invalid --next-committee roster")?;
+    let max_rounds: usize = flags
+        .get("max-rounds")
+        .unwrap_or("300")
+        .parse()
+        .map_err(|e| format!("bad --max-rounds: {e}"))?;
+    let pause_ms: u64 = flags
+        .get("pause-ms")
+        .unwrap_or("10")
+        .parse()
+        .map_err(|e| format!("bad --pause-ms: {e}"))?;
+
+    let proposal = EpochProposal {
+        network_id,
+        policy_id: policy.id(),
+        epoch,
+        next_roster,
+    };
+    let client_id = format!("reconfig-{}", std::process::id());
+    let net = TcpAuthorityNet::bind_at(client_id, listen)
+        .map_err(|e| format!("bind {listen}: {e}"))?;
+    // Best-effort connect; missing peers are retried in the collection loop.
+    for &a in &peers {
+        let _ = net.connect_peer(a);
+    }
+    thread::sleep(Duration::from_millis(30));
+    emit(&format!(
+        "{{\"event\":\"epoch_proposed\",\"epoch\":{},\"next_committee\":\"{}\"}}",
+        epoch,
+        escape_json(&next_committee.id().to_string())
+    ));
+
+    const RETRY_WINDOW: usize = 25;
+    let endpoint = net.endpoint();
+    let mut votes: Vec<EpochVote> = Vec::new();
+    let mut remaining = max_rounds.max(1);
+    let assembled: Option<EpochCert> = loop {
+        for &a in &peers {
+            let known = net.peer_states().iter().any(|(ra, _)| *ra == Some(a));
+            if !known {
+                let _ = net.connect_peer(a);
+            }
+        }
+        endpoint
+            .broadcast_epoch_proposal(proposal.clone())
+            .map_err(|e| format!("broadcast_epoch_proposal: {e:?}"))?;
+        let window = remaining.min(RETRY_WINDOW);
+        let mut done = None;
+        for _ in 0..window {
+            for msg in endpoint.poll() {
+                let AuthorityMsg::EpochVote(v) = msg else {
+                    continue;
+                };
+                // Foreign change, foreign trust root, or foreign roster:
+                // never mixed into this certificate.
+                if v.epoch != epoch
+                    || v.committee_id != committee.id()
+                    || v.next_committee_id != next_committee.id()
+                {
+                    continue;
+                }
+                let Some(key) = committee.key_of(&v.authority) else {
+                    continue;
+                };
+                if v.verify_signature(key).is_err() {
+                    continue;
+                }
+                if !votes.iter().any(|seen| seen.authority == v.authority) {
+                    votes.push(v);
+                }
+            }
+            // One frontier digest must hold quorum — a split frontier means
+            // the fence quorum has not converged yet, so keep waiting.
+            let mut by_digest: HashMap<[u8; 32], Vec<EpochVote>> = HashMap::new();
+            for v in &votes {
+                by_digest.entry(v.frontier_digest).or_default().push(v.clone());
+            }
+            if let Some((_, group)) = by_digest
+                .into_iter()
+                .find(|(_, group)| group.len() >= committee.quorum())
+            {
+                done = Some(EpochCert {
+                    epoch,
+                    next_roster: proposal.next_roster.clone(),
+                    frontier: group[0].frontier.clone(),
+                    votes: group[..committee.quorum()].to_vec(),
+                });
+                break;
+            }
+            if pause_ms > 0 {
+                thread::sleep(Duration::from_millis(pause_ms));
+            }
+        }
+        if done.is_some() {
+            break done;
+        }
+        remaining = remaining.saturating_sub(window);
+        if remaining == 0 {
+            break None;
+        }
+    };
+
+    let code = match assembled {
+        Some(cert) => {
+            endpoint
+                .broadcast_epoch_cert(cert)
+                .map_err(|e| format!("broadcast_epoch_cert: {e:?}"))?;
+            // Give authorities a moment to receive/install before teardown.
+            thread::sleep(Duration::from_millis(100));
+            emit(&format!(
+                "{{\"event\":\"epoch_cert_broadcast\",\"epoch\":{},\"votes\":{}}}",
+                epoch,
+                committee.quorum()
+            ));
+            ExitCode::SUCCESS
+        }
+        None => {
+            emit(&format!(
+                "{{\"event\":\"epoch_reconfig_failed\",\"epoch\":{},\"reason\":\"no quorum-agreed frontier within budget\"}}",
+                epoch
             ));
             ExitCode::from(2)
         }

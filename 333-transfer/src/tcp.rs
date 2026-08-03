@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use crate::authority::{Certificate, Vote};
 use crate::effect::EffectAttestation;
+use crate::epoch::{EpochCert, EpochProposal, EpochVote};
 use crate::net::{AuthorityMsg, AuthorityNet, NetError};
 use crate::wire::{decode_authority_msg, encode_authority_msg};
 use crate::SignedTransfer;
@@ -311,6 +312,18 @@ impl AuthorityNet for TcpEndpoint {
 
     fn broadcast_attestation(&self, a: EffectAttestation) -> Result<(), NetError> {
         self.write_all(&AuthorityMsg::Attestation(a))
+    }
+
+    fn broadcast_epoch_proposal(&self, p: EpochProposal) -> Result<(), NetError> {
+        self.write_all(&AuthorityMsg::EpochProposal(p))
+    }
+
+    fn broadcast_epoch_vote(&self, v: EpochVote) -> Result<(), NetError> {
+        self.write_all(&AuthorityMsg::EpochVote(v))
+    }
+
+    fn broadcast_epoch_cert(&self, c: EpochCert) -> Result<(), NetError> {
+        self.write_all(&AuthorityMsg::EpochCert(c))
     }
 
     fn poll(&self) -> Vec<AuthorityMsg> {

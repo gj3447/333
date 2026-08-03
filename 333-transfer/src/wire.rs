@@ -472,6 +472,7 @@ fn put_epoch_vote_body(buf: &mut Vec<u8>, v: &EpochVote) {
     buf.extend_from_slice(v.committee_id.as_bytes());
     buf.extend_from_slice(&v.epoch.to_le_bytes());
     buf.extend_from_slice(v.next_committee_id.as_bytes());
+    put_frontier(buf, &v.frontier);
     buf.extend_from_slice(&v.frontier_digest);
     buf.extend_from_slice(&v.signature.to_bytes());
 }
@@ -481,6 +482,7 @@ fn take_epoch_vote_body(input: &mut &[u8]) -> Result<EpochVote, WireError> {
     let committee_id = take_committee_id(input)?;
     let epoch = take_u64(input)?;
     let next_committee_id = take_committee_id(input)?;
+    let frontier = take_frontier(input)?;
     let frontier_digest: [u8; 32] = take(input, 32)?
         .try_into()
         .expect("take returned exactly 32 frontier-digest bytes");
@@ -490,6 +492,7 @@ fn take_epoch_vote_body(input: &mut &[u8]) -> Result<EpochVote, WireError> {
         committee_id,
         epoch,
         next_committee_id,
+        frontier,
         frontier_digest,
         signature,
     })

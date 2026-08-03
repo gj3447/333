@@ -81,12 +81,20 @@ pub struct EpochProposal {
 /// authority from. `next_committee_id` is the digest the `next_roster` in any
 /// valid [`EpochCert`] must reproduce, so a certificate is self-authenticating
 /// exactly like a transfer `Certificate`.
+///
+/// The vote carries the full `frontier` it digests: a reconfig collector has
+/// no request/response channel to fetch it later, so the certificate can only
+/// be assembled if the frontier travels with the vote. `frontier_digest`
+/// stays in the signed preimage (cheap comparison) and every consumer checks
+/// `frontier_digest(vote.frontier) == vote.frontier_digest` — self-consistency,
+/// so the pair cannot disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochVote {
     pub authority: AuthorityId,
     pub committee_id: CommitteeId,
     pub epoch: u64,
     pub next_committee_id: CommitteeId,
+    pub frontier: Vec<(AccountId, u64)>,
     pub frontier_digest: [u8; 32],
     pub signature: Signature,
 }
@@ -95,6 +103,8 @@ pub struct EpochVote {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EpochVoteError {
     BadSignature,
+    /// `frontier_digest(frontier) != frontier_digest` — the pair disagrees.
+    FrontierMismatch,
 }
 
 impl EpochVote {
@@ -124,15 +134,20 @@ impl EpochVote {
             committee_id,
             epoch,
             next_committee_id,
+            frontier: frontier.to_vec(),
             frontier_digest,
             signature,
         }
     }
 
-    /// Verify the signature against the authority's advertised key. Committee
-    /// membership and quorum are NOT checked here — that is the certificate
-    /// assembly's job (M2), mirroring `Vote`/`Certificate`.
+    /// Verify the signature against the authority's advertised key, plus the
+    /// `frontier`/`frontier_digest` self-consistency (the pair must not
+    /// disagree). Committee membership and quorum are NOT checked here — that
+    /// is the certificate assembly's job (M2), mirroring `Vote`/`Certificate`.
     pub fn verify_signature(&self, key: &VerifyingKey) -> Result<(), EpochVoteError> {
+        if frontier_digest(&self.frontier) != self.frontier_digest {
+            return Err(EpochVoteError::FrontierMismatch);
+        }
         let msg = epoch_vote_signing_message(
             &self.authority,
             &self.committee_id,

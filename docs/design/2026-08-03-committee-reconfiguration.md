@@ -1,9 +1,26 @@
 # Committee Reconfiguration (Epoch Changes) — Design
 
-> Status: DESIGN DRAFT v1 (2026-08-03), NOT yet implemented.
+> Status: DESIGN v1.1 (2026-08-03), M0–M3 implemented and live-gated.
 > Closes: `LakatosTree_333_Cryptocurrency_20260721` question `committee-reconfiguration-epoch`.
 > Audit basis: `SYMPOSIUM/FINDINGS/audit-333-fsm-vs-borg-k8s-2026-07-15/FSM_AUDIT_REPORT.md` (P1: "Committee 정적 — wire에 재구성 메시지 없음").
 > Acceptance (from the tree question): wire epoch/committee-change messages + 2-phase reconfiguration FSM + quorum-intersection safety oracle tests.
+>
+> **v1.1 revisions (discovered during M3 implementation):**
+> 1. **`EpochVote` carries the full `frontier`**, not just its digest — a
+>    reconfig collector has no request/response channel, so the certificate
+>    could never be assembled from digests alone. `frontier_digest` stays in
+>    the signed preimage; consumers check the pair is self-consistent.
+>    (Epoch-wire v1 was unreleased — no producer existed before M3 — so the
+>    layout was revised in place rather than versioned.)
+> 2. **Joining members boot as observers.** A not-yet-member cannot pass the
+>    boot-time membership check nor `confirm()`'s self-key binding. The
+>    `--observe` daemon mode boots anyway, follows the log via
+>    `confirm_as_observer` (identical validation minus exactly the self-key
+>    check), installs the epoch cert, and votes only once it IS a member.
+>    Its pre-membership votes are rejected network-wide by every collector.
+> 3. **Joiners must be in the mesh peer list.** The half-mesh dial rule
+>    (dial strictly greater addresses) isolates any node whose address isn't
+>    in the others' `--peers`; observers are added to `--peers` from boot.
 
 ## 0. Problem
 
@@ -147,13 +164,24 @@ makes this safe rather than merely polite.
 ## 8. Milestones
 
 - **M0** scaffolding: `Committee::with_epoch`, `Authority::epoch()` accessor,
-  current-epoch in events. No behavior change.
+  current-epoch in events. No behavior change. **DONE** (`a3e4908`).
 - **M1** wire types + codec + domains (roundtrip/unknown-tag tests).
+  **DONE** (`8a86f73`; v1.1 revised `EpochVote` to carry the frontier).
 - **M2** authority epoch FSM (fence/vote/install) + frontier digest + unit
   tests (illegal transitions panic; fence blocks votes, never confirms).
-- **M3** `node reconfig` operator path (proposal → vote collection → cert).
-- **M4** the three oracle gates green + negative oracle.
-- **M5** epoch certs in the anti-entropy set + straggler convergence.
+  **DONE** (`2dc1e4a` — 9 integration tests, fully durable via journal).
+- **M3** `node reconfig` operator path (proposal → vote collection → cert)
+  + daemon epoch-message handling + quiet-window vote signing + `--observe`
+  join path + `REQ-EPOCH-CHANGE` live gate (14/14, negative oracle RED
+  against pre-M3 binary). **DONE** (this change).
+- **M4** remaining oracle gates: `REQ-EPOCH-SAFETY` (boundary double-spend
+  attempt: old-committee submit post-change must fail, conflicting order
+  re-signed under new epoch must never certify), `REQ-EPOCH-STRAGGLER`
+  (authority down through the whole change converges via re-presentation).
+- **M5** hardening: epoch certs in the anti-entropy set (done in M3),
+  recovered-authority epoch-cert re-presentation (journal →
+  `applied_epoch_certs` refill), observe-mode vote suppression (currently
+  observers broadcast ignored votes — harmless noise, not a safety issue).
 
 ## 9. Non-goals / explicit risks
 
@@ -163,5 +191,9 @@ makes this safe rather than merely polite.
   pause). A fence-certificate phase that removes the heuristics is v2.
 - **Frontier size** is bounded by the owner roster; if the roster ever becomes
   permissionless this needs a digest-only commitment instead.
+- **Fresh member joining AFTER a completed change** (never observed the old
+  epoch): its trust-root assertion and the foreignness of old-epoch certs
+  need an explicit state-transfer path (balances are not in the frontier) —
+  v2. The M3 observe-join covers members who observe *before* the switch.
 - Removed members learn nothing new; members removed *and* re-added later
   rejoin as fresh (state sync via re-presentation, as with any straggler).

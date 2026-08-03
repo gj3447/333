@@ -28,6 +28,7 @@ use crate::authority::{
     Authority, AuthorityError, Certificate, Certified, Committee, Verified, Vote,
 };
 use crate::effect::EffectAttestation;
+use crate::epoch::{EpochCert, EpochProposal, EpochVote};
 use crate::{AccountId, Ledger, Reject, SignedTransfer};
 
 pub use crate::wire::AuthorityMsg;
@@ -72,6 +73,11 @@ pub trait AuthorityNet: MaybeSendSync {
     fn broadcast_vote(&self, v: Vote) -> Result<(), NetError>;
     fn broadcast_cert(&self, c: Certificate) -> Result<(), NetError>;
     fn broadcast_attestation(&self, a: EffectAttestation) -> Result<(), NetError>;
+    /// Epoch-change messages (committee-reconfiguration M3): operator proposal,
+    /// authority assent, and the quorum certificate itself.
+    fn broadcast_epoch_proposal(&self, p: EpochProposal) -> Result<(), NetError>;
+    fn broadcast_epoch_vote(&self, v: EpochVote) -> Result<(), NetError>;
+    fn broadcast_epoch_cert(&self, c: EpochCert) -> Result<(), NetError>;
     fn poll(&self) -> Vec<AuthorityMsg>;
 }
 
@@ -225,6 +231,18 @@ impl AuthorityNet for MeshEndpoint {
 
     fn broadcast_attestation(&self, a: EffectAttestation) -> Result<(), NetError> {
         self.mesh.fanout(AuthorityMsg::Attestation(a))
+    }
+
+    fn broadcast_epoch_proposal(&self, p: EpochProposal) -> Result<(), NetError> {
+        self.mesh.fanout(AuthorityMsg::EpochProposal(p))
+    }
+
+    fn broadcast_epoch_vote(&self, v: EpochVote) -> Result<(), NetError> {
+        self.mesh.fanout(AuthorityMsg::EpochVote(v))
+    }
+
+    fn broadcast_epoch_cert(&self, c: EpochCert) -> Result<(), NetError> {
+        self.mesh.fanout(AuthorityMsg::EpochCert(c))
     }
 
     fn poll(&self) -> Vec<AuthorityMsg> {

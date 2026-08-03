@@ -301,6 +301,7 @@ fn install_rejects_invalid_certs() {
             committee_id: c.id(),
             epoch: 1,
             next_committee_id: next_committee(1).id(),
+            frontier: frontier.clone(),
             frontier_digest: frontier_digest(&frontier),
             signature: key(42).sign(&[0xEE; 32]),
         })

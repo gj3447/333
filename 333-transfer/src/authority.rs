@@ -1183,6 +1183,29 @@ impl Authority {
         verified: &Verified,
         committee: &Committee,
     ) -> Result<ConfirmOutcome, ConfirmError> {
+        self.confirm_impl(verified, committee, true)
+    }
+
+    /// Observer variant of [`Authority::confirm`] (committee-reconfiguration
+    /// M3 join path): identical validation EXCEPT the self-membership binding,
+    /// which a not-yet-member cannot satisfy by construction. Used only by
+    /// `--observe` daemons — the observer still cannot *vote* (every collector
+    /// rejects non-member votes), it just follows the log until an epoch
+    /// change makes it a member.
+    pub fn confirm_as_observer(
+        &mut self,
+        verified: &Verified,
+        committee: &Committee,
+    ) -> Result<ConfirmOutcome, ConfirmError> {
+        self.confirm_impl(verified, committee, false)
+    }
+
+    fn confirm_impl(
+        &mut self,
+        verified: &Verified,
+        committee: &Committee,
+        require_membership: bool,
+    ) -> Result<ConfirmOutcome, ConfirmError> {
         // Fail-stop applies here exactly as in `handle`. Without this guard a
         // *transient* durability failure (a full disk the operator then clears)
         // punches a permanent hole in the log: the failed append leaves
@@ -1225,8 +1248,9 @@ impl Authority {
 
         // A matching CommitteeId already commits to this exact roster and key,
         // but checking the local member binding catches constructor/configuration
-        // mistakes without relying only on the digest comparison.
-        if committee.key_of(&self.id) != Some(&self.verifying_key()) {
+        // mistakes without relying only on the digest comparison. Observers
+        // (`confirm_as_observer`) skip exactly this check — and nothing else.
+        if require_membership && committee.key_of(&self.id) != Some(&self.verifying_key()) {
             return Err(ConfirmError::WrongCommittee {
                 expected: self.committee_id,
                 got: committee.id(),

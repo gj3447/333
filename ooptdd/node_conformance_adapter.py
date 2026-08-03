@@ -41,6 +41,15 @@ _OWNER_ROSTER = ",".join([
     "alice=197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61",
     "bob=4508a07aa941707f3eb2db94c8897a80b2c1197476b6de213ac273df7d86c4ff",
 ])
+# b0 (dev-seed 100): the member JOINING via epoch change in probe 10 — an
+# observer until the new roster activates (committee-reconfiguration M3).
+_B0_PUB = "2bc2800b3316e009209ffd757dab19ccf0ae84bc7ae90654e1e81712d270f653"
+_NEXT_COMMITTEE = ",".join([
+    "a0=3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",
+    "a1=8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "a2=8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    f"b0={_B0_PUB}",
+])
 _NETWORK_ID = "transfer333-ooptdd-v2"
 _N_AUTH = 4
 _GENESIS = "alice=100,bob=0"
@@ -145,7 +154,8 @@ class _Proc:
 
 
 def _submit(
-    client_port: int, auth_addrs: list[str], transfer: str, owner_seed: int
+    client_port: int, auth_addrs: list[str], transfer: str, owner_seed: int,
+    committee: str = _COMMITTEE,
 ) -> _Proc:
     argv = [
         str(_NODE_BIN), "submit",
@@ -154,7 +164,7 @@ def _submit(
         "--owner-roster", _OWNER_ROSTER,
         "--listen", f"127.0.0.1:{client_port}",
         "--peers", ",".join(auth_addrs),
-        "--committee", _COMMITTEE,
+        "--committee", committee,
         "--transfer", transfer,
         "--max-rounds", "300",
         "--pause-ms", "10",
@@ -246,6 +256,12 @@ def _emit_anti_entropy_convergence(backend, cid: str, ok: bool, **attrs) -> bool
     return ok
 
 
+def _emit_epoch_change(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-epoch-change-20260803
+    if ok:
+        backend.ship([_ev(cid, "epoch_change", **attrs)])
+    return ok
+
+
 def _authority_config_probe(*, committee: str, genesis: str) -> subprocess.CompletedProcess:
     """Run one authority config through the real CLI; expected failures occur pre-bind."""
     return subprocess.run(
@@ -328,8 +344,9 @@ def run_node_probe(backend, cid: str) -> dict:  # KG: transfer333-node-conforman
     )
 
     # One distinct client port per sequential submit avoids TIME_WAIT/rebind
-    # coupling between the five sequential submit probes.
-    _ports = _free_ports(_N_AUTH + 5)
+    # coupling between the five sequential submit probes; +1 for the b0
+    # observer's listen address (probe 10 epoch change).
+    _ports = _free_ports(_N_AUTH + 6)
     auth_ports = _ports[:_N_AUTH]
     (
         forged_client_port,
@@ -338,12 +355,15 @@ def run_node_probe(backend, cid: str) -> dict:  # KG: transfer333-node-conforman
         double_client_port,
         skip_client_port,
     ) = (
-        _ports[_N_AUTH:]
+        _ports[_N_AUTH : _N_AUTH + 5]
     )
+    b0_port = _ports[_N_AUTH + 5]
     auth_addrs = [f"127.0.0.1:{p}" for p in auth_ports]
+    b0_addr = f"127.0.0.1:{b0_port}"
     summary["auth_addrs"] = auth_addrs
 
     authorities: list[_Proc] = []
+    b0: _Proc | None = None
     try:
         for i in range(_N_AUTH):
             argv = [
@@ -352,12 +372,30 @@ def run_node_probe(backend, cid: str) -> dict:  # KG: transfer333-node-conforman
                 "--network-id", _NETWORK_ID,
                 "--owner-roster", _OWNER_ROSTER,
                 "--listen", auth_addrs[i],
-                "--peers", ",".join(auth_addrs),
+                # b0's addr is in the peer list so the observer meshes from
+                # boot (half-mesh rule: exactly one side dials per pair,
+                # regardless of where its random port lands).
+                "--peers", ",".join(auth_addrs + [b0_addr]),
                 "--committee", _COMMITTEE,
                 "--genesis", _GENESIS,
                 "--rounds-idle-exit", "100000",
             ]
             authorities.append(_Proc(f"a{i}", argv))
+
+        # b0 boots as an OBSERVER from the start (not in the epoch-0 roster):
+        # it converges via old-epoch certificates and becomes a voter only
+        # when the probe-10 epoch change activates the new roster.
+        b0 = _Proc("b0", [
+            str(_NODE_BIN), "authority",
+            "--id", "b0", "--dev-seed", "100", "--observe",
+            "--network-id", _NETWORK_ID,
+            "--owner-roster", _OWNER_ROSTER,
+            "--listen", b0_addr,
+            "--peers", ",".join(auth_addrs),
+            "--committee", _COMMITTEE,
+            "--genesis", _GENESIS,
+            "--rounds-idle-exit", "100000",
+        ])
 
         # Wait until every authority meshed (committee_ready).
         ready = all(a.wait_event("committee_ready", timeout=15.0) for a in authorities)
@@ -748,9 +786,120 @@ def run_node_probe(backend, cid: str) -> dict:  # KG: transfer333-node-conforman
             balances=want,
             order_id=converged.get("order_id") if converged else None,
         )
-        a3_restarted.stop()
+        # a3 stays UP (as the restarted instance) for probe 10: the retired
+        # member must keep running — and keep trying to vote — to prove its
+        # exclusion under the new roster.
+        authorities[3] = a3_restarted
+
+        # 10) Epoch change (committee-reconfiguration M3): live fence-then-
+        # change reconfiguration 4 -> (a0,a1,a2,b0). b0 has observed since
+        # boot and converged; a3 retires but keeps voting (and must be
+        # excluded by the new-roster collector).
+        b0_ready = b0.wait_event("committee_ready", timeout=5.0)
+        b0_converged = b0.wait_matching(
+            lambda event: (
+                event.get("event") == "cert_applied"
+                and event.get("balances") == want
+            ),
+            timeout=12.0,
+        )
+        summary["b0_observer"] = {"ready": bool(b0_ready), "converged": bool(b0_converged)}
+
+        reconfig_port = _free_ports(1)[0]
+        rc = subprocess.run(
+            [
+                str(_NODE_BIN), "reconfig",
+                "--network-id", _NETWORK_ID,
+                "--owner-roster", _OWNER_ROSTER,
+                "--listen", f"127.0.0.1:{reconfig_port}",
+                "--peers", ",".join(auth_addrs + [b0_addr]),
+                "--committee", _COMMITTEE,
+                "--next-committee", _NEXT_COMMITTEE,
+                "--epoch", "1",
+                "--max-rounds", "300",
+                "--pause-ms", "10",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+        reconfig_ok = rc.returncode == 0 and "epoch_cert_broadcast" in rc.stdout
+        summary["reconfig"] = {
+            "rc": rc.returncode,
+            "stdout_tail": rc.stdout.strip().splitlines()[-3:] if rc.stdout else [],
+            "stderr_tail": rc.stderr.strip().splitlines()[-3:] if rc.stderr else [],
+        }
+
+        installed = {
+            name: proc.wait_event("epoch_installed", timeout=15.0) is not None
+            for name, proc in [
+                ("a0", authorities[0]),
+                ("a1", authorities[1]),
+                ("a2", authorities[2]),
+                ("b0", b0),
+            ]
+        }
+        summary["epoch_installed"] = installed
+
+        # New-epoch transfer under the NEW roster. The retired a3 still
+        # votes — and must be excluded by the collector (the cert can only
+        # form from new-roster votes).
+        s5 = _submit(
+            _free_ports(1)[0],
+            auth_addrs + [b0_addr],
+            "alice:1:bob:5",
+            42,
+            committee=_NEXT_COMMITTEE,
+        )
+        certified5 = s5.wait_event("certified", timeout=25.0)
+        a3_retired_vote = authorities[3].wait_matching(
+            lambda event: (
+                event.get("event") == "vote_cast"
+                and event.get("epoch") == 1
+                and event.get("transfer") == "alice:1:bob:5"
+            ),
+            timeout=12.0,
+        )
+        want_new = {"alice": 65, "bob": 35}
+        new_members_applied = [
+            p.wait_matching(
+                lambda event: (
+                    event.get("event") == "cert_applied"
+                    and event.get("epoch") == 1
+                    and event.get("balances") == want_new
+                ),
+                timeout=12.0,
+            )
+            for p in (authorities[0], authorities[1], authorities[2], b0)
+        ]
+        s5.stop()
+        epoch_ok = bool(
+            b0_ready
+            and b0_converged
+            and reconfig_ok
+            and all(installed.values())
+            and certified5
+            and certified5.get("status") == "Ok"
+            and a3_retired_vote is not None
+            and all(new_members_applied)
+        )
+        summary["epoch_change"] = {
+            "certified_new_roster": bool(certified5),
+            "a3_retired_vote_seen": a3_retired_vote is not None,
+            "new_members_applied": [bool(x) for x in new_members_applied],
+        }
+        _emit_epoch_change(
+            backend,
+            cid,
+            epoch_ok,
+            epoch=1,
+            order_id=certified5.get("order_id") if certified5 else None,
+        )
 
         return summary
     finally:
         for a in authorities:
             a.stop()
+        if b0 is not None:
+            b0.stop()

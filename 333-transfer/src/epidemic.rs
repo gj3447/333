@@ -22,6 +22,7 @@ use identity333::NodeId;
 
 use crate::authority::{Certificate, Vote};
 use crate::effect::EffectAttestation;
+use crate::epoch::{EpochCert, EpochProposal, EpochVote};
 use crate::net::{AuthorityNet, InMemoryAuthorityMesh, NetError};
 use crate::wire::{decode_authority_msg, encode_authority_msg, AuthorityMsg};
 use crate::SignedTransfer;
@@ -413,6 +414,18 @@ impl AuthorityNet for EpidemicEndpoint {
 
     fn broadcast_attestation(&self, a: EffectAttestation) -> Result<(), NetError> {
         self.broadcast_msg(AuthorityMsg::Attestation(a))
+    }
+
+    fn broadcast_epoch_proposal(&self, p: EpochProposal) -> Result<(), NetError> {
+        self.broadcast_msg(AuthorityMsg::EpochProposal(p))
+    }
+
+    fn broadcast_epoch_vote(&self, v: EpochVote) -> Result<(), NetError> {
+        self.broadcast_msg(AuthorityMsg::EpochVote(v))
+    }
+
+    fn broadcast_epoch_cert(&self, c: EpochCert) -> Result<(), NetError> {
+        self.broadcast_msg(AuthorityMsg::EpochCert(c))
     }
 
     fn poll(&self) -> Vec<AuthorityMsg> {
