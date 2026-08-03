@@ -73,6 +73,7 @@ use crdt333::{CausalBroadcast, CausalMsg, VectorClockBroadcaster};
 pub mod authority;
 pub mod effect;
 pub mod epidemic;
+pub mod epoch;
 pub mod journal;
 pub mod net;
 pub mod owner;
@@ -92,6 +93,10 @@ pub use authority::{
 pub use effect::{
     effect_message, is_final_effectcert, EffectAttestation, EffectCert,
     EFFECT_ATTESTATION_DOMAIN,
+};
+pub use epoch::{
+    epoch_vote_signing_message, frontier_digest, EpochCert, EpochProposal, EpochVote,
+    EpochVoteError, MAX_FRONTIER_ACCOUNTS,
 };
 pub use epidemic::{
     mesh_all_eager, mesh_with_dropped_eager_edge, msg_id_of, peer_node_id, pump, EpidemicEndpoint,
@@ -114,9 +119,11 @@ pub use owner::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use tcp::{TcpAuthorityNet, TcpEndpoint};
 pub use wire::{
-    decode_attestation, decode_authority_msg, decode_certificate, decode_transfer, decode_vote,
-    encode_attestation, encode_authority_msg, encode_certificate, encode_transfer, encode_vote,
-    WireError, TAG_ATTESTATION, TAG_CERT, TAG_ORDER, TAG_VOTE,
+    decode_attestation, decode_authority_msg, decode_certificate, decode_epoch_cert,
+    decode_epoch_proposal, decode_epoch_vote, decode_transfer, decode_vote, encode_attestation,
+    encode_authority_msg, encode_certificate, encode_epoch_cert, encode_epoch_proposal,
+    encode_epoch_vote, encode_transfer, encode_vote, WireError, TAG_ATTESTATION, TAG_CERT,
+    TAG_EPOCH_CERT, TAG_EPOCH_PROPOSAL, TAG_EPOCH_VOTE, TAG_ORDER, TAG_VOTE,
 };
 // Re-exported so callers can build authorities/committees (the public API takes
 // Ed25519 keys) and inspect vote signatures without a direct ed25519-dalek dep.

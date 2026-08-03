@@ -14,10 +14,11 @@ use crate::authority::{
     Certificate, CommitteeId, Vote, MAX_AUTHORITY_ID_BYTES, MAX_COMMITTEE_MEMBERS,
 };
 use crate::effect::EffectAttestation;
+use crate::epoch::{EpochCert, EpochProposal, EpochVote, MAX_FRONTIER_ACCOUNTS};
 use crate::owner::{
     NetworkId, PolicyId, SignedTransfer, MAX_ACCOUNT_ID_BYTES, MAX_NETWORK_ID_BYTES,
 };
-use crate::Transfer;
+use crate::{AccountId, Transfer};
 
 const DOMAIN_TRANSFER: &[u8] = b"transfer333/wire-signed-order/v3\0";
 const DOMAIN_VOTE: &[u8] = b"transfer333/wire-vote/v3\0";
@@ -25,6 +26,11 @@ const DOMAIN_CERT: &[u8] = b"transfer333/wire-cert/v3\0";
 // NEW domain for the M3 effect attestation — never a reuse of a v3 tag for a
 // different layout.
 const DOMAIN_ATTESTATION: &[u8] = b"transfer333/wire-effect-attestation/v1\0";
+// Epoch-change domains (committee-reconfiguration M1) — fresh v1 domains, no
+// reuse of any existing tag or layout.
+const DOMAIN_EPOCH_PROPOSAL: &[u8] = b"transfer333/wire-epoch-proposal/v1\0";
+const DOMAIN_EPOCH_VOTE: &[u8] = b"transfer333/wire-epoch-vote/v1\0";
+const DOMAIN_EPOCH_CERT: &[u8] = b"transfer333/wire-epoch-cert/v1\0";
 pub const MAX_CERTIFICATE_VOTES: usize = MAX_COMMITTEE_MEMBERS;
 
 /// Wire tag for [`AuthorityMsg`] over TCP / framed streams.
@@ -32,15 +38,22 @@ pub const TAG_ORDER: u8 = 0;
 pub const TAG_VOTE: u8 = 1;
 pub const TAG_CERT: u8 = 2;
 pub const TAG_ATTESTATION: u8 = 3;
+pub const TAG_EPOCH_PROPOSAL: u8 = 4;
+pub const TAG_EPOCH_VOTE: u8 = 5;
+pub const TAG_EPOCH_CERT: u8 = 6;
 
 /// Messages that travel the authority mesh (orders, signed votes, certificates,
-/// effect attestations). Shared by the in-memory mesh and the TCP backend.
+/// effect attestations, epoch-change proposal/vote/cert). Shared by the
+/// in-memory mesh and the TCP backend.
 #[derive(Debug, Clone)]
 pub enum AuthorityMsg {
     Order(SignedTransfer),
     Vote(Vote),
     Cert(Certificate),
     Attestation(EffectAttestation),
+    EpochProposal(EpochProposal),
+    EpochVote(EpochVote),
+    EpochCert(EpochCert),
 }
 
 /// Why a byte stream could not be decoded into an authority message.
@@ -375,6 +388,196 @@ pub fn decode_attestation(bytes: &[u8]) -> Result<EffectAttestation, WireError> 
     Ok(a)
 }
 
+// --- epoch-change codec (committee-reconfiguration M1) -------------------------
+
+fn put_roster(buf: &mut Vec<u8>, roster: &[(crate::authority::AuthorityId, ed25519_dalek::VerifyingKey)]) {
+    buf.extend_from_slice(&(roster.len() as u64).to_le_bytes());
+    for (authority, key) in roster {
+        put_str(buf, authority);
+        buf.extend_from_slice(key.as_bytes());
+    }
+}
+
+fn take_roster(
+    input: &mut &[u8],
+) -> Result<Vec<(crate::authority::AuthorityId, ed25519_dalek::VerifyingKey)>, WireError> {
+    let count = take_u64(input)?;
+    if count > MAX_COMMITTEE_MEMBERS as u64 {
+        return Err(WireError::TooManyVotes {
+            count,
+            max: MAX_COMMITTEE_MEMBERS,
+        });
+    }
+    let mut roster = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let authority = take_str(input, "epoch.authority", MAX_AUTHORITY_ID_BYTES)?;
+        let key_bytes: [u8; 32] = take(input, 32)?
+            .try_into()
+            .expect("take returned exactly 32 verifying-key bytes");
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|_| WireError::BadSignature)?;
+        roster.push((authority, key));
+    }
+    Ok(roster)
+}
+
+fn put_frontier(buf: &mut Vec<u8>, frontier: &[(AccountId, u64)]) {
+    buf.extend_from_slice(&(frontier.len() as u64).to_le_bytes());
+    for (account, next_seq) in frontier {
+        put_str(buf, account);
+        buf.extend_from_slice(&next_seq.to_le_bytes());
+    }
+}
+
+fn take_frontier(input: &mut &[u8]) -> Result<Vec<(AccountId, u64)>, WireError> {
+    let count = take_u64(input)?;
+    if count > MAX_FRONTIER_ACCOUNTS as u64 {
+        return Err(WireError::FieldTooLong {
+            field: "epoch.frontier",
+            length: count,
+            max: MAX_FRONTIER_ACCOUNTS,
+        });
+    }
+    let mut frontier = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let account = take_str(input, "epoch.frontier.account", MAX_ACCOUNT_ID_BYTES)?;
+        let next_seq = take_u64(input)?;
+        frontier.push((account, next_seq));
+    }
+    Ok(frontier)
+}
+
+fn put_epoch_proposal_body(buf: &mut Vec<u8>, p: &EpochProposal) {
+    buf.extend_from_slice(p.policy_id.as_bytes());
+    put_str(buf, p.network_id.as_str());
+    buf.extend_from_slice(&p.epoch.to_le_bytes());
+    put_roster(buf, &p.next_roster);
+}
+
+fn take_epoch_proposal_body(input: &mut &[u8]) -> Result<EpochProposal, WireError> {
+    let policy_id = take_policy_id(input)?;
+    let network_id = take_network_id(input)?;
+    let epoch = take_u64(input)?;
+    let next_roster = take_roster(input)?;
+    Ok(EpochProposal {
+        network_id,
+        policy_id,
+        epoch,
+        next_roster,
+    })
+}
+
+fn put_epoch_vote_body(buf: &mut Vec<u8>, v: &EpochVote) {
+    put_str(buf, &v.authority);
+    buf.extend_from_slice(v.committee_id.as_bytes());
+    buf.extend_from_slice(&v.epoch.to_le_bytes());
+    buf.extend_from_slice(v.next_committee_id.as_bytes());
+    buf.extend_from_slice(&v.frontier_digest);
+    buf.extend_from_slice(&v.signature.to_bytes());
+}
+
+fn take_epoch_vote_body(input: &mut &[u8]) -> Result<EpochVote, WireError> {
+    let authority = take_str(input, "epoch_vote.authority", MAX_AUTHORITY_ID_BYTES)?;
+    let committee_id = take_committee_id(input)?;
+    let epoch = take_u64(input)?;
+    let next_committee_id = take_committee_id(input)?;
+    let frontier_digest: [u8; 32] = take(input, 32)?
+        .try_into()
+        .expect("take returned exactly 32 frontier-digest bytes");
+    let signature = take_signature(input)?;
+    Ok(EpochVote {
+        authority,
+        committee_id,
+        epoch,
+        next_committee_id,
+        frontier_digest,
+        signature,
+    })
+}
+
+/// Encode an operator `EpochProposal` under the fresh v1 domain.
+pub fn encode_epoch_proposal(p: &EpochProposal) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(192 + p.next_roster.len() * 48);
+    buf.extend_from_slice(DOMAIN_EPOCH_PROPOSAL);
+    put_epoch_proposal_body(&mut buf, p);
+    buf
+}
+
+/// Decode a domain-tagged `EpochProposal`.
+pub fn decode_epoch_proposal(bytes: &[u8]) -> Result<EpochProposal, WireError> {
+    let mut input = bytes;
+    expect_domain(&mut input, DOMAIN_EPOCH_PROPOSAL)?;
+    let p = take_epoch_proposal_body(&mut input)?;
+    if !input.is_empty() {
+        return Err(WireError::Truncated);
+    }
+    Ok(p)
+}
+
+/// Encode a signed `EpochVote`.
+pub fn encode_epoch_vote(v: &EpochVote) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(200 + v.authority.len());
+    buf.extend_from_slice(DOMAIN_EPOCH_VOTE);
+    put_epoch_vote_body(&mut buf, v);
+    buf
+}
+
+/// Decode a domain-tagged `EpochVote`. Signature validity is NOT checked
+/// here — callers must still run `EpochVote::verify_signature`.
+pub fn decode_epoch_vote(bytes: &[u8]) -> Result<EpochVote, WireError> {
+    let mut input = bytes;
+    expect_domain(&mut input, DOMAIN_EPOCH_VOTE)?;
+    let v = take_epoch_vote_body(&mut input)?;
+    if !input.is_empty() {
+        return Err(WireError::Truncated);
+    }
+    Ok(v)
+}
+
+/// Encode an `EpochCert` (roster + frontier + full epoch-vote list).
+pub fn encode_epoch_cert(c: &EpochCert) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256 + c.votes.len() * 192);
+    buf.extend_from_slice(DOMAIN_EPOCH_CERT);
+    buf.extend_from_slice(&c.epoch.to_le_bytes());
+    put_roster(&mut buf, &c.next_roster);
+    put_frontier(&mut buf, &c.frontier);
+    buf.extend_from_slice(&(c.votes.len() as u64).to_le_bytes());
+    for v in &c.votes {
+        put_epoch_vote_body(&mut buf, v);
+    }
+    buf
+}
+
+/// Decode a domain-tagged `EpochCert`. Quorum validity is NOT checked here —
+/// that is the install path's job (M2).
+pub fn decode_epoch_cert(bytes: &[u8]) -> Result<EpochCert, WireError> {
+    let mut input = bytes;
+    expect_domain(&mut input, DOMAIN_EPOCH_CERT)?;
+    let epoch = take_u64(&mut input)?;
+    let next_roster = take_roster(&mut input)?;
+    let frontier = take_frontier(&mut input)?;
+    let count = take_u64(&mut input)?;
+    if count > MAX_COMMITTEE_MEMBERS as u64 {
+        return Err(WireError::TooManyVotes {
+            count,
+            max: MAX_COMMITTEE_MEMBERS,
+        });
+    }
+    let mut votes = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        votes.push(take_epoch_vote_body(&mut input)?);
+    }
+    if !input.is_empty() {
+        return Err(WireError::Truncated);
+    }
+    Ok(EpochCert {
+        epoch,
+        next_roster,
+        frontier,
+        votes,
+    })
+}
+
 // --- AuthorityMsg frame (1-byte tag + domain body) ---------------------------
 
 /// Encode an [`AuthorityMsg`] as `tag || domain-tagged-body`.
@@ -409,6 +612,27 @@ pub fn encode_authority_msg(msg: &AuthorityMsg) -> Vec<u8> {
             out.extend_from_slice(&body);
             out
         }
+        AuthorityMsg::EpochProposal(p) => {
+            let body = encode_epoch_proposal(p);
+            let mut out = Vec::with_capacity(1 + body.len());
+            out.push(TAG_EPOCH_PROPOSAL);
+            out.extend_from_slice(&body);
+            out
+        }
+        AuthorityMsg::EpochVote(v) => {
+            let body = encode_epoch_vote(v);
+            let mut out = Vec::with_capacity(1 + body.len());
+            out.push(TAG_EPOCH_VOTE);
+            out.extend_from_slice(&body);
+            out
+        }
+        AuthorityMsg::EpochCert(c) => {
+            let body = encode_epoch_cert(c);
+            let mut out = Vec::with_capacity(1 + body.len());
+            out.push(TAG_EPOCH_CERT);
+            out.extend_from_slice(&body);
+            out
+        }
     }
 }
 
@@ -424,6 +648,9 @@ pub fn decode_authority_msg(bytes: &[u8]) -> Result<AuthorityMsg, WireError> {
         TAG_VOTE => Ok(AuthorityMsg::Vote(decode_vote(body)?)),
         TAG_CERT => Ok(AuthorityMsg::Cert(decode_certificate(body)?)),
         TAG_ATTESTATION => Ok(AuthorityMsg::Attestation(decode_attestation(body)?)),
+        TAG_EPOCH_PROPOSAL => Ok(AuthorityMsg::EpochProposal(decode_epoch_proposal(body)?)),
+        TAG_EPOCH_VOTE => Ok(AuthorityMsg::EpochVote(decode_epoch_vote(body)?)),
+        TAG_EPOCH_CERT => Ok(AuthorityMsg::EpochCert(decode_epoch_cert(body)?)),
         other => Err(WireError::UnknownTag(other)),
     }
 }
@@ -877,6 +1104,130 @@ mod tests {
         match decode_authority_msg(&bytes) {
             Err(WireError::UnknownTag(0xFF)) => {}
             other => panic!("expected UnknownTag(0xFF), got {other:?}"),
+        }
+    }
+
+    // --- epoch-change codec (M1) ------------------------------------------------
+
+    fn epoch_setup() -> (EpochProposal, EpochVote, EpochCert) {
+        let roster: Vec<(String, _)> = (0..4u8)
+            .map(|i| (format!("b{i}"), key(100 + i).verifying_key()))
+            .collect();
+        let next_committee = crate::authority::Committee::with_epoch(roster.clone(), policy(), 1)
+            .expect("valid next roster");
+        let frontier = vec![
+            ("alice".to_string(), 1u64),
+            ("bob".to_string(), 1u64),
+            ("carol".to_string(), 0u64),
+        ];
+        let proposal = EpochProposal {
+            network_id: NetworkId::new("wire-testnet").unwrap(),
+            policy_id: policy().id(),
+            epoch: 1,
+            next_roster: roster,
+        };
+        let old_committee_id = crate::authority::CommitteeId::from_bytes([7u8; 32]);
+        let vote = EpochVote::sign(
+            "a0".to_string(),
+            old_committee_id,
+            1,
+            next_committee.id(),
+            &frontier,
+            &key(7),
+        );
+        let votes = (0..3u8)
+            .map(|i| {
+                EpochVote::sign(
+                    format!("a{i}"),
+                    old_committee_id,
+                    1,
+                    next_committee.id(),
+                    &frontier,
+                    &key(i),
+                )
+            })
+            .collect();
+        let cert = EpochCert {
+            epoch: 1,
+            next_roster: proposal.next_roster.clone(),
+            frontier,
+            votes,
+        };
+        (proposal, vote, cert)
+    }
+
+    #[test]
+    fn epoch_proposal_roundtrip() {
+        let (proposal, _, _) = epoch_setup();
+        let bytes = encode_epoch_proposal(&proposal);
+        assert_eq!(decode_epoch_proposal(&bytes).unwrap(), proposal);
+    }
+
+    #[test]
+    fn epoch_vote_roundtrip_and_signature_survives() {
+        let (_, vote, _) = epoch_setup();
+        let bytes = encode_epoch_vote(&vote);
+        let back = decode_epoch_vote(&bytes).unwrap();
+        assert_eq!(back, vote);
+        assert!(back.verify_signature(&key(7).verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn epoch_cert_roundtrip() {
+        let (_, _, cert) = epoch_setup();
+        let bytes = encode_epoch_cert(&cert);
+        assert_eq!(decode_epoch_cert(&bytes).unwrap(), cert);
+    }
+
+    #[test]
+    fn epoch_frames_roundtrip_via_authority_msg() {
+        let (proposal, vote, cert) = epoch_setup();
+        for msg in [
+            AuthorityMsg::EpochProposal(proposal),
+            AuthorityMsg::EpochVote(vote),
+            AuthorityMsg::EpochCert(cert),
+        ] {
+            let bytes = encode_authority_msg(&msg);
+            let back = decode_authority_msg(&bytes).unwrap();
+            match (&msg, &back) {
+                (AuthorityMsg::EpochProposal(a), AuthorityMsg::EpochProposal(b)) => {
+                    assert_eq!(a, b)
+                }
+                (AuthorityMsg::EpochVote(a), AuthorityMsg::EpochVote(b)) => assert_eq!(a, b),
+                (AuthorityMsg::EpochCert(a), AuthorityMsg::EpochCert(b)) => assert_eq!(a, b),
+                _ => panic!("epoch frame decoded to the wrong variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_domains_fail_closed_against_foreign_bodies() {
+        let (_, vote, _) = epoch_setup();
+        // An epoch-vote body is not a transfer-vote body and must not decode as one.
+        assert!(decode_vote(&encode_epoch_vote(&vote)).is_err());
+        // And a transfer-vote must not decode as an epoch-vote.
+        let policy = policy();
+        let order = signed_tx(&policy, "alice", 42, 0, "bob", 1);
+        let (committee, mut auth, _) = setup(4);
+        let _ = committee;
+        let v = auth[0].handle(&order).unwrap();
+        assert!(decode_epoch_vote(&encode_vote(&v)).is_err());
+    }
+
+    #[test]
+    fn epoch_cert_rejects_oversized_vote_count() {
+        let (proposal, _, cert) = epoch_setup();
+        // Hand-build a frame whose declared vote count exceeds the cap: the
+        // decoder must fail closed before allocating for it.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(DOMAIN_EPOCH_CERT);
+        forged.extend_from_slice(&cert.epoch.to_le_bytes());
+        put_roster(&mut forged, &proposal.next_roster);
+        put_frontier(&mut forged, &cert.frontier);
+        forged.extend_from_slice(&((crate::authority::MAX_COMMITTEE_MEMBERS as u64) + 1).to_le_bytes());
+        match decode_epoch_cert(&forged) {
+            Err(WireError::TooManyVotes { .. }) => {}
+            other => panic!("expected TooManyVotes, got {other:?}"),
         }
     }
 }

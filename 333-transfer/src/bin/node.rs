@@ -666,6 +666,13 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                     // Authorities ignore peer attestations; clients collect
                     // them for EffectCert finality.
                 }
+                AuthorityMsg::EpochProposal(_)
+                | AuthorityMsg::EpochVote(_)
+                | AuthorityMsg::EpochCert(_) => {
+                    // M2 wires the epoch FSM. Until then epoch messages are
+                    // inert here — M1 has no producer, so receiving one is a
+                    // version-skew no-op, never a crash.
+                }
             }
         }
         thread::sleep(Duration::from_millis(2));
