@@ -515,6 +515,11 @@ pub struct Authority {
     /// Epoch-change protocol state (design §5). `Active` casts user votes;
     /// the other two withhold them (never `confirm`).
     epoch_state: EpochState,
+    /// The most recent epoch certificate this authority installed. Retained
+    /// past completion so a journal-recovered process can re-join the
+    /// quiet-period re-presentation set (M5) — the cert is public,
+    /// self-authenticating evidence and re-presenting it is always safe.
+    last_epoch_cert: Option<EpochCert>,
     /// Set once a journal append fails. In-memory state is then no longer backed
     /// by stable storage, so the authority refuses to vote or confirm rather than
     /// silently serving from state it cannot recover. Fail-stop, not fail-open.
@@ -571,6 +576,7 @@ impl Authority {
             journal,
             epoch: 0,
             epoch_state: EpochState::Active,
+            last_epoch_cert: None,
             poisoned,
         }
     }
@@ -666,6 +672,7 @@ impl Authority {
                         JournalError::Corrupt("epoch-installed roster invalid".into())
                     })?;
                     me.locked.clear();
+                    me.last_epoch_cert = Some(cert.clone());
                     me.epoch_state = EpochState::Installing {
                         cert: cert.clone(),
                         next_committee: next,
@@ -759,6 +766,14 @@ impl Authority {
     /// epoch-install transition, strictly monotonically.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The most recent epoch certificate this authority installed (M5). A
+    /// journal-recovered process uses it to re-join the quiet-period
+    /// re-presentation set — the cert is public, self-authenticating
+    /// evidence, and re-presenting it is always safe.
+    pub fn last_epoch_cert(&self) -> Option<&EpochCert> {
+        self.last_epoch_cert.as_ref()
     }
 
     // --- epoch-change FSM (committee-reconfiguration design v1 §5, M2) ---------
@@ -946,6 +961,7 @@ impl Authority {
                 reason: e.to_string(),
             })?;
         self.locked.clear();
+        self.last_epoch_cert = Some(cert.clone());
         self.epoch_state = EpochState::Installing {
             cert: cert.clone(),
             next_committee: next,

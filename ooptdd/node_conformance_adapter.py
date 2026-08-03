@@ -262,6 +262,18 @@ def _emit_epoch_change(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: tra
     return ok
 
 
+def _emit_epoch_safety(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-epoch-safety-20260803
+    if ok:
+        backend.ship([_ev(cid, "epoch_safety", **attrs)])
+    return ok
+
+
+def _emit_epoch_straggler(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-epoch-straggler-20260803
+    if ok:
+        backend.ship([_ev(cid, "epoch_straggler", **attrs)])
+    return ok
+
+
 def _authority_config_probe(*, committee: str, genesis: str) -> subprocess.CompletedProcess:
     """Run one authority config through the real CLI; expected failures occur pre-bind."""
     return subprocess.run(
@@ -896,6 +908,78 @@ def run_node_probe(backend, cid: str) -> dict:  # KG: transfer333-node-conforman
             epoch=1,
             order_id=certified5.get("order_id") if certified5 else None,
         )
+
+        # 11) Epoch safety (design §3/§7): the boundary must not leak a
+        # double-spend, and the old trust root must be dead.
+        #  (a) re-spending the pre-change alice:0 slot under the NEW roster
+        #      -> out_of_order everywhere (the slot is spent), never a cert.
+        s6 = _submit(
+            _free_ports(1)[0],
+            auth_addrs + [b0_addr],
+            "alice:0:bob:99",
+            42,
+            committee=_NEXT_COMMITTEE,
+        )
+        failed6 = s6.wait_event("cert_failed", timeout=25.0)
+        s6.stop()
+        #  (b) a fresh order submitted under the OLD trust root: every live
+        #      authority signs with the NEW committee_id now, so the old
+        #      collector can never assemble a cert.
+        s7 = _submit(
+            _free_ports(1)[0],
+            auth_addrs + [b0_addr],
+            "alice:2:bob:1",
+            42,
+            committee=_COMMITTEE,
+        )
+        failed7 = s7.wait_event("cert_failed", timeout=25.0)
+        s7.stop()
+        # The gate is only meaningful POST-change: without epoch_installed
+        # evidence, both cert_failed events fire for the wrong reasons
+        # (trust-root mismatch / plain out_of_order) — so the precondition
+        # is part of the oracle, keeping it RED on a pre-change binary.
+        epoch_safety_ok = bool(failed6 and failed7 and all(installed.values()))
+        summary["epoch_safety"] = {
+            "respent_slot_rejected": bool(failed6),
+            "old_trust_root_dead": bool(failed7),
+            "post_change_precondition": all(installed.values()),
+        }
+        _emit_epoch_safety(backend, cid, epoch_safety_ok, epoch=1)
+
+        # 12) Epoch straggler (design §7, M5 acceptance): a2 restarts at
+        # genesis AFTER the change — it must receive the missed user certs
+        # AND the epoch-1 cert via quiet-period re-presentation, install the
+        # new epoch, and converge to the new roster's state.
+        a2 = authorities[2]
+        a2.stop()
+        time.sleep(0.5)
+        a2_restarted = _Proc("a2r", [
+            str(_NODE_BIN), "authority",
+            "--id", "a2", "--dev-seed", "2",
+            "--network-id", _NETWORK_ID,
+            "--owner-roster", _OWNER_ROSTER,
+            "--listen", auth_addrs[2],
+            "--peers", ",".join(auth_addrs + [b0_addr]),
+            "--committee", _COMMITTEE,
+            "--genesis", _GENESIS,
+            "--rounds-idle-exit", "100000",
+        ])
+        authorities[2] = a2_restarted
+        a2_epoch_installed = a2_restarted.wait_event("epoch_installed", timeout=20.0)
+        a2_converged = a2_restarted.wait_matching(
+            lambda event: (
+                event.get("event") == "cert_applied"
+                and event.get("epoch") == 1
+                and event.get("balances") == {"alice": 65, "bob": 35}
+            ),
+            timeout=20.0,
+        )
+        straggler_ok = bool(a2_epoch_installed and a2_converged)
+        summary["epoch_straggler"] = {
+            "installed": bool(a2_epoch_installed),
+            "converged_new_epoch": bool(a2_converged),
+        }
+        _emit_epoch_straggler(backend, cid, straggler_ok, epoch=1)
 
         return summary
     finally:

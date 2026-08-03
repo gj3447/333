@@ -455,6 +455,11 @@ fn run_authority(args: &[String]) -> Result<(), String> {
     // Epoch certificates get the same re-presentation (M3/M5): a straggler
     // that missed the change converges to the new epoch the same way.
     let mut applied_epoch_certs: HashMap<u64, EpochCert> = HashMap::new();
+    // A journal-recovered process re-joins the epoch-cert re-presentation set
+    // from its durable install record (M5).
+    if let Some(ec) = auth.last_epoch_cert() {
+        applied_epoch_certs.insert(ec.epoch, ec.clone());
+    }
     // ~100 idle rounds ≈ 0.7s at this loop's sleep pace; quiet-period-only
     // rebroadcast self-throttles under load.
     const REBROADCAST_IDLE_ROUNDS: usize = 100;
@@ -551,7 +556,13 @@ fn run_authority(args: &[String]) -> Result<(), String> {
             match msg {
                 AuthorityMsg::Order(t) => match auth.handle(&t) {
                     Ok(vote) => {
-                        let _ = endpoint.broadcast_vote(vote);
+                        // Observers withhold votes while they are not members
+                        // of the CURRENT committee (collectors would reject
+                        // them anyway); once an epoch change makes them a
+                        // member, their votes flow normally.
+                        if !(observe && !committee.contains(&id)) {
+                            let _ = endpoint.broadcast_vote(vote);
+                        }
                         emit(&format!(
                             "{{\"event\":\"vote_cast\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"epoch\":{}}}",
                             order_id_hex(&t),

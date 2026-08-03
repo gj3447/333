@@ -153,3 +153,23 @@ requirements:
       source: node_conformance_adapter.py
       symbol: _emit_epoch_change
       must_emit: epoch_change
+
+  - id: REQ-EPOCH-SAFETY
+    description: boundary double-spend is refused (pre-change slot re-spend under the new roster never certifies) and the old trust root is dead (old-committee submit never certifies post-change)
+    gate:
+      - {event: epoch_safety, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-epoch-safety-20260803
+      source: node_conformance_adapter.py
+      symbol: _emit_epoch_safety
+      must_emit: epoch_safety
+
+  - id: REQ-EPOCH-STRAGGLER
+    description: an authority restarted at genesis after the change receives the missed user certs AND the epoch cert via re-presentation, installs epoch 1, and converges to the new roster state
+    gate:
+      - {event: epoch_straggler, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-epoch-straggler-20260803
+      source: node_conformance_adapter.py
+      symbol: _emit_epoch_straggler
+      must_emit: epoch_straggler
