@@ -5,6 +5,7 @@
 // (no clap, no serde). Driven by an external harness that reads stdout events.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -14,9 +15,9 @@ use std::thread;
 use std::time::Duration;
 
 use transfer333::{
-    Authority, AuthorityError, AuthorityMsg, AuthorityNet, Certified, Committee, ConfirmError,
-    ConfirmOutcome, FileJournal, Ledger, NetworkId, OwnerAuthError, OwnerRegistry, SignedTransfer,
-    SigningKey,
+    Authority, AuthorityError, AuthorityMsg, AuthorityNet, Certificate, Certified, Committee,
+    ConfirmError, ConfirmOutcome, FileJournal, Ledger, NetworkId, OwnerAuthError, OwnerRegistry,
+    SignedTransfer, SigningKey,
     TcpAuthorityNet, Transfer, TransferPolicy, VerifyingKey, VoteCollector,
 };
 use zeroize::Zeroizing;
@@ -377,8 +378,15 @@ fn run_authority(args: &[String]) -> Result<(), String> {
         escape_json(&net.addr().to_string())
     ));
 
-    net.connect_all(&peers)
-        .map_err(|e| format!("connect_all: {e:?}"))?;
+    // Best-effort initial mesh (anti-entropy, audit 2026-07-15 P1): some
+    // peers may still be booting. A hard failure here used to kill the
+    // process; now a missing peer is (re-)dialed level-triggered in the main
+    // loop below, so a partially-up committee no longer bricks startup.
+    for &a in &peers {
+        if a != net.addr() && net.addr() < a {
+            let _ = net.connect_peer(a);
+        }
+    }
     // Brief settle so accept threads register peer streams.
     thread::sleep(Duration::from_millis(20));
     emit(&format!(
@@ -397,15 +405,64 @@ fn run_authority(args: &[String]) -> Result<(), String> {
     });
 
     let endpoint = net.endpoint();
+    // Anti-entropy, receiver-independent half (audit 2026-07-15 P1): a
+    // certificate is public, self-authenticating evidence — re-presenting it
+    // is always safe (`confirm` is idempotent: AlreadyApplied). The daemon
+    // retains every certificate it applied and re-broadcasts the set during
+    // quiet periods, so an authority that missed one (late boot, lost frame)
+    // converges level-triggered instead of staying locked on an old seq
+    // forever. No request/response protocol: just periodic re-presentation.
+    let mut applied_certs: HashMap<(String, u64), Certificate> = HashMap::new();
+    // ~100 idle rounds ≈ 0.7s at this loop's sleep pace; quiet-period-only
+    // rebroadcast self-throttles under load.
+    const REBROADCAST_IDLE_ROUNDS: usize = 100;
+    let mut since_rebroadcast = 0usize;
+    // Level-triggered (re-)dial of missing mesh peers, ~50 rounds ≈ 0.35s.
+    const REDIAL_INTERVAL_ROUNDS: usize = 50;
+    let mut since_redial = 0usize;
     let mut idle_rounds = 0usize;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
 
+        since_redial += 1;
+        if since_redial >= REDIAL_INTERVAL_ROUNDS {
+            since_redial = 0;
+            for &a in &peers {
+                // Half-mesh invariant: we only ever dial strictly greater
+                // addresses; lesser ones heal by dialing us.
+                if a == net.addr() || net.addr() > a {
+                    continue;
+                }
+                let known = net.peer_states().iter().any(|(ra, _)| *ra == Some(a));
+                if !known {
+                    let _ = net.connect_peer(a);
+                }
+            }
+        }
+
         let msgs = endpoint.poll();
         if msgs.is_empty() {
             idle_rounds += 1;
+            since_rebroadcast += 1;
+            if since_rebroadcast >= REBROADCAST_IDLE_ROUNDS && !applied_certs.is_empty() {
+                since_rebroadcast = 0;
+                let mut order_ids = String::new();
+                for cert in applied_certs.values() {
+                    let _ = endpoint.broadcast_cert(cert.clone());
+                    if !order_ids.is_empty() {
+                        order_ids.push(',');
+                    }
+                    order_ids.push_str(&order_id_hex(&cert.order));
+                }
+                emit(&format!(
+                    "{{\"event\":\"cert_rebroadcast\",\"authority\":\"{}\",\"certs\":{},\"order_ids\":\"{}\"}}",
+                    escape_json(&id),
+                    applied_certs.len(),
+                    escape_json(&order_ids)
+                ));
+            }
             if let Some(n) = idle_exit {
                 if idle_rounds >= n {
                     break;
@@ -415,6 +472,7 @@ fn run_authority(args: &[String]) -> Result<(), String> {
             continue;
         }
         idle_rounds = 0;
+        since_rebroadcast = 0;
 
         for msg in msgs {
             match msg {
@@ -564,11 +622,21 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                                 // committed apply, does the attestation exist.
                                 let account = v.transfer().from.clone();
                                 let seq = v.transfer().from_seq;
+                                // Retain for quiet-period anti-entropy
+                                // re-presentation (see applied_certs above).
+                                applied_certs.insert((account.clone(), seq), c.clone());
                                 if let Some(attestation) = auth.attestation_for(&account, seq) {
                                     let _ = endpoint.broadcast_attestation(attestation);
                                 }
                             }
-                            Ok(ConfirmOutcome::AlreadyApplied) => {}
+                            Ok(ConfirmOutcome::AlreadyApplied) => {
+                                // A re-presented cert may be our only copy
+                                // after a journal-recovered restart — retain
+                                // it too so we can re-present it onward.
+                                let account = v.transfer().from.clone();
+                                let seq = v.transfer().from_seq;
+                                applied_certs.insert((account, seq), c.clone());
+                            }
                             Err(error) => {
                                 let reason = match error {
                                     ConfirmError::WrongCommittee { .. } => "wrong_committee",
@@ -641,9 +709,13 @@ fn run_submit(args: &[String]) -> Result<ExitCode, String> {
         escape_json(&net.addr().to_string())
     ));
 
-    // Client dials every authority (one-way); authorities do not list the client.
-    net.connect_each(&peers)
-        .map_err(|e| format!("connect_each: {e:?}"))?;
+    // Client dials every authority (one-way); authorities do not list the
+    // client. Best-effort (anti-entropy, audit 2026-07-15 P1): a late-booting
+    // authority used to kill the submit at connect time — now missing peers
+    // are (re-)dialed in the collection loop below.
+    for &a in &peers {
+        let _ = net.connect_peer(a);
+    }
     thread::sleep(Duration::from_millis(30));
     emit(&format!(
         "{{\"event\":\"committee_ready\",\"n\":{}}}",
@@ -651,17 +723,39 @@ fn run_submit(args: &[String]) -> Result<ExitCode, String> {
     ));
 
     let endpoint = net.endpoint();
-    endpoint
-        .broadcast_order(order.clone())
-        .map_err(|e| format!("broadcast_order: {e:?}"))?;
 
+    // Level-triggered order broadcast: a lost frame or a late authority no
+    // longer means certain cert_failed. The order is re-broadcast every
+    // collection window while the vote budget lasts. Authorities re-vote
+    // idempotently on duplicates, and the collector accumulates across
+    // windows, so retrying changes liveness, never safety. Total wait budget
+    // (--max-rounds) is unchanged.
+    const RETRY_WINDOW: usize = 25;
     let mut coll = VoteCollector::new(order.clone());
-    let (cert, status) = coll.collect_until_quorum_with_pause(
-        &endpoint,
-        &committee,
-        max_rounds,
-        Duration::from_millis(pause_ms),
-    );
+    let mut remaining = max_rounds.max(1);
+    let (cert, status) = loop {
+        for &a in &peers {
+            let known = net.peer_states().iter().any(|(ra, _)| *ra == Some(a));
+            if !known {
+                let _ = net.connect_peer(a);
+            }
+        }
+        endpoint
+            .broadcast_order(order.clone())
+            .map_err(|e| format!("broadcast_order: {e:?}"))?;
+        let window = remaining.min(RETRY_WINDOW);
+        let (c, s) = coll.collect_until_quorum_with_pause(
+            &endpoint,
+            &committee,
+            window,
+            Duration::from_millis(pause_ms),
+        );
+        let certified = matches!(s, Certified::Ok);
+        remaining = remaining.saturating_sub(window);
+        if certified || remaining == 0 {
+            break (c, s);
+        }
+    };
 
     let code = match status {
         Certified::Ok => {

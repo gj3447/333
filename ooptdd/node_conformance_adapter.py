@@ -228,6 +228,18 @@ def _emit_out_of_order_rejected(backend, cid: str, ok: bool, **attrs) -> bool:  
     return ok
 
 
+def _emit_cert_anti_entropy_rebroadcast(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-cert-anti-entropy-rebroadcast-20260803
+    if ok:
+        backend.ship([_ev(cid, "cert_anti_entropy_rebroadcast", **attrs)])
+    return ok
+
+
+def _emit_client_retry_late_quorum(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-client-retry-late-quorum-20260803
+    if ok:
+        backend.ship([_ev(cid, "client_retry_late_quorum", **attrs)])
+    return ok
+
+
 def _authority_config_probe(*, committee: str, genesis: str) -> subprocess.CompletedProcess:
     """Run one authority config through the real CLI; expected failures occur pre-bind."""
     return subprocess.run(
@@ -611,6 +623,84 @@ def run_node_probe(backend, cid: str) -> dict:  # KG: transfer333-node-conforman
             reason=failed3.get("reason") if failed3 else None,
             order_id=skip_order_id,
         )
+
+        # 7) Anti-entropy: an authority that applied the step-3 certificate
+        # must re-present it during a quiet period. A peer that missed the
+        # cert (late boot, lost frame) then converges level-triggered instead
+        # of staying locked on an old sequence forever (audit 2026-07-15 P1).
+        rebroadcasts = [
+            a.wait_event("cert_rebroadcast", timeout=12.0) for a in authorities
+        ]
+        seen_rebroadcast = sum(1 for e in rebroadcasts if e)
+        summary["cert_rebroadcast"] = {
+            "authorities": [bool(e) for e in rebroadcasts],
+        }
+        _emit_cert_anti_entropy_rebroadcast(
+            backend,
+            cid,
+            ready and seen_rebroadcast >= 1,
+            authorities=_N_AUTH,
+            seen=seen_rebroadcast,
+        )
+
+        # 8) Client retry liveness: with only 2 of 4 authorities up, the
+        # submit client must keep (re-)dialing and re-broadcasting the order
+        # until a late-booted third authority lets quorum form — never dying
+        # on the first connect failure or a single lost broadcast.
+        retry_ports = _free_ports(_N_AUTH + 1)
+        retry_addrs = [f"127.0.0.1:{p}" for p in retry_ports[:3]]
+        retry_client_port = retry_ports[3]
+        early: list[_Proc] = []
+        late: list[_Proc] = []
+
+        def _retry_authority(i: int) -> _Proc:
+            argv = [
+                str(_NODE_BIN), "authority",
+                "--id", f"a{i}", "--dev-seed", str(i),
+                "--network-id", _NETWORK_ID,
+                "--owner-roster", _OWNER_ROSTER,
+                "--listen", retry_addrs[i],
+                "--peers", ",".join(retry_addrs),
+                "--committee", _COMMITTEE,
+                "--genesis", _GENESIS,
+                "--rounds-idle-exit", "100000",
+            ]
+            return _Proc(f"r{i}", argv)
+
+        try:
+            for i in (0, 1):
+                early.append(_retry_authority(i))
+            ready_early = all(
+                a.wait_event("committee_ready", timeout=15.0) for a in early
+            )
+            # The retry authorities are FRESH processes at genesis — for them
+            # alice's next sequence is 0 (the step-3 cert lives only on the
+            # main committee's ledgers). Submitting seq 1 here would be a
+            # self-inflicted out_of_order.
+            s4 = _submit(retry_client_port, retry_addrs, "alice:0:bob:5", 42)
+            time.sleep(2.0)
+            late.append(_retry_authority(2))
+            certified4 = s4.wait_event("certified", timeout=25.0)
+            retry_ok = bool(
+                ready_early
+                and certified4
+                and certified4.get("status") == "Ok"
+            )
+            summary["client_retry_late_quorum"] = {
+                "early_ready": bool(ready_early),
+                "certified": bool(certified4),
+            }
+            _emit_client_retry_late_quorum(
+                backend,
+                cid,
+                retry_ok,
+                transfer="alice:0:bob:5",
+                order_id=certified4.get("order_id") if certified4 else None,
+            )
+            s4.stop()
+        finally:
+            for a in early + late:
+                a.stop()
 
         return summary
     finally:

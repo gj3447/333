@@ -113,3 +113,23 @@ requirements:
       source: node_conformance_adapter.py
       symbol: _emit_out_of_order_rejected
       must_emit: out_of_order_rejected
+
+  - id: REQ-CERT-ANTI-ENTROPY-REBROADCAST
+    description: an authority that applied a certificate re-presents it during quiet periods (level-triggered anti-entropy, audit P1)
+    gate:
+      - {event: cert_anti_entropy_rebroadcast, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-cert-anti-entropy-rebroadcast-20260803
+      source: node_conformance_adapter.py
+      symbol: _emit_cert_anti_entropy_rebroadcast
+      must_emit: cert_anti_entropy_rebroadcast
+
+  - id: REQ-CLIENT-RETRY-LATE-QUORUM
+    description: with 2 of 4 authorities up, the submit client keeps redialing+rebroadcasting until a late-booted third authority lets quorum form
+    gate:
+      - {event: client_retry_late_quorum, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-client-retry-late-quorum-20260803
+      source: node_conformance_adapter.py
+      symbol: _emit_client_retry_late_quorum
+      must_emit: client_retry_late_quorum
