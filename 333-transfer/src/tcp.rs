@@ -13,6 +13,11 @@
 // accepted ones are pruned (their remote listen address is unknown; the dialer
 // heals that pair by dialing us again). Write errors alone cannot be the
 // trigger: a write into a freshly dead socket returns Ok until the RST lands.
+//
+// Peer state machine (P1, FSM audit 2026-07-15 §2-D): detection → demotion →
+// recovery is an explicit per-peer FSM (`PeerState`) with etcd-raft discipline —
+// a peer changes state only through named `become_*` transitions, direct enum
+// assignment is forbidden, and an illegal transition panics.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -32,6 +37,42 @@ const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const CONNECT_ATTEMPTS: u32 = 40;
 const CONNECT_BACKOFF: Duration = Duration::from_millis(10);
 
+/// Per-peer connection state (FSM audit 2026-07-15 §2-D / P1).
+///
+/// etcd-raft bar (`raft.go:891-971`): a peer changes state exclusively through
+/// the named `become_*` transitions on [`PeerSession`]; assigning this enum
+/// directly is forbidden and an illegal transition panics. Legality table:
+///
+/// - `Live -> Suspect` — death signal observed (reader EOF/fatal, write error)
+/// - `Suspect -> Live` — recovery completed (redial succeeded)
+/// - `Suspect -> Dead` — recovery attempted and failed
+/// - `Dead -> Live` — tombstone redial finally succeeded
+///
+/// There is deliberately **no** `Live -> Dead`: a peer must be *observed*
+/// failing before it may be declared dead. `Dead` is terminal for accepted
+/// sessions (reaped at demotion); for dialed sessions it is a tombstone that
+/// retains the peer's listen address and is retried on later sends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerState {
+    /// Freshly dialed/accepted, no death signal observed.
+    Live,
+    /// Death signal observed; recovery (redial) has not completed.
+    Suspect,
+    /// Recovery attempted and failed. Dialed peers keep a tombstone (the
+    /// redial address survives) and are retried on later sends.
+    Dead,
+}
+
+impl PeerState {
+    fn can_become(self, next: PeerState) -> bool {
+        use PeerState::*;
+        matches!(
+            (self, next),
+            (Live, Suspect) | (Suspect, Live) | (Suspect, Dead) | (Dead, Live)
+        )
+    }
+}
+
 /// One live (or corpse) TCP session on the write path.
 ///
 /// `alive` is shared with the session's reader thread: the reader is the only
@@ -45,6 +86,60 @@ struct PeerSession {
     stream: TcpStream,
     redial: Option<SocketAddr>,
     alive: Arc<AtomicBool>,
+    state: PeerState,
+}
+
+impl PeerSession {
+    fn new(stream: TcpStream, redial: Option<SocketAddr>, alive: Arc<AtomicBool>) -> Self {
+        Self {
+            stream,
+            redial,
+            alive,
+            state: PeerState::Live,
+        }
+    }
+
+    /// The only state-change path. Illegal transitions are programming errors
+    /// and panic, mirroring etcd-raft's `becomeXxx` discipline.
+    fn transition(&mut self, next: PeerState) {
+        assert!(
+            self.state.can_become(next),
+            "illegal peer transition {:?} -> {:?}",
+            self.state,
+            next
+        );
+        if next == PeerState::Suspect {
+            // The cross-thread death signal and the FSM state are one fact;
+            // keep them in lockstep so no later phase misreads a suspect
+            // session as live.
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        self.state = next;
+    }
+
+    /// Death signal observed (reader EOF/fatal or write error).
+    fn become_suspect(&mut self) {
+        self.transition(PeerState::Suspect);
+    }
+
+    /// Recovery completed: this peer (identity = its listen address) is
+    /// reachable again. Legal from `Suspect` and from a `Dead` tombstone.
+    fn become_live(&mut self) {
+        self.transition(PeerState::Live);
+    }
+
+    /// Recovery attempted and failed.
+    fn become_dead(&mut self) {
+        self.transition(PeerState::Dead);
+    }
+
+    /// Replace this session's transport with a freshly redialed one, keeping
+    /// the peer identity (`redial` listen address), and record the recovery.
+    fn replace_with(&mut self, fresh: PeerSession) {
+        self.stream = fresh.stream;
+        self.alive = fresh.alive;
+        self.become_live();
+    }
 }
 
 /// Shared state for one TCP authority peer (listener + outbound peers + inbox).
@@ -103,6 +198,19 @@ impl TcpAuthorityNet {
 
     pub fn addr(&self) -> SocketAddr {
         self.inner.addr
+    }
+
+    /// Observable peer FSM snapshot: `(peer listen address if dialed, state)`.
+    /// Dead dialed peers appear as tombstones awaiting redial; accepted peers
+    /// are reaped at demotion, so they never linger here as Dead.
+    pub fn peer_states(&self) -> Vec<(Option<SocketAddr>, PeerState)> {
+        self.inner
+            .peers
+            .lock()
+            .expect("peers lock")
+            .iter()
+            .map(|p| (p.redial, p.state))
+            .collect()
     }
 
     /// Cheap cloneable endpoint for the Steps 5–7 generic drivers.
@@ -224,14 +332,18 @@ impl TcpEndpoint {
         let mut ok = 0usize;
         let mut last_err: Option<String> = None;
 
-        // Phase 1 — heal sessions whose reader flagged death (EOF / fatal read).
-        // This flag, not a write error, is the load-bearing trigger: a write
-        // into a corpse stream can return Ok (the kernel buffers the bytes
-        // before the peer's RST arrives), so an error-triggered-only reconnect
-        // would never fire and the corpse would shadow the peer forever.
+        // Phase 1 — demote sessions whose reader flagged death (EOF / fatal
+        // read), then attempt recovery. The flag, not a write error, is the
+        // load-bearing trigger: a write into a corpse stream can return Ok
+        // (the kernel buffers the bytes before the peer's RST arrives), so an
+        // error-triggered-only reconnect would never fire and the corpse
+        // would shadow the peer forever.
         let mut idx = 0;
         while idx < peers.len() {
-            if peers[idx].alive.load(Ordering::SeqCst) {
+            if !peers[idx].alive.load(Ordering::SeqCst) && peers[idx].state == PeerState::Live {
+                peers[idx].become_suspect();
+            }
+            if peers[idx].state == PeerState::Live {
                 idx += 1;
                 continue;
             }
@@ -241,18 +353,24 @@ impl TcpEndpoint {
                 // on the send path; the caller's next send is the retry.
                 Some(addr) => match redial_once(&self.inner, addr) {
                     Ok(fresh) => {
-                        peers[idx] = fresh;
+                        peers[idx].replace_with(fresh);
                         idx += 1;
                     }
                     Err(e) => {
+                        // Tombstone: keep the entry — it carries the redial
+                        // address, and a later send retries the recovery.
+                        if peers[idx].state == PeerState::Suspect {
+                            peers[idx].become_dead();
+                        }
                         last_err = Some(e);
-                        idx += 1; // keep the corpse entry: it carries the redial addr
+                        idx += 1;
                     }
                 },
-                // Accepted session: no redialable address. Prune the corpse; a
-                // restarted dialer heals this pair by dialing us again (the
-                // accept loop pushes the fresh session).
+                // Accepted session: no redialable address. Demote to Dead and
+                // reap; a restarted dialer heals this pair by dialing us again
+                // (the accept loop pushes the fresh Live session).
                 None => {
+                    peers[idx].become_dead();
                     peers.remove(idx);
                 }
             }
@@ -264,36 +382,42 @@ impl TcpEndpoint {
         }
 
         // Phase 2 — best-effort fan-out to live sessions. A surfaced write
-        // error is the second death signal: flag it and, for dialed sessions,
-        // try one reconnect-and-resend within this send.
+        // error is the second death signal: demote Live -> Suspect and, for
+        // dialed sessions, try one reconnect-and-resend within this send.
         for p in peers.iter_mut() {
-            if !p.alive.load(Ordering::SeqCst) {
-                continue; // redial failed this round; next send retries
+            if !p.alive.load(Ordering::SeqCst) && p.state == PeerState::Live {
+                p.become_suspect();
+            }
+            if p.state != PeerState::Live {
+                continue; // recovery failed this round; next send retries
             }
             match p.stream.write_all(&frame).and_then(|_| p.stream.flush()) {
                 Ok(()) => ok += 1,
                 Err(e) => {
-                    p.alive.store(false, Ordering::SeqCst);
+                    p.become_suspect();
                     last_err = Some(e.to_string());
                     if let Some(addr) = p.redial {
                         match redial_once(&self.inner, addr) {
                             Ok(fresh) => {
-                                match (&fresh.stream)
+                                let written = (&fresh.stream)
                                     .write_all(&frame)
-                                    .and_then(|_| (&fresh.stream).flush())
-                                {
+                                    .and_then(|_| (&fresh.stream).flush());
+                                // The fresh transport replaces the suspect
+                                // session even if its first write failed —
+                                // phase 1 redials it again on the next send.
+                                p.replace_with(fresh);
+                                match written {
                                     Ok(()) => ok += 1,
                                     Err(e2) => {
-                                        fresh.alive.store(false, Ordering::SeqCst);
+                                        p.become_suspect();
                                         last_err = Some(e2.to_string());
                                     }
                                 }
-                                // The fresh session replaces the corpse even if
-                                // its first write failed — phase 1 redials it
-                                // on the next send.
-                                *p = fresh;
                             }
-                            Err(e2) => last_err = Some(e2),
+                            Err(e2) => {
+                                p.become_dead();
+                                last_err = Some(e2);
+                            }
                         }
                     }
                 }
@@ -384,11 +508,7 @@ fn dialed_session(
             inner.readers.lock().expect("readers lock").push(handle);
         }
     }
-    Ok(PeerSession {
-        stream,
-        redial: Some(addr),
-        alive,
-    })
+    Ok(PeerSession::new(stream, Some(addr), alive))
 }
 
 /// One reconnect attempt to a dialed peer's listen address. Send-path helper:
@@ -455,11 +575,11 @@ fn spawn_listener(inner: Arc<TcpInner>, listener: TcpListener) -> JoinHandle<()>
             let alive = Arc::new(AtomicBool::new(true));
             if let Ok(write_half) = stream.try_clone() {
                 if configure_stream(&write_half).is_ok() {
-                    inner.peers.lock().expect("peers lock").push(PeerSession {
-                        stream: write_half,
-                        redial: None,
-                        alive: Arc::clone(&alive),
-                    });
+                    inner
+                        .peers
+                        .lock()
+                        .expect("peers lock")
+                        .push(PeerSession::new(write_half, None, Arc::clone(&alive)));
                 }
             }
             let handle = spawn_reader(Arc::clone(&inner), stream, alive);
@@ -654,5 +774,142 @@ mod tests {
             AuthorityMsg::Cert(c) => assert!(c.is_valid(&committee)),
             _ => panic!("cert"),
         }
+    }
+
+    fn stream_pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").expect("pair bind");
+        let a = l.local_addr().expect("pair addr");
+        let c = TcpStream::connect(a).expect("pair connect");
+        let (s, _) = l.accept().expect("pair accept");
+        (c, s)
+    }
+
+    /// The audit bar (§2-D/P1): detection -> demotion -> recovery must be an
+    /// explicit, named-transition FSM, not an implicit boolean dance.
+    #[test]
+    fn peer_fsm_named_transitions_cover_detect_demote_recover() {
+        let (c, _s) = stream_pair();
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut p = PeerSession::new(c, Some("127.0.0.1:9".parse().unwrap()), alive);
+        assert_eq!(p.state, PeerState::Live);
+        p.become_suspect(); // detect
+        assert_eq!(p.state, PeerState::Suspect);
+        assert!(
+            !p.alive.load(Ordering::SeqCst),
+            "suspect keeps the cross-thread death signal in lockstep"
+        );
+        p.become_live(); // recover
+        assert_eq!(p.state, PeerState::Live);
+        p.become_suspect();
+        p.become_dead(); // demote after a failed recovery
+        assert_eq!(p.state, PeerState::Dead);
+        p.become_live(); // tombstone redial finally succeeds
+        assert_eq!(p.state, PeerState::Live);
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal peer transition")]
+    fn peer_fsm_live_to_dead_panics() {
+        let (c, _s) = stream_pair();
+        let mut p = PeerSession::new(c, None, Arc::new(AtomicBool::new(true)));
+        p.become_dead(); // a peer must be *observed* failing (Suspect) first
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal peer transition")]
+    fn peer_fsm_dead_to_dead_panics() {
+        let (c, _s) = stream_pair();
+        let mut p = PeerSession::new(c, None, Arc::new(AtomicBool::new(true)));
+        p.become_suspect();
+        p.become_dead();
+        p.become_dead(); // no silent self-transition
+    }
+
+    /// Same restart scenario as `a_restarted_peer_becomes_reachable_again`,
+    /// but asserting the observable FSM path: Live -> Suspect -> Dead
+    /// (tombstone retained) -> Live (recovery completed).
+    #[test]
+    fn restarted_peer_fsm_transitions_are_observable() {
+        let policy = policy();
+        let port = free_port();
+        let b_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        let a = TcpAuthorityNet::bind("a").unwrap();
+        let b1 = TcpAuthorityNet::bind_at("b", b_addr).unwrap();
+        a.connect_peer(b_addr).unwrap();
+        let ea = a.endpoint();
+        ea.broadcast_order(signed_tx(&policy, 0, 1)).unwrap();
+        assert_eq!(poll_until(&b1.endpoint(), 50).len(), 1, "baseline live delivery");
+        assert_eq!(a.peer_states(), vec![(Some(b_addr), PeerState::Live)]);
+
+        b1.shutdown();
+        drop(b1);
+        for i in 0..30 {
+            let _ = ea.broadcast_order(signed_tx(&policy, 1 + i, 1));
+            if a.peer_states().first().map(|p| p.1) == Some(PeerState::Dead) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            a.peer_states(),
+            vec![(Some(b_addr), PeerState::Dead)],
+            "a dead dialed peer must surface as a Dead tombstone, not a silent corpse"
+        );
+
+        let b2 = TcpAuthorityNet::bind_at("b", b_addr).unwrap();
+        let eb2 = b2.endpoint();
+        let mut got = Vec::new();
+        for i in 0..60 {
+            let _ = ea.broadcast_order(signed_tx(&policy, 100 + i, 1));
+            got.extend(eb2.poll());
+            if !got.is_empty() && a.peer_states().first().map(|p| p.1) == Some(PeerState::Live) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!got.is_empty(), "restarted peer must receive again");
+        assert_eq!(
+            a.peer_states(),
+            vec![(Some(b_addr), PeerState::Live)],
+            "recovery must complete Dead -> Live"
+        );
+
+        a.shutdown();
+        b2.shutdown();
+    }
+
+    /// An accepted session has no redialable address: on death it must be
+    /// demoted and reaped, never linger as a corpse in the peer set.
+    #[test]
+    fn accepted_corpse_is_demoted_and_reaped() {
+        let policy = policy();
+        let a = TcpAuthorityNet::bind("a").unwrap();
+        let b = TcpAuthorityNet::bind("b").unwrap();
+        b.connect_peer(a.addr()).unwrap(); // b dials a; a accepts (redial: None)
+        for _ in 0..50 {
+            if a.peer_states().len() == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(a.peer_states(), vec![(None, PeerState::Live)]);
+
+        b.shutdown();
+        drop(b);
+        let ea = a.endpoint();
+        for i in 0..30 {
+            let _ = ea.broadcast_order(signed_tx(&policy, i, 1));
+            if a.peer_states().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            a.peer_states().is_empty(),
+            "accepted corpse must be demoted and reaped, got {:?}",
+            a.peer_states()
+        );
+        a.shutdown();
     }
 }
