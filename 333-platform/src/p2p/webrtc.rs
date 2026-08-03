@@ -24,6 +24,27 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 
 // KG: CONTRACT_333_INT_MemFix — PeerState enum
+/// Peer connection state machine (FSM audit 2026-07-15 §2-D — this enum was
+/// unguarded and `Failed` was unreachable: zero ICE handlers existed).
+///
+/// Guard discipline mirrors tcp.rs `PeerState`: local code paths transition
+/// only through [`become`] (illegal = panic, a programming error), while
+/// browser events (ICE state change, channel `onopen`) go through
+/// [`become_from_event`] — a total function that must never panic, because a
+/// remote event is not a programming error and the browser shares our single
+/// wasm instance (no panic isolation in production — audit P1).
+///
+/// Legality table (browser reality included: ICE may complete before our own
+/// async SDP dance finishes, and `disconnected` is transient):
+///
+/// - `New -> Connecting | Connected | Disconnected | Failed`
+/// - `Connecting -> Connected | Disconnected | Failed`
+/// - `Connected -> Disconnected | Failed`
+/// - `Disconnected -> Connected | Failed`
+/// - `Failed -> (terminal)`
+///
+/// Local teardown ([`become_closed`]) is always legal — closing our own side
+/// is never a protocol violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
     New,
@@ -31,6 +52,79 @@ pub enum PeerState {
     Connected,
     Disconnected,
     Failed,
+}
+
+impl PeerState {
+    fn can_become(self, next: PeerState) -> bool {
+        use PeerState::*;
+        matches!(
+            (self, next),
+            (New, Connecting)
+                | (New, Connected)
+                | (New, Disconnected)
+                | (New, Failed)
+                | (Connecting, Connected)
+                | (Connecting, Disconnected)
+                | (Connecting, Failed)
+                | (Connected, Disconnected)
+                | (Connected, Failed)
+                | (Disconnected, Connected)
+                | (Disconnected, Failed)
+        )
+    }
+
+    /// Map the browser's ICE connection-state string onto our FSM. Read via
+    /// `js_sys::Reflect` instead of the typed `web_sys::RtcIceConnectionState`
+    /// API — the typed type/method needs extra web-sys feature flags, and
+    /// `333-platform/Cargo.toml` belongs to another work stream. Pure
+    /// function; this is the piece that makes `Failed` reachable at all.
+    fn from_ice_str(ice: &str) -> PeerState {
+        match ice {
+            "new" => PeerState::New,
+            "checking" => PeerState::Connecting,
+            "connected" | "completed" => PeerState::Connected,
+            "disconnected" => PeerState::Disconnected,
+            "failed" => PeerState::Failed,
+            // "closed" and any unknown future state: treat as a transient
+            // drop, never as New.
+            _ => PeerState::Disconnected,
+        }
+    }
+}
+
+/// Programmer-driven transition — illegal transitions are programming errors
+/// and panic (etcd-raft `becomeXxx` bar).
+fn transition(state: &Rc<RefCell<PeerState>>, next: PeerState) {
+    let mut s = state.borrow_mut();
+    assert!(
+        s.can_become(next),
+        "illegal webrtc peer transition {:?} -> {:?}",
+        *s,
+        next
+    );
+    *s = next;
+}
+
+/// Browser-event-driven transition — total, never panics. Idempotent for
+/// no-op events; refuses illegal regressions (returns `false`) so a confused
+/// or malicious event stream cannot move the FSM backwards out of `Failed`.
+fn become_from_event(state: &Rc<RefCell<PeerState>>, next: PeerState) -> bool {
+    let mut s = state.borrow_mut();
+    if *s == next {
+        return true;
+    }
+    if s.can_become(next) {
+        *s = next;
+        true
+    } else {
+        false
+    }
+}
+
+/// Local teardown — always legal from any state. `close()` is our own act,
+/// not a peer protocol event.
+fn become_closed(state: &Rc<RefCell<PeerState>>) {
+    *state.borrow_mut() = PeerState::Disconnected;
 }
 
 /// Channel identifiers for 4-channel architecture
@@ -142,6 +236,10 @@ pub struct WebRtcPeer {
     inboxes: Rc<ChannelInboxes>,
     state: Rc<RefCell<PeerState>>,
     ondatachannel: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
+    /// ICE connection-state handler — stored (not forgotten) so `close()`/Drop
+    /// can detach it. This is the wiring that makes `PeerState::Failed`
+    /// reachable: before the FSM audit fix, zero ICE handlers existed.
+    oniceconnectionstatechange: Option<Closure<dyn FnMut()>>,
 }
 
 /// ICE server configuration — STUN + TURN fallback
@@ -203,6 +301,25 @@ impl WebRtcPeer {
         let inboxes = Rc::new(ChannelInboxes::new());
         let state = Rc::new(RefCell::new(PeerState::New));
 
+        // ICE connection-state handler: the browser is the only reliable
+        // observer of transport death/recovery. Events drive the FSM through
+        // the total, never-panicking event path.
+        let onice = {
+            let pc_for_event = pc.clone();
+            let state_for_event = Rc::clone(&state);
+            Closure::<dyn FnMut()>::new(move || {
+                let ice = Reflect::get(
+                    pc_for_event.as_ref(),
+                    &JsValue::from_str("iceConnectionState"),
+                )
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+                become_from_event(&state_for_event, PeerState::from_ice_str(&ice));
+            })
+        };
+        pc.set_oniceconnectionstatechange(Some(onice.as_ref().unchecked_ref()));
+
         Ok(Self {
             pc,
             channels: Vec::new(),
@@ -211,6 +328,7 @@ impl WebRtcPeer {
             inboxes,
             state,
             ondatachannel: None,
+            oniceconnectionstatechange: Some(onice),
         })
     }
 
@@ -223,7 +341,7 @@ impl WebRtcPeer {
             let closures = self.attach_handlers(&dc);
             self.channels.push(ChannelEntry { dc, closures });
         }
-        *self.state.borrow_mut() = PeerState::Connecting;
+        transition(&self.state, PeerState::Connecting);
         Ok(())
     }
 
@@ -269,7 +387,7 @@ impl WebRtcPeer {
             dc.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
 
             let onopen = Closure::<dyn FnMut()>::new(move || {
-                *state2.borrow_mut() = PeerState::Connected;
+                become_from_event(&state2, PeerState::Connected);
             });
             dc.set_onopen(Some(onopen.as_ref().unchecked_ref()));
 
@@ -295,7 +413,11 @@ impl WebRtcPeer {
         // Move remote channels into struct
         self.remote_channels = remote_store.borrow_mut().drain(..).collect();
 
-        *self.state.borrow_mut() = PeerState::Connecting;
+        // Event path, not a panic-guarded local transition: during the SDP
+        // awaits above, channels may already have opened (state == Connected);
+        // regressing Connected -> Connecting would be a lie and (guarded) a
+        // panic. Advance only if we are still New.
+        become_from_event(&self.state, PeerState::Connecting);
         Ok(answer_sdp)
     }
 
@@ -386,6 +508,8 @@ impl WebRtcPeer {
     pub fn close(&mut self) {
         self.pc.set_ondatachannel(None);
         self.ondatachannel = None;
+        self.pc.set_oniceconnectionstatechange(None);
+        self.oniceconnectionstatechange = None;
 
         for entry in &mut self.channels {
             entry.closures.cleanup(&entry.dc);
@@ -401,7 +525,7 @@ impl WebRtcPeer {
         self.remote_channels.clear();
 
         self.pc.close();
-        *self.state.borrow_mut() = PeerState::Disconnected;
+        become_closed(&self.state);
     }
 }
 
@@ -410,6 +534,7 @@ impl WebRtcPeer {
 impl Drop for WebRtcPeer {
     fn drop(&mut self) {
         self.pc.set_ondatachannel(None);
+        self.pc.set_oniceconnectionstatechange(None);
         for entry in &mut self.channels {
             entry.closures.cleanup(&entry.dc);
             entry.dc.close();
@@ -447,7 +572,7 @@ impl WebRtcPeer {
         dc.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
 
         let onopen = Closure::<dyn FnMut()>::new(move || {
-            *state.borrow_mut() = PeerState::Connected;
+            become_from_event(&state, PeerState::Connected);
         });
         dc.set_onopen(Some(onopen.as_ref().unchecked_ref()));
 
@@ -455,5 +580,89 @@ impl WebRtcPeer {
             onmessage: Some(onmsg),
             onopen: Some(onopen),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(s: PeerState) -> Rc<RefCell<PeerState>> {
+        Rc::new(RefCell::new(s))
+    }
+
+    #[test]
+    fn ice_mapping_covers_every_browser_state() {
+        assert_eq!(PeerState::from_ice_str("new"), PeerState::New);
+        assert_eq!(PeerState::from_ice_str("checking"), PeerState::Connecting);
+        assert_eq!(PeerState::from_ice_str("connected"), PeerState::Connected);
+        assert_eq!(PeerState::from_ice_str("completed"), PeerState::Connected);
+        assert_eq!(PeerState::from_ice_str("disconnected"), PeerState::Disconnected);
+        assert_eq!(PeerState::from_ice_str("failed"), PeerState::Failed);
+        assert_eq!(PeerState::from_ice_str("closed"), PeerState::Disconnected);
+        // Unknown future states degrade to a transient drop, never to New.
+        assert_eq!(PeerState::from_ice_str(""), PeerState::Disconnected);
+        assert_eq!(PeerState::from_ice_str("whatever"), PeerState::Disconnected);
+    }
+
+    /// The pre-fix defect (FSM audit 2026-07-15 §2-D): `Failed` had zero
+    /// incoming paths — no ICE handler existed at all.
+    #[test]
+    fn failed_is_reachable_via_ice_event_path() {
+        let s = st(PeerState::Connecting);
+        assert!(become_from_event(&s, PeerState::from_ice_str("failed")));
+        assert_eq!(*s.borrow(), PeerState::Failed);
+    }
+
+    #[test]
+    fn event_path_full_browser_lifecycle() {
+        let s = st(PeerState::New);
+        assert!(become_from_event(&s, PeerState::Connecting)); // ICE checking
+        assert!(become_from_event(&s, PeerState::Connected)); // channel onopen
+        // transient drop + recovery (wifi flap is normal, not a fault)
+        assert!(become_from_event(&s, PeerState::Disconnected));
+        assert!(become_from_event(&s, PeerState::Connected));
+        // idempotent repeats are no-ops, still ok
+        assert!(become_from_event(&s, PeerState::Connected));
+        // terminal failure
+        assert!(become_from_event(&s, PeerState::Failed));
+        // a late/confused event must not resurrect a failed peer
+        assert!(!become_from_event(&s, PeerState::Connected));
+        assert!(!become_from_event(&s, PeerState::Disconnected));
+        assert_eq!(*s.borrow(), PeerState::Failed);
+        // local teardown is still legal
+        become_closed(&s);
+        assert_eq!(*s.borrow(), PeerState::Disconnected);
+    }
+
+    #[test]
+    fn event_path_never_regresses_connected_to_connecting() {
+        // accept_offer race: channels opened during the SDP awaits — the
+        // trailing "Connecting" write must not drag the FSM backwards.
+        let s = st(PeerState::New);
+        assert!(become_from_event(&s, PeerState::Connected));
+        assert!(!become_from_event(&s, PeerState::Connecting));
+        assert_eq!(*s.borrow(), PeerState::Connected);
+    }
+
+    #[test]
+    fn programmer_path_new_to_connecting() {
+        let s = st(PeerState::New);
+        transition(&s, PeerState::Connecting);
+        assert_eq!(*s.borrow(), PeerState::Connecting);
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal webrtc peer transition")]
+    fn programmer_path_backwards_panics() {
+        let s = st(PeerState::Connected);
+        transition(&s, PeerState::New);
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal webrtc peer transition")]
+    fn programmer_path_resurrecting_failed_panics() {
+        let s = st(PeerState::Failed);
+        transition(&s, PeerState::Connecting);
     }
 }
