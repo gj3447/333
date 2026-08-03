@@ -240,6 +240,12 @@ def _emit_client_retry_late_quorum(backend, cid: str, ok: bool, **attrs) -> bool
     return ok
 
 
+def _emit_anti_entropy_convergence(backend, cid: str, ok: bool, **attrs) -> bool:  # KG: transfer333-req-anti-entropy-convergence-20260803
+    if ok:
+        backend.ship([_ev(cid, "anti_entropy_convergence", **attrs)])
+    return ok
+
+
 def _authority_config_probe(*, committee: str, genesis: str) -> subprocess.CompletedProcess:
     """Run one authority config through the real CLI; expected failures occur pre-bind."""
     return subprocess.run(
@@ -701,6 +707,48 @@ def run_node_probe(backend, cid: str) -> dict:  # KG: transfer333-node-conforman
         finally:
             for a in early + late:
                 a.stop()
+
+        # 9) Anti-entropy convergence: restart a3 with an empty (in-memory)
+        # state — it has genesis only and missed the step-3 certificate.
+        # The peers' quiet-period re-presentation must carry it to the same
+        # balances (alice=70, bob=30): level-triggered reconciliation, not a
+        # one-shot delivery (audit 2026-07-15 P1 acceptance criterion).
+        a3 = authorities[3]
+        a3.stop()
+        time.sleep(0.5)
+        argv = [
+            str(_NODE_BIN), "authority",
+            "--id", "a3", "--dev-seed", "3",
+            "--network-id", _NETWORK_ID,
+            "--owner-roster", _OWNER_ROSTER,
+            "--listen", auth_addrs[3],
+            "--peers", ",".join(auth_addrs),
+            "--committee", _COMMITTEE,
+            "--genesis", _GENESIS,
+            "--rounds-idle-exit", "100000",
+        ]
+        a3_restarted = _Proc("a3r", argv)
+        want = {"alice": 70, "bob": 30}
+        converged = a3_restarted.wait_matching(
+            lambda event: (
+                event.get("event") == "cert_applied"
+                and event.get("balances") == want
+                and event.get("total_supply") == 100
+            ),
+            timeout=15.0,
+        )
+        summary["anti_entropy_convergence"] = {
+            "restarted": bool(a3_restarted.wait_event("committee_ready", timeout=5.0)),
+            "converged": bool(converged),
+        }
+        _emit_anti_entropy_convergence(
+            backend,
+            cid,
+            ready and converged is not None,
+            balances=want,
+            order_id=converged.get("order_id") if converged else None,
+        )
+        a3_restarted.stop()
 
         return summary
     finally:

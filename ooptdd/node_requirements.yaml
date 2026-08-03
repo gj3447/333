@@ -133,3 +133,13 @@ requirements:
       source: node_conformance_adapter.py
       symbol: _emit_client_retry_late_quorum
       must_emit: client_retry_late_quorum
+
+  - id: REQ-ANTI-ENTROPY-CONVERGENCE
+    description: a restarted authority at genesis receives the missed certificate via peer re-presentation and converges to the same balances
+    gate:
+      - {event: anti_entropy_convergence, op: "==", count: 1}
+    longinus:
+      kg_anchor: transfer333-req-anti-entropy-convergence-20260803
+      source: node_conformance_adapter.py
+      symbol: _emit_anti_entropy_convergence
+      must_emit: anti_entropy_convergence
