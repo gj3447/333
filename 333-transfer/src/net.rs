@@ -298,7 +298,9 @@ pub fn certify_via_mesh(
                         | AuthorityError::SequenceExhausted { .. }
                         | AuthorityError::BalanceOverflow { .. }
                         | AuthorityError::JournalFailed { .. }
-                        | AuthorityError::Poisoned,
+                        | AuthorityError::Poisoned
+                        | AuthorityError::EpochFencing { .. }
+                        | AuthorityError::EpochCatchingUp { .. },
                     ) => {
                         refusals += 1;
                     }

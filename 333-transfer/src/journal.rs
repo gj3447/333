@@ -45,8 +45,12 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
+use crate::epoch::{EpochCert, EpochProposal};
 use crate::owner::SignedTransfer;
-use crate::wire::{decode_transfer, encode_transfer, WireError};
+use crate::wire::{
+    decode_epoch_cert, decode_epoch_proposal, decode_transfer, encode_epoch_cert,
+    encode_epoch_proposal, encode_transfer, WireError,
+};
 
 const JOURNAL_MAGIC: &[u8] = b"transfer333/journal/v4\0";
 
@@ -69,6 +73,8 @@ const TAG_TORN: u8 = 0;
 const TAG_LOCKED: u8 = 1;
 const TAG_CONFIRMED: u8 = 2;
 const TAG_SNAPSHOT: u8 = 3;
+const TAG_EPOCH_FENCE: u8 = 4;
+const TAG_EPOCH_INSTALLED: u8 = 5;
 
 /// `tag(1) || len(4, BE) || crc(4, BE)`.
 const HEADER_LEN: usize = 9;
@@ -93,6 +99,14 @@ pub enum JournalRecord {
     /// Complete authority state as of some point. Replaying it *replaces* state
     /// rather than adding to it; see [`SnapshotData`].
     Snapshot(SnapshotData),
+    /// This authority fenced for an epoch change (stopped casting user votes
+    /// under the current committee). Written *before* the fence takes effect —
+    /// forgetting it would let an honest restart re-vote under the old epoch
+    /// and reopen the boundary race the fence exists to close (design §3).
+    EpochFence(EpochProposal),
+    /// This authority installed an epoch-change certificate. Written *before*
+    /// the install mutates state (write-ahead, same discipline as `Locked`).
+    EpochInstalled(EpochCert),
 }
 
 /// Authority state captured whole, so the log before it can be discarded.
@@ -122,6 +136,11 @@ pub struct SnapshotData {
     /// whole orders here would invent data the authority does not have and bloat
     /// the file for nothing.
     pub confirmed: Vec<(String, u64, [u8; 32])>,
+    /// Committee generation at snapshot time (committee-reconfiguration M2).
+    /// Snapshots are only taken in the `Active` state, so the epoch number
+    /// alone fully describes the epoch dimension — no Fencing/Installing
+    /// payload exists here by construction.
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +223,8 @@ pub fn encode_record(record: &JournalRecord) -> Vec<u8> {
         JournalRecord::Locked(o) => (TAG_LOCKED, encode_transfer(o)),
         JournalRecord::Confirmed(o) => (TAG_CONFIRMED, encode_transfer(o)),
         JournalRecord::Snapshot(sn) => (TAG_SNAPSHOT, encode_snapshot(sn)),
+        JournalRecord::EpochFence(p) => (TAG_EPOCH_FENCE, encode_epoch_proposal(p)),
+        JournalRecord::EpochInstalled(c) => (TAG_EPOCH_INSTALLED, encode_epoch_cert(c)),
     };
     let crc = frame_crc(tag, &body);
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
@@ -288,6 +309,8 @@ fn scan(bytes: &[u8]) -> Result<(Vec<JournalRecord>, usize), JournalError> {
             TAG_LOCKED => JournalRecord::Locked(decode_transfer(body)?),
             TAG_CONFIRMED => JournalRecord::Confirmed(decode_transfer(body)?),
             TAG_SNAPSHOT => JournalRecord::Snapshot(decode_snapshot(body)?),
+            TAG_EPOCH_FENCE => JournalRecord::EpochFence(decode_epoch_proposal(body)?),
+            TAG_EPOCH_INSTALLED => JournalRecord::EpochInstalled(decode_epoch_cert(body)?),
             other => return Err(JournalError::Corrupt(format!("unknown tag: {other}"))),
         });
         rest = &rest[HEADER_LEN + len..];
@@ -347,6 +370,10 @@ pub fn encode_snapshot(sn: &SnapshotData) -> Vec<u8> {
         out.extend_from_slice(&seq.to_be_bytes());
         out.extend_from_slice(order_id);
     }
+    // Epoch is the last field (committee-reconfiguration M2). Pre-M2 snapshot
+    // files end here and fail *closed* below — a truncated u64 is Corrupt,
+    // never a silent epoch-0 assumption.
+    out.extend_from_slice(&sn.epoch.to_be_bytes());
     out
 }
 
@@ -389,6 +416,11 @@ pub fn decode_snapshot(mut bytes: &[u8]) -> Result<SnapshotData, JournalError> {
             .expect("32 bytes checked");
         confirmed.push((account, seq, order_id));
     }
+    let epoch = u64::from_be_bytes(
+        take_slice(&mut bytes, 8)?
+            .try_into()
+            .expect("8 bytes checked"),
+    );
     if !bytes.is_empty() {
         return Err(JournalError::Corrupt("snapshot: trailing bytes".into()));
     }
@@ -396,6 +428,7 @@ pub fn decode_snapshot(mut bytes: &[u8]) -> Result<SnapshotData, JournalError> {
         accounts,
         locked,
         confirmed,
+        epoch,
     })
 }
 

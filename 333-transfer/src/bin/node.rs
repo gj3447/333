@@ -563,6 +563,27 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                         ));
                         return Err("authority poisoned by an earlier durability failure".to_string());
                     }
+                    // Epoch gate (design §5): fencing/catching-up withholds
+                    // votes but is not a failure — the order's owner retries
+                    // after the change completes.
+                    Err(AuthorityError::EpochFencing { epoch }) => {
+                        emit(&format!(
+                            "{{\"event\":\"epoch_fencing\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"epoch\":{}}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id),
+                            epoch
+                        ));
+                    }
+                    Err(AuthorityError::EpochCatchingUp { epoch }) => {
+                        emit(&format!(
+                            "{{\"event\":\"epoch_catching_up\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"epoch\":{}}}",
+                            order_id_hex(&t),
+                            escape_json(&transfer_str(&t.transfer)),
+                            escape_json(&id),
+                            epoch
+                        ));
+                    }
                     Err(AuthorityError::ZeroAmount) => {
                         emit(&format!(
                             "{{\"event\":\"state_rejected\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"reason\":\"zero_amount\"}}",

@@ -233,6 +233,7 @@ fn snapshot_codec_roundtrips() {
         ],
         locked: vec![t("bob", 0, 30)],
         confirmed: vec![("bob".to_string(), 9, [0xAB; 32])],
+        epoch: 0,
     };
     let bytes = encode_snapshot(&sn);
     assert_eq!(decode_snapshot(&bytes).expect("roundtrip"), sn);
@@ -298,6 +299,7 @@ fn mem_journal_compaction_matches() {
         ],
         locked: vec![a.clone()],
         confirmed: vec![],
+        epoch: 0,
     };
     journal.compact(&snapshot).expect("compact");
     assert_eq!(journal.len(), 1, "compaction replaces the log with one frame");

@@ -14,6 +14,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::effect::{effect_message, EffectAttestation};
+use crate::epoch::{frontier_digest, EpochCert, EpochProposal, EpochVote};
 use crate::journal::{Journal, JournalError, JournalRecord, NullJournal, SnapshotData};
 use crate::owner::{
     put_network_transfer_body, NetworkId, OwnerAuthError, PolicyId, SignedTransfer,
@@ -369,6 +370,80 @@ pub enum AuthorityError {
     /// again: its in-memory locks are no longer backed by stable storage, so it
     /// cannot prove it has not already signed a conflicting order for a slot.
     Poisoned,
+    /// User order arrived while this authority is fenced for an epoch change
+    /// (committee-reconfiguration design §5): voting is withheld, confirmation
+    /// is NOT — pre-fence certificates still apply. Clients retry post-change.
+    EpochFencing { epoch: u64 },
+    /// An epoch change is installed but the local frontier has not yet covered
+    /// the committed frontier; votes stay withheld until anti-entropy catches
+    /// the authority up. `epoch` is the generation being entered.
+    EpochCatchingUp { epoch: u64 },
+}
+
+/// Why an epoch-change operation was refused (committee-reconfiguration M2).
+/// These are protocol-level refusals, distinct from user-order rejections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochError {
+    /// The proposal/cert fails validation (roster unbuildable, policy
+    /// mismatch, field mismatch, bad signature, duplicate voter, insufficient
+    /// quorum, or voter outside the old committee).
+    Invalid { reason: String },
+    /// A durability barrier failed; the authority has fail-stopped.
+    Journal { reason: String },
+    /// A prior durability failure fail-stopped this authority.
+    Poisoned,
+    /// `sign_epoch_vote` outside the Fencing state — a caller bug, surfaced
+    /// as data rather than a panic because the daemon drives timing.
+    NotFencing,
+    /// A *valid* epoch certificate for the same generation conflicts with one
+    /// already installed — proof of ≥ f+1 Byzantine members in the old
+    /// committee. Fail-stop (design §5), same class as a durability fault.
+    ConflictingCert,
+}
+
+/// Result of a `fence` call (committee-reconfiguration M2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceOutcome {
+    /// The authority fenced: user votes are now withheld under this epoch.
+    Fenced { next_committee_id: CommitteeId },
+    /// Already fenced on this exact proposal.
+    AlreadyFenced,
+    /// Proposal is not for `current_epoch + 1` — ignored, never fenced.
+    IgnoredStaleEpoch { expected: u64, got: u64 },
+    /// A different proposal already holds the fence for this epoch (v1:
+    /// the operator issues exactly one; a second is ignored, not an error).
+    IgnoredConflictingProposal,
+    /// An epoch change is mid-install — proposals wait for it to complete.
+    IgnoredInstalling,
+}
+
+/// Result of an `install_epoch_cert` call (committee-reconfiguration M2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// Cert accepted; local frontier already covers the committed one — the
+    /// new epoch is fully active (committee switched, locks released).
+    Installed,
+    /// Cert accepted but the local frontier is behind the committed one;
+    /// votes stay withheld until anti-entropy catches up.
+    Installing,
+    /// This exact change was already installed.
+    AlreadyInstalled,
+    /// Cert is not for `current_epoch + 1` — ignored.
+    IgnoredStaleEpoch { expected: u64, got: u64 },
+}
+
+/// Epoch-change protocol state (design §5). `Active` is the only state that
+/// casts user votes; `Fencing`/`Installing` withhold them but NEVER refuse
+/// `confirm` — pre-fence certificates must always be applicable.
+#[derive(Debug, Clone)]
+enum EpochState {
+    Active,
+    Fencing { proposal: EpochProposal },
+    Installing {
+        cert: EpochCert,
+        next_committee: Committee,
+        frontier_digest: [u8; 32],
+    },
 }
 
 /// Vote-slot identity: one lock per (account, sequence, round). A higher round
@@ -437,6 +512,9 @@ pub struct Authority {
     /// design v1). 0 = static deployment committee. Advanced only by the M2
     /// epoch-install transition, strictly monotonically; until then it is 0.
     epoch: u64,
+    /// Epoch-change protocol state (design §5). `Active` casts user votes;
+    /// the other two withhold them (never `confirm`).
+    epoch_state: EpochState,
     /// Set once a journal append fails. In-memory state is then no longer backed
     /// by stable storage, so the authority refuses to vote or confirm rather than
     /// silently serving from state it cannot recover. Fail-stop, not fail-open.
@@ -492,6 +570,7 @@ impl Authority {
             confirmed: HashMap::new(),
             journal,
             epoch: 0,
+            epoch_state: EpochState::Active,
             poisoned,
         }
     }
@@ -547,6 +626,11 @@ impl Authority {
                         .iter()
                         .map(|(account, seq, order_id)| ((account.clone(), *seq), *order_id))
                         .collect();
+                    // Snapshots are taken only in the Active state (the compact
+                    // path refuses otherwise), so the epoch number alone fully
+                    // restores the epoch dimension.
+                    me.epoch = sn.epoch;
+                    me.epoch_state = EpochState::Active;
                 }
                 JournalRecord::Locked(order) => {
                     me.locked.insert(slot(order), order.clone());
@@ -564,6 +648,34 @@ impl Authority {
                     // round locks for the (account, seq) go.
                     me.locked
                         .retain(|(a, s, _), _| !(*a == account && *s == seq));
+                }
+                JournalRecord::EpochFence(proposal) => {
+                    me.epoch_state = EpochState::Fencing {
+                        proposal: proposal.clone(),
+                    };
+                }
+                JournalRecord::EpochInstalled(cert) => {
+                    // The cert was fully validated before it was journalled;
+                    // replay re-derives the state from the durable record.
+                    let next = Committee::with_epoch(
+                        cert.next_roster.clone(),
+                        me.policy.clone(),
+                        cert.epoch,
+                    )
+                    .ok_or_else(|| {
+                        JournalError::Corrupt("epoch-installed roster invalid".into())
+                    })?;
+                    me.locked.clear();
+                    me.epoch_state = EpochState::Installing {
+                        cert: cert.clone(),
+                        next_committee: next,
+                        frontier_digest: frontier_digest(&cert.frontier),
+                    };
+                    // Confirmed records folded so far may already cover the
+                    // committed frontier — complete immediately if so.
+                    if me.install_covered() {
+                        me.complete_install();
+                    }
                 }
             }
         }
@@ -594,6 +706,7 @@ impl Authority {
                 .iter()
                 .map(|((account, seq), order_id)| (account.clone(), *seq, *order_id))
                 .collect(),
+            epoch: self.epoch,
         }
     }
 
@@ -602,7 +715,16 @@ impl Authority {
     /// Safe to call at any quiescent point; the snapshot is taken from live
     /// state, so it is consistent by construction. A failure fail-stops for the
     /// same reason `append` does: the log on disk may no longer describe us.
+    ///
+    /// Refused outside the `Active` epoch state: `SnapshotData` carries only the
+    /// epoch number, so compacting mid-change (Fencing/Installing) would erase
+    /// the in-flight epoch transition the journal exists to preserve.
     pub fn compact_journal(&mut self) -> Result<(), AuthorityError> {
+        if !matches!(self.epoch_state, EpochState::Active) {
+            return Err(AuthorityError::EpochFencing {
+                epoch: self.epoch,
+            });
+        }
         let snapshot = self.snapshot_data();
         if let Err(e) = self.journal.compact(&snapshot) {
             self.poisoned = true;
@@ -637,6 +759,230 @@ impl Authority {
     /// epoch-install transition, strictly monotonically.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    // --- epoch-change FSM (committee-reconfiguration design v1 §5, M2) ---------
+
+    /// Per-account next-seq frontier (design §4) — the state summary an epoch
+    /// change is agreed over, and what `Installing` coverage is measured
+    /// against.
+    pub fn frontier(&self) -> Vec<(AccountId, u64)> {
+        self.ledger
+            .balances()
+            .into_iter()
+            .map(|(id, _)| {
+                let seq = self.ledger.next_seq(&id);
+                (id, seq)
+            })
+            .collect()
+    }
+
+    /// Phase 1 — fence (design §3/§5): stop casting user votes under the
+    /// current epoch. Only a well-formed proposal for `epoch + 1` under this
+    /// policy fences; anything else is ignored and never fences. The fence is
+    /// journalled *before* it takes effect — a restart that forgot it would
+    /// re-vote under the old epoch and reopen the boundary race.
+    pub fn fence(&mut self, proposal: EpochProposal) -> Result<FenceOutcome, EpochError> {
+        if self.poisoned {
+            return Err(EpochError::Poisoned);
+        }
+        if let EpochState::Installing { .. } = self.epoch_state {
+            return Ok(FenceOutcome::IgnoredInstalling);
+        }
+        if proposal.epoch != self.epoch + 1 {
+            return Ok(FenceOutcome::IgnoredStaleEpoch {
+                expected: self.epoch + 1,
+                got: proposal.epoch,
+            });
+        }
+        if proposal.policy_id != self.policy.id() {
+            return Err(EpochError::Invalid {
+                reason: "proposal policy_id does not match this authority's policy".into(),
+            });
+        }
+        // Validate the proposed roster now — fencing on an unbuildable
+        // committee would strand the change at vote time.
+        let next = Committee::with_epoch(
+            proposal.next_roster.clone(),
+            self.policy.clone(),
+            proposal.epoch,
+        )
+        .ok_or_else(|| EpochError::Invalid {
+            reason: "proposal roster does not form a valid committee".into(),
+        })?;
+        match &self.epoch_state {
+            EpochState::Active => {
+                self.journal_append(&JournalRecord::EpochFence(proposal.clone()))
+                    .map_err(|e| EpochError::Journal {
+                        reason: e.to_string(),
+                    })?;
+                self.epoch_state = EpochState::Fencing { proposal };
+                Ok(FenceOutcome::Fenced {
+                    next_committee_id: next.id(),
+                })
+            }
+            EpochState::Fencing { proposal: existing } => {
+                if *existing == proposal {
+                    Ok(FenceOutcome::AlreadyFenced)
+                } else {
+                    Ok(FenceOutcome::IgnoredConflictingProposal)
+                }
+            }
+            EpochState::Installing { .. } => unreachable!("handled above"),
+        }
+    }
+
+    /// Phase 2 — sign assent to the fenced change over the *current local*
+    /// frontier (design §5). The daemon calls this only once the frontier has
+    /// been stable for a quiet window; the signature binds exactly the state
+    /// present at call time.
+    pub fn sign_epoch_vote(&self) -> Result<EpochVote, EpochError> {
+        let EpochState::Fencing { proposal } = &self.epoch_state else {
+            return Err(EpochError::NotFencing);
+        };
+        let next = Committee::with_epoch(
+            proposal.next_roster.clone(),
+            self.policy.clone(),
+            proposal.epoch,
+        )
+        .ok_or_else(|| EpochError::Invalid {
+            reason: "fenced roster no longer builds (state corruption)".into(),
+        })?;
+        Ok(EpochVote::sign(
+            self.id.clone(),
+            self.committee_id,
+            proposal.epoch,
+            next.id(),
+            &self.frontier(),
+            &self.signing,
+        ))
+    }
+
+    /// Install an epoch-change certificate (design §5). Validation is total:
+    /// self-consistency (roster/frontier digests), every vote signed by a
+    /// member of the *current* committee, quorum of it, epoch == current + 1.
+    /// The install is journalled before any state moves; epoch-e locks are
+    /// released (a lock is a promise to a committee that no longer exists —
+    /// unconfirmed orders are re-submitted by their owners under the new
+    /// epoch). A *valid* but conflicting cert for the same generation
+    /// fail-stops the authority.
+    pub fn install_epoch_cert(
+        &mut self,
+        cert: &EpochCert,
+        old_committee: &Committee,
+    ) -> Result<InstallOutcome, EpochError> {
+        if self.poisoned {
+            return Err(EpochError::Poisoned);
+        }
+        if old_committee.id() != self.committee_id {
+            return Err(EpochError::Invalid {
+                reason: "old_committee does not match this authority's trust root".into(),
+            });
+        }
+        if cert.epoch != self.epoch + 1 {
+            return Ok(InstallOutcome::IgnoredStaleEpoch {
+                expected: self.epoch + 1,
+                got: cert.epoch,
+            });
+        }
+        let next = Committee::with_epoch(
+            cert.next_roster.clone(),
+            self.policy.clone(),
+            cert.epoch,
+        )
+        .ok_or_else(|| EpochError::Invalid {
+            reason: "cert roster does not form a valid committee".into(),
+        })?;
+        let fd = frontier_digest(&cert.frontier);
+        let mut seen = HashSet::new();
+        for v in &cert.votes {
+            if v.epoch != cert.epoch
+                || v.committee_id != self.committee_id
+                || v.next_committee_id != next.id()
+                || v.frontier_digest != fd
+            {
+                return Err(EpochError::Invalid {
+                    reason: "vote fields do not match the certificate".into(),
+                });
+            }
+            if !seen.insert(v.authority.clone()) {
+                return Err(EpochError::Invalid {
+                    reason: "duplicate voter".into(),
+                });
+            }
+            let key = old_committee
+                .key_of(&v.authority)
+                .ok_or_else(|| EpochError::Invalid {
+                    reason: "voter is not in the old committee".into(),
+                })?;
+            v.verify_signature(key).map_err(|_| EpochError::Invalid {
+                reason: "bad vote signature".into(),
+            })?;
+        }
+        if seen.len() < old_committee.quorum() {
+            return Err(EpochError::Invalid {
+                reason: "insufficient quorum in epoch votes".into(),
+            });
+        }
+        if let EpochState::Installing {
+            cert: existing,
+            next_committee: existing_next,
+            frontier_digest: existing_fd,
+        } = &self.epoch_state
+        {
+            if existing_next.id() != next.id() || *existing_fd != fd || existing.epoch != cert.epoch
+            {
+                // Two valid, different certs for one generation: the old
+                // committee's Byzantine budget is exceeded. Fail-stop.
+                self.poisoned = true;
+                return Err(EpochError::ConflictingCert);
+            }
+            return Ok(InstallOutcome::AlreadyInstalled);
+        }
+        // Write-ahead: the install promise is durable before any state moves,
+        // exactly like a vote lock.
+        self.journal_append(&JournalRecord::EpochInstalled(cert.clone()))
+            .map_err(|e| EpochError::Journal {
+                reason: e.to_string(),
+            })?;
+        self.locked.clear();
+        self.epoch_state = EpochState::Installing {
+            cert: cert.clone(),
+            next_committee: next,
+            frontier_digest: fd,
+        };
+        if self.install_covered() {
+            self.complete_install();
+            return Ok(InstallOutcome::Installed);
+        }
+        Ok(InstallOutcome::Installing)
+    }
+
+    /// True when the local ledger's per-account next-seq covers the committed
+    /// frontier of an in-flight install.
+    fn install_covered(&self) -> bool {
+        let EpochState::Installing { cert, .. } = &self.epoch_state else {
+            return false;
+        };
+        cert.frontier
+            .iter()
+            .all(|(account, seq)| self.ledger.next_seq(account) >= *seq)
+    }
+
+    /// Complete an install whose coverage has arrived: switch the trust root
+    /// and advance the epoch. The only `epoch`/`committee_id` mutator besides
+    /// construction — a named transition, matching the FSM discipline.
+    fn complete_install(&mut self) {
+        let EpochState::Installing {
+            cert,
+            next_committee,
+            ..
+        } = std::mem::replace(&mut self.epoch_state, EpochState::Active)
+        else {
+            return;
+        };
+        self.committee_id = next_committee.id();
+        self.epoch = cert.epoch;
     }
 
     pub fn verifying_key(&self) -> VerifyingKey {
@@ -724,6 +1070,33 @@ impl Authority {
     pub fn handle(&mut self, order: &SignedTransfer) -> Result<Vote, AuthorityError> {
         if self.poisoned {
             return Err(AuthorityError::Poisoned);
+        }
+        // Epoch gate (design §5): Fencing withholds user votes; Installing
+        // withholds them until the local frontier covers the committed one —
+        // and coverage arriving here completes the install before the first
+        // new-epoch vote. `confirm` is never gated.
+        enum Gate {
+            Open,
+            Covered,
+            Reject(AuthorityError),
+        }
+        let gate = match &self.epoch_state {
+            EpochState::Active => Gate::Open,
+            EpochState::Fencing { .. } => Gate::Reject(AuthorityError::EpochFencing {
+                epoch: self.epoch,
+            }),
+            EpochState::Installing { .. } => {
+                if self.install_covered() {
+                    Gate::Covered
+                } else {
+                    Gate::Reject(AuthorityError::EpochCatchingUp { epoch: self.epoch })
+                }
+            }
+        };
+        match gate {
+            Gate::Open => {}
+            Gate::Covered => self.complete_install(),
+            Gate::Reject(e) => return Err(e),
         }
         order
             .verify(&self.policy)
@@ -893,6 +1266,12 @@ impl Authority {
         // The seq is spent for every round, so all round locks for it go.
         self.locked
             .retain(|(account, seq, _), _| !(account == &transfer.from && *seq == transfer.from_seq));
+        // A pre-fence certificate may deliver the last missing piece of the
+        // committed frontier — completing the install is exactly what
+        // `Installing` exists for (design §5). No-op in any other state.
+        if self.install_covered() {
+            self.complete_install();
+        }
         Ok(ConfirmOutcome::Applied)
     }
 }
@@ -1065,7 +1444,9 @@ pub fn certify(
                 | AuthorityError::SequenceExhausted { .. }
                 | AuthorityError::BalanceOverflow { .. }
                 | AuthorityError::JournalFailed { .. }
-                | AuthorityError::Poisoned,
+                | AuthorityError::Poisoned
+                | AuthorityError::EpochFencing { .. }
+                | AuthorityError::EpochCatchingUp { .. },
             ) => refusals += 1,
         }
     }

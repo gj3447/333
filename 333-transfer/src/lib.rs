@@ -88,7 +88,8 @@ pub mod wire;
 pub use authority::{
     authority_signing_message, certify, quorum, signing_message, Authority, AuthorityError,
     Certificate, CertificateError, Certified, Committee, CommitteeId, ConfirmError,
-    ConfirmOutcome, Verified, Vote, VoteError, MAX_AUTHORITY_ID_BYTES, MAX_COMMITTEE_MEMBERS,
+    ConfirmOutcome, EpochError, FenceOutcome, InstallOutcome, Verified, Vote, VoteError,
+    MAX_AUTHORITY_ID_BYTES, MAX_COMMITTEE_MEMBERS,
 };
 pub use effect::{
     effect_message, is_final_effectcert, EffectAttestation, EffectCert,
