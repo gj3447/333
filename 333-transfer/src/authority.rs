@@ -137,15 +137,34 @@ fn committee_id(
 /// therefore cannot inflate quorum power by appearing under multiple aliases.
 /// Iteration order never affects [`CommitteeId`] because members are canonicalized
 /// in a `BTreeMap` before hashing.
+///
+/// `epoch` is the committee generation (committee-reconfiguration design v1,
+/// `docs/design/2026-08-03-committee-reconfiguration.md`): epoch 0 is the
+/// static deployment committee, and every later epoch is justified by an
+/// epoch-change certificate from the previous one. Epoch is a generation
+/// marker, **not** part of the trust-root digest — the same roster yields the
+/// same [`CommitteeId`] at any epoch.
 #[derive(Debug, Clone)]
 pub struct Committee {
     members: BTreeMap<AuthorityId, VerifyingKey>,
     policy: TransferPolicy,
     id: CommitteeId,
+    epoch: u64,
 }
 
 impl Committee {
+    /// Epoch-0 committee: the static deployment roster (unchanged behavior).
     pub fn new<I, S>(members: I, policy: TransferPolicy) -> Option<Self>
+    where
+        I: IntoIterator<Item = (S, VerifyingKey)>,
+        S: Into<AuthorityId>,
+    {
+        Self::with_epoch(members, policy, 0)
+    }
+
+    /// Committee at an explicit generation. Roster/id rules are identical to
+    /// [`Committee::new`]; only the generation marker differs.
+    pub fn with_epoch<I, S>(members: I, policy: TransferPolicy, epoch: u64) -> Option<Self>
     where
         I: IntoIterator<Item = (S, VerifyingKey)>,
         S: Into<AuthorityId>,
@@ -175,11 +194,17 @@ impl Committee {
             members: roster,
             policy,
             id,
+            epoch,
         })
     }
 
     pub fn id(&self) -> CommitteeId {
         self.id
+    }
+
+    /// Committee generation. 0 = static deployment committee.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub fn size(&self) -> usize {
@@ -408,6 +433,10 @@ pub struct Authority {
     locked: HashMap<(AccountId, u64, u64), SignedTransfer>,
     confirmed: HashMap<(AccountId, u64), [u8; 32]>,
     journal: Box<dyn Journal>,
+    /// Committee generation currently operated (committee-reconfiguration
+    /// design v1). 0 = static deployment committee. Advanced only by the M2
+    /// epoch-install transition, strictly monotonically; until then it is 0.
+    epoch: u64,
     /// Set once a journal append fails. In-memory state is then no longer backed
     /// by stable storage, so the authority refuses to vote or confirm rather than
     /// silently serving from state it cannot recover. Fail-stop, not fail-open.
@@ -462,6 +491,7 @@ impl Authority {
             locked: HashMap::new(),
             confirmed: HashMap::new(),
             journal,
+            epoch: 0,
             poisoned,
         }
     }
@@ -600,6 +630,13 @@ impl Authority {
 
     pub fn id(&self) -> &AuthorityId {
         &self.id
+    }
+
+    /// Committee generation currently operated (committee-reconfiguration
+    /// design v1). 0 = static deployment committee; advanced only by the M2
+    /// epoch-install transition, strictly monotonically.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub fn verifying_key(&self) -> VerifyingKey {
@@ -1165,6 +1202,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn committee_epoch_defaults_to_zero_and_with_epoch_preserves_identity() {
+        let (c0, _, policy) = setup(4);
+        assert_eq!(c0.epoch(), 0);
+        let members = (0..4u8).map(|i| (format!("a{i}"), key(i).verifying_key()));
+        let c3 = Committee::with_epoch(members, policy, 3).unwrap();
+        assert_eq!(c3.epoch(), 3);
+        // Epoch is a generation marker, not part of the trust-root digest:
+        // the same roster yields the same CommitteeId at any epoch.
+        assert_eq!(c0.id(), c3.id());
+        // Roster rules are unchanged at any epoch.
+        assert_eq!(c3.quorum(), c0.quorum());
+        assert_eq!(c3.size(), c0.size());
+    }
+
+    #[test]
+    fn authority_epoch_defaults_to_zero() {
+        let (_, authorities, _) = setup(4);
+        assert!(authorities.iter().all(|a| a.epoch() == 0));
+    }
+
     // KNOWN LIMITATION — equivocation split-vote permanently locks the slot for
     // an UNCOOPERATIVE owner who never re-votes. This remains true by design
     // (Guerraoui ceiling: consensusless asset transfer cannot force liveness for
@@ -1574,6 +1632,7 @@ mod tests {
             members,
             policy: policy.clone(),
             id: committee_id,
+            epoch: 0,
         };
         let mut authority = Authority::new(
             "a0",

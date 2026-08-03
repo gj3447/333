@@ -480,10 +480,11 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                     Ok(vote) => {
                         let _ = endpoint.broadcast_vote(vote);
                         emit(&format!(
-                            "{{\"event\":\"vote_cast\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\"}}",
+                            "{{\"event\":\"vote_cast\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"epoch\":{}}}",
                             order_id_hex(&t),
                             escape_json(&transfer_str(&t.transfer)),
-                            escape_json(&id)
+                            escape_json(&id),
+                            committee.epoch()
                         ));
                     }
                     Err(AuthorityError::Equivocation { account, seq }) => {
@@ -611,10 +612,11 @@ fn run_authority(args: &[String]) -> Result<(), String> {
                         match auth.confirm(&v, &committee) {
                             Ok(ConfirmOutcome::Applied) => {
                                 emit(&format!(
-                                    "{{\"event\":\"cert_applied\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"balances\":{},\"total_supply\":{}}}",
+                                    "{{\"event\":\"cert_applied\",\"order_id\":\"{}\",\"transfer\":\"{}\",\"authority\":\"{}\",\"epoch\":{},\"balances\":{},\"total_supply\":{}}}",
                                     order_id_hex(v.order()),
                                     escape_json(&transfer_str(v.transfer())),
                                     escape_json(&id),
+                                    committee.epoch(),
                                     balances_json(auth.ledger()),
                                     auth.ledger().total_supply()
                                 ));
