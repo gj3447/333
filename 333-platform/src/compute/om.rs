@@ -76,6 +76,7 @@ pub struct OmOrchestrator {
     pub(crate) scheduler: TaskScheduler,
     nodes: HashMap<u32, NodeResources>,
     jobs: HashMap<String, OmJob>,
+    verified_outputs: HashMap<TaskId, Vec<u8>>,
     next_job_num: u64,
     total_compute_ms: u64,
     total_tokens_distributed: u64,
@@ -93,6 +94,7 @@ impl OmOrchestrator {
             scheduler: TaskScheduler::new(),
             nodes: HashMap::new(),
             jobs: HashMap::new(),
+            verified_outputs: HashMap::new(),
             next_job_num: 1,
             total_compute_ms: 0,
             total_tokens_distributed: 0,
@@ -187,7 +189,13 @@ impl OmOrchestrator {
         }
         // Update job status
         for job in self.jobs.values_mut() {
-            if job.status == OmJobStatus::Submitted && !assignments.is_empty() {
+            if job.status == OmJobStatus::Submitted
+                && job.task_ids.iter().any(|task_id| {
+                    assignments
+                        .iter()
+                        .any(|assignment| assignment.task_id == *task_id)
+                })
+            {
                 job.status = OmJobStatus::Distributing;
             }
         }
@@ -196,30 +204,66 @@ impl OmOrchestrator {
 
     /// Submit task result and check job completion
     pub fn submit_result(&mut self, result: TaskResult, now_ms: u64) -> Option<VerifyResult> {
-        let task_id = result.task_id;
-        let compute_ms = result.compute_ms;
-        let output = result.output.clone();
+        let outcome = self.scheduler.submit_result_outcome(result)?;
+        self.total_compute_ms = self.total_compute_ms.saturating_add(outcome.compute_ms);
+        self.total_tokens_distributed = self
+            .total_tokens_distributed
+            .saturating_add(outcome.reward_delta);
 
-        let verify = self.scheduler.submit_result(result)?;
+        let terminal_success = outcome.newly_finalized
+            && matches!(
+                &outcome.verify,
+                VerifyResult::NoVerificationNeeded
+                    | VerifyResult::QuorumAgreed { .. }
+                    | VerifyResult::CanaryPassed
+            );
+        let terminal_failure = outcome.newly_finalized
+            && matches!(
+                &outcome.verify,
+                VerifyResult::QuorumDisagreed { .. } | VerifyResult::CanaryFailed { .. }
+            );
+        let recorded_output = if terminal_success {
+            outcome.canonical_output.as_ref().is_some_and(|output| {
+                self.verified_outputs
+                    .insert(outcome.task_id, output.clone())
+                    .is_none()
+            })
+        } else {
+            false
+        };
 
-        self.total_compute_ms += compute_ms;
-
-        // Check if any job is now complete
         for job in self.jobs.values_mut() {
-            if job.task_ids.contains(&task_id) {
-                job.results.push(output.clone());
-                job.status = OmJobStatus::Computing;
+            if job.task_ids.contains(&outcome.task_id) {
+                if terminal_failure || (terminal_success && !recorded_output) {
+                    job.status = OmJobStatus::Failed;
+                } else if recorded_output {
+                    job.results = job
+                        .task_ids
+                        .iter()
+                        .filter_map(|task_id| self.verified_outputs.get(task_id).cloned())
+                        .collect();
+                    if job
+                        .task_ids
+                        .iter()
+                        .all(|task_id| self.verified_outputs.contains_key(task_id))
+                    {
+                        job.status = OmJobStatus::Completed;
+                        job.completed_at = Some(now_ms);
+                    } else {
+                        job.status = OmJobStatus::Computing;
+                    }
+                } else if !matches!(job.status, OmJobStatus::Completed | OmJobStatus::Failed) {
+                    job.status = OmJobStatus::Computing;
+                }
 
-                // All tasks done?
-                if job.results.len() >= job.task_ids.len() {
+                if job.status == OmJobStatus::Completed && job.completed_at.is_none() {
                     job.status = OmJobStatus::Completed;
                     job.completed_at = Some(now_ms);
-                    self.total_tokens_distributed += job.reward_per_task * job.task_ids.len() as u64;
                 }
             }
         }
 
-        Some(verify)
+        Some(outcome.verify)
     }
 
     /// Get network-wide stats
@@ -274,12 +318,28 @@ pub struct OmStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn make_node(id: u32, cores: u32, gpu: bool) -> NodeResources {
         NodeResources {
             node_id: id, cpu_cores: cores, memory_mb: 4096,
             gpu_available: gpu, battery_pct: None,
             active_workers: 0, max_workers: cores,
+        }
+    }
+
+    fn valid_result(
+        task_id: TaskId,
+        worker_id: u32,
+        output: &[u8],
+        compute_ms: u64,
+    ) -> TaskResult {
+        TaskResult {
+            task_id,
+            worker_id,
+            output: output.to_vec(),
+            compute_ms,
+            output_hash: output_hash(output),
         }
     }
 
@@ -313,13 +373,15 @@ mod tests {
         let assignments = om.distribute(100);
         assert_eq!(assignments.len(), 1);
 
-        let verify = om.submit_result(TaskResult {
-            task_id: assignments[0].task_id,
-            worker_id: 1,
-            output: b"result".to_vec(),
-            compute_ms: 500,
-            output_hash: "hash123".into(),
-        }, 600);
+        let verify = om.submit_result(
+            valid_result(
+                assignments[0].task_id,
+                assignments[0].worker_id,
+                b"result",
+                500,
+            ),
+            600,
+        );
         assert!(verify.is_some());
 
         let job = om.job_status(&job_id).unwrap();
@@ -370,11 +432,15 @@ mod tests {
         om.submit_job(OmTaskKind::CpuIntensive { estimated_ms: 100 }, 1, 0);
         let assignments = om.distribute(0);
 
-        om.submit_result(TaskResult {
-            task_id: assignments[0].task_id, worker_id: 1,
-            output: vec![], compute_ms: 250,
-            output_hash: "h".into(),
-        }, 250);
+        om.submit_result(
+            valid_result(
+                assignments[0].task_id,
+                assignments[0].worker_id,
+                b"",
+                250,
+            ),
+            250,
+        );
 
         assert_eq!(om.stats().total_compute_ms, 250);
     }
@@ -394,9 +460,16 @@ mod tests {
     #[test]
     fn no_workers_distribute_empty() {
         let mut om = OmOrchestrator::new();
-        om.submit_job(OmTaskKind::CpuIntensive { estimated_ms: 100 }, 1, 0);
+        let job_id = om.submit_job(OmTaskKind::CpuIntensive { estimated_ms: 100 }, 1, 0);
+        let task_id = om.job_status(&job_id).unwrap().task_ids[0];
         let assignments = om.distribute(0);
         assert!(assignments.is_empty());
+        assert_eq!(om.stats().pending_tasks, 1);
+
+        om.register_node(make_node(7, 4, false));
+        let assignments = om.distribute(1);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].task_id, task_id);
     }
 
     // KG: CONTRACT_333_Compute_OM T4 — submit result for unassigned task returns None
@@ -405,11 +478,7 @@ mod tests {
         let mut om = OmOrchestrator::new();
         om.register_node(make_node(1, 4, false));
         // Submit result for task_id 999 that was never created
-        let verify = om.submit_result(TaskResult {
-            task_id: 999, worker_id: 1,
-            output: vec![], compute_ms: 10,
-            output_hash: "x".into(),
-        }, 100);
+        let verify = om.submit_result(valid_result(999, 1, b"x", 10), 100);
         assert!(verify.is_none());
     }
 
@@ -421,14 +490,10 @@ mod tests {
         // Directly use scheduler to submit a canary
         let tid = om.scheduler.submit_task(TaskType::Canary {
             description: "trap".into(), input: vec![],
-            expected_hash: "correct".into(),
+            expected_hash: output_hash(b"correct"),
         }, 0);
         om.scheduler.assign_next(0);
-        om.scheduler.submit_result(TaskResult {
-            task_id: tid, worker_id: 1,
-            output: vec![], compute_ms: 1,
-            output_hash: "wrong".into(),
-        });
+        om.scheduler.submit_result(valid_result(tid, 1, b"wrong", 1));
         let worker = om.scheduler.worker_info(1).unwrap();
         assert_eq!(worker.tasks_failed, 1);
     }
@@ -441,5 +506,128 @@ mod tests {
         let worker = om.scheduler.worker_info(42).unwrap();
         assert_eq!(worker.reputation, ReputationTier::New);
         assert_eq!(worker.tasks_completed, 0);
+    }
+
+    #[test]
+    fn quorum_job_finalizes_only_once_after_strict_majority() {
+        let mut om = OmOrchestrator::new();
+        om.register_node(make_node(1, 4, true));
+        om.register_node(make_node(2, 4, true));
+        let job_id = om.submit_job(OmTaskKind::GpuCompute { model_size_mb: 128 }, 9, 0);
+        let assignments = om.distribute(0);
+        let workers: HashSet<_> = assignments.iter().map(|a| a.worker_id).collect();
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(workers.len(), 2);
+
+        let first = valid_result(
+            assignments[0].task_id,
+            assignments[0].worker_id,
+            b"agreed output",
+            100,
+        );
+        let second = valid_result(
+            assignments[1].task_id,
+            assignments[1].worker_id,
+            b"agreed output",
+            120,
+        );
+
+        assert_eq!(
+            om.submit_result(first, 100),
+            Some(VerifyResult::InsufficientResults)
+        );
+        let job = om.job_status(&job_id).unwrap();
+        assert_eq!(job.status, OmJobStatus::Computing);
+        assert!(job.results.is_empty());
+        assert_eq!(om.stats().total_tokens_distributed, 0);
+
+        assert!(matches!(
+            om.submit_result(second.clone(), 120),
+            Some(VerifyResult::QuorumAgreed { agree_count: 2, .. })
+        ));
+        let job = om.job_status(&job_id).unwrap();
+        assert_eq!(job.status, OmJobStatus::Completed);
+        assert_eq!(job.results, vec![b"agreed output".to_vec()]);
+        assert_eq!(om.stats().total_compute_ms, 220);
+        assert_eq!(om.stats().total_tokens_distributed, 2);
+
+        assert!(om.submit_result(second, 130).is_none());
+        let job = om.job_status(&job_id).unwrap();
+        assert_eq!(job.results.len(), 1);
+        assert_eq!(om.stats().total_compute_ms, 220);
+        assert_eq!(om.stats().total_tokens_distributed, 2);
+    }
+
+    #[test]
+    fn failed_mapreduce_job_is_absorbing_when_other_chunks_finish() {
+        let mut om = OmOrchestrator::new();
+        for worker_id in 1..=6 {
+            om.register_node(make_node(worker_id, 4, false));
+        }
+        let job_id = om.submit_job(
+            OmTaskKind::MapReduce {
+                chunk_count: 2,
+                reduce_fn: "sum".into(),
+            },
+            99,
+            0,
+        );
+        let assignments = om.distribute(0);
+        assert_eq!(assignments.len(), 6);
+        let job = om.job_status(&job_id).unwrap();
+        let failed_task = job.task_ids[0];
+        let successful_task = job.task_ids[1];
+        let failed_workers: Vec<_> = assignments
+            .iter()
+            .filter(|assignment| assignment.task_id == failed_task)
+            .map(|assignment| assignment.worker_id)
+            .collect();
+        let successful_workers: Vec<_> = assignments
+            .iter()
+            .filter(|assignment| assignment.task_id == successful_task)
+            .map(|assignment| assignment.worker_id)
+            .collect();
+
+        for (index, worker_id) in failed_workers.into_iter().enumerate() {
+            om.submit_result(
+                valid_result(
+                    failed_task,
+                    worker_id,
+                    format!("different-{index}").as_bytes(),
+                    10,
+                ),
+                10,
+            );
+        }
+        assert_eq!(om.job_status(&job_id).unwrap().status, OmJobStatus::Failed);
+
+        for worker_id in successful_workers {
+            om.submit_result(valid_result(successful_task, worker_id, b"same", 10), 20);
+        }
+        assert_eq!(om.job_status(&job_id).unwrap().status, OmJobStatus::Failed);
+        assert_eq!(om.job_status(&job_id).unwrap().completed_at, None);
+    }
+
+    #[test]
+    fn distribute_excludes_low_battery_nodes() {
+        let mut om = OmOrchestrator::new();
+        let mut low_battery = make_node(1, 4, false);
+        low_battery.battery_pct = Some(15);
+        om.register_node(low_battery);
+        om.submit_job(OmTaskKind::CpuIntensive { estimated_ms: 10 }, 1, 0);
+
+        assert!(om.distribute(0).is_empty());
+        assert_eq!(om.stats().pending_tasks, 1);
+    }
+
+    #[test]
+    fn distribute_routes_gpu_jobs_only_to_gpu_nodes() {
+        let mut om = OmOrchestrator::new();
+        om.register_node(make_node(1, 4, false));
+        om.register_node(make_node(2, 4, false));
+        om.submit_job(OmTaskKind::GpuCompute { model_size_mb: 8 }, 1, 0);
+
+        assert!(om.distribute(0).is_empty());
+        assert_eq!(om.stats().pending_tasks, 1);
     }
 }

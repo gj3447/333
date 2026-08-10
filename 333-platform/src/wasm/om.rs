@@ -20,7 +20,8 @@
 
 use wasm_bindgen::prelude::*;
 use crate::compute::om::{NodeResources, OmOrchestrator, OmTaskKind};
-use crate::compute::task::{TaskResult, VerifyResult};
+use crate::compute::scheduler::SubmitResultError;
+use crate::compute::task::{TaskResult, TaskResultError, VerifyResult};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -101,24 +102,89 @@ impl From<OmTaskKindWire> for OmTaskKind {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert VerifyResult (no Serialize) to a compact JSON string.
+/// Convert a typed core outcome to a compact and stable JSON envelope.
 /// KG: sprint5B-om-wasm-ui-2026-04-15
-fn verify_result_to_json(v: &VerifyResult) -> String {
+pub(crate) fn submit_result_to_json(
+    outcome: Result<VerifyResult, SubmitResultError>,
+) -> String {
+    let value = match outcome {
+        Ok(v) => verify_result_value(&v),
+        Err(error) => submit_result_error_value(&error),
+    };
+    value.to_string()
+}
+
+fn verify_result_value(v: &VerifyResult) -> serde_json::Value {
     match v {
         VerifyResult::NoVerificationNeeded =>
-            r#"{"verdict":"ok","kind":"no_verification"}"#.to_string(),
+            serde_json::json!({"verdict": "ok", "kind": "no_verification"}),
         VerifyResult::QuorumAgreed { agreed_hash, agree_count } =>
-            format!(r#"{{"verdict":"ok","kind":"quorum_agreed","agreed_hash":"{agreed_hash}","agree_count":{agree_count}}}"#),
-        VerifyResult::QuorumDisagreed { hashes } => {
-            let hs = hashes.iter().map(|h| format!(r#""{h}""#)).collect::<Vec<_>>().join(",");
-            format!(r#"{{"verdict":"fail","kind":"quorum_disagreed","hashes":[{hs}]}}"#)
-        }
+            serde_json::json!({
+                "verdict": "ok",
+                "kind": "quorum_agreed",
+                "agreed_hash": agreed_hash,
+                "agree_count": agree_count,
+            }),
+        VerifyResult::QuorumDisagreed { hashes } => serde_json::json!({
+            "verdict": "fail",
+            "kind": "quorum_disagreed",
+            "hashes": hashes,
+        }),
         VerifyResult::CanaryPassed =>
-            r#"{"verdict":"ok","kind":"canary_passed"}"#.to_string(),
+            serde_json::json!({"verdict": "ok", "kind": "canary_passed"}),
         VerifyResult::CanaryFailed { worker_id } =>
-            format!(r#"{{"verdict":"fail","kind":"canary_failed","worker_id":{worker_id}}}"#),
+            serde_json::json!({
+                "verdict": "fail",
+                "kind": "canary_failed",
+                "worker_id": worker_id,
+            }),
         VerifyResult::InsufficientResults =>
-            r#"{"verdict":"pending","kind":"insufficient_results"}"#.to_string(),
+            serde_json::json!({"verdict": "pending", "kind": "insufficient_results"}),
+    }
+}
+
+fn submit_result_error_value(error: &SubmitResultError) -> serde_json::Value {
+    match error {
+        SubmitResultError::UnknownTask { task_id } => serde_json::json!({
+            "verdict": "rejected",
+            "kind": "unknown_task",
+            "task_id": task_id,
+        }),
+        SubmitResultError::WorkerIdentityMismatch { authenticated, claimed } => {
+            serde_json::json!({
+                "verdict": "rejected",
+                "kind": "worker_identity_mismatch",
+                "authenticated_worker_id": authenticated,
+                "claimed_worker_id": claimed,
+            })
+        }
+        SubmitResultError::Rejected(reason) => match reason {
+            TaskResultError::WrongTask { expected, actual } => serde_json::json!({
+                "verdict": "rejected",
+                "kind": "wrong_task",
+                "expected_task_id": expected,
+                "actual_task_id": actual,
+            }),
+            TaskResultError::NotAcceptingResults { status } => serde_json::json!({
+                "verdict": "rejected",
+                "kind": "task_not_accepting_results",
+                "status": format!("{status:?}"),
+            }),
+            TaskResultError::UnassignedWorker { worker_id } => serde_json::json!({
+                "verdict": "rejected",
+                "kind": "unassigned_worker",
+                "worker_id": worker_id,
+            }),
+            TaskResultError::DuplicateWorker { worker_id } => serde_json::json!({
+                "verdict": "rejected",
+                "kind": "duplicate_worker_result",
+                "worker_id": worker_id,
+            }),
+            TaskResultError::OutputHashMismatch { .. } => serde_json::json!({
+                "verdict": "rejected",
+                "kind": "output_hash_mismatch",
+            }),
+        },
     }
 }
 
@@ -240,7 +306,7 @@ impl OmSessionWasm {
     ///
     /// `result_json` shape: `{ task_id, worker_id, output, compute_ms, output_hash }`
     ///
-    /// Returns a JSON string describing the verify outcome, or `null` if not found.
+    /// Returns a typed JSON envelope for accepted, pending, failed, or rejected input.
     ///
     /// KG: sprint5B-om-wasm-ui-2026-04-15
     pub fn submit_result(&mut self, result_json: &str, now_ms: f64) -> Result<String, JsValue> {
@@ -255,10 +321,11 @@ impl OmSessionWasm {
             output_hash: w.output_hash,
         };
 
-        match self.inner.submit_result(result, now_ms as u64) {
-            Some(v) => Ok(verify_result_to_json(&v)),
-            None => Ok("null".to_string()),
-        }
+        Ok(submit_result_to_json(self.inner.submit_result_from(
+            self.peer_id,
+            result,
+            now_ms as u64,
+        )))
     }
 
     // -------------------------------------------------------------------------

@@ -3,7 +3,8 @@
 // 작업 정의 + 결과 + 검증 레이어
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 
 /// Task ID (unique) // KG: ST_TaskId
 pub type TaskId = u64;
@@ -65,6 +66,59 @@ pub struct TaskResult {
     pub output_hash: String, // SHA-256 of output (for quorum comparison)
 }
 
+/// Canonical SHA-256 digest of exact task output bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OutputDigest([u8; 32]);
+
+impl OutputDigest {
+    pub const ALGORITHM: &'static str = "sha256";
+
+    pub fn of(output: &[u8]) -> Self {
+        let digest = Sha256::digest(output);
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&digest);
+        Self(bytes)
+    }
+
+    /// Parse the wire representation. Only canonical lowercase 64-byte hex is accepted.
+    pub fn from_hex(value: &str) -> Option<Self> {
+        let encoded = value.as_bytes();
+        if encoded.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let high = decode_hex_nibble(encoded[index * 2])?;
+            let low = decode_hex_nibble(encoded[index * 2 + 1])?;
+            *byte = (high << 4) | low;
+        }
+        Some(Self(bytes))
+    }
+
+    pub fn to_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(64);
+        for byte in self.0 {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Canonical wire hash for a task output.
+pub fn output_hash(output: &[u8]) -> String {
+    OutputDigest::of(output).to_hex()
+}
+
 /// Task with full metadata
 #[derive(Debug, Clone)]
 pub struct Task {
@@ -74,6 +128,15 @@ pub struct Task {
     pub created_at: u64,
     pub assignments: Vec<TaskAssignment>,
     pub results: Vec<TaskResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskResultError {
+    WrongTask { expected: TaskId, actual: TaskId },
+    NotAcceptingResults { status: TaskStatus },
+    UnassignedWorker { worker_id: u32 },
+    DuplicateWorker { worker_id: u32 },
+    OutputHashMismatch { claimed: String, actual: String },
 }
 
 /// Verification result
@@ -105,64 +168,174 @@ impl Task {
         }
     }
 
-    /// 결과 제출
+    pub fn required_assignments(&self) -> usize {
+        match &self.task_type {
+            TaskType::Quorum { replicas, .. } => *replicas as usize,
+            TaskType::Embarrassing { .. } | TaskType::Canary { .. } => 1,
+        }
+    }
+
+    pub fn can_assign(&self, worker_id: u32) -> bool {
+        matches!(self.status, TaskStatus::Pending | TaskStatus::Assigned | TaskStatus::Computing)
+            && self.assignments.len() < self.required_assignments()
+            && !self.assignments.iter().any(|assignment| {
+                assignment.task_id == self.id && assignment.worker_id == worker_id
+            })
+    }
+
+    pub fn record_assignment(&mut self, assignment: TaskAssignment) -> bool {
+        if assignment.task_id != self.id || !self.can_assign(assignment.worker_id) {
+            return false;
+        }
+        self.assignments.push(assignment);
+        if self.status == TaskStatus::Pending {
+            self.status = TaskStatus::Assigned;
+        }
+        true
+    }
+
+    /// Compatibility wrapper. New callers should use `try_submit_result` so a
+    /// rejected result cannot be mistaken for an accepted state transition.
     pub fn submit_result(&mut self, result: TaskResult) {
+        let _ = self.try_submit_result(result);
+    }
+
+    pub fn try_submit_result(&mut self, result: TaskResult) -> Result<(), TaskResultError> {
+        if result.task_id != self.id {
+            return Err(TaskResultError::WrongTask {
+                expected: self.id,
+                actual: result.task_id,
+            });
+        }
+        if !matches!(self.status, TaskStatus::Assigned | TaskStatus::Computing) {
+            return Err(TaskResultError::NotAcceptingResults {
+                status: self.status,
+            });
+        }
+        if !self.assignments.iter().any(|assignment| {
+            assignment.task_id == self.id && assignment.worker_id == result.worker_id
+        }) {
+            return Err(TaskResultError::UnassignedWorker {
+                worker_id: result.worker_id,
+            });
+        }
+        if self.results.iter().any(|existing| existing.worker_id == result.worker_id) {
+            return Err(TaskResultError::DuplicateWorker {
+                worker_id: result.worker_id,
+            });
+        }
+        let actual = OutputDigest::of(&result.output);
+        if OutputDigest::from_hex(&result.output_hash) != Some(actual) {
+            return Err(TaskResultError::OutputHashMismatch {
+                claimed: result.output_hash,
+                actual: actual.to_hex(),
+            });
+        }
         self.results.push(result);
+        self.status = TaskStatus::Computing;
+        Ok(())
+    }
+
+    pub(crate) fn valid_results(&self) -> Vec<&TaskResult> {
+        let mut seen_workers = HashSet::new();
+        self.results
+            .iter()
+            .filter(|result| {
+                result.task_id == self.id
+                    && self.assignments.iter().any(|assignment| {
+                        assignment.task_id == self.id
+                            && assignment.worker_id == result.worker_id
+                    })
+                    && OutputDigest::from_hex(&result.output_hash)
+                        == Some(OutputDigest::of(&result.output))
+                    && seen_workers.insert(result.worker_id)
+            })
+            .collect()
+    }
+
+    pub(crate) fn canonical_result(&self, verify: &VerifyResult) -> Option<&TaskResult> {
+        let valid_results = self.valid_results();
+        match verify {
+            VerifyResult::NoVerificationNeeded | VerifyResult::CanaryPassed => {
+                valid_results.first().copied()
+            }
+            VerifyResult::QuorumAgreed { agreed_hash, .. } => {
+                let agreed = OutputDigest::from_hex(agreed_hash)?;
+                valid_results
+                    .into_iter()
+                    .find(|result| OutputDigest::of(&result.output) == agreed)
+            }
+            _ => None,
+        }
     }
 
     /// 검증 수행
     pub fn verify(&mut self) -> VerifyResult {
-        match &self.task_type {
+        let verify = {
+            let valid_results = self.valid_results();
+            match &self.task_type {
             TaskType::Embarrassing { .. } => {
-                if !self.results.is_empty() {
-                    self.status = TaskStatus::Verified;
+                if !valid_results.is_empty() {
                     VerifyResult::NoVerificationNeeded
                 } else {
                     VerifyResult::InsufficientResults
                 }
             }
             TaskType::Quorum { replicas, .. } => {
-                if self.results.len() < *replicas as usize {
+                let replicas = *replicas as usize;
+                let threshold = replicas / 2 + 1;
+                if valid_results.len() < threshold {
                     return VerifyResult::InsufficientResults;
                 }
-                // 해시 다수결
-                let mut hash_count: HashMap<&str, u32> = HashMap::new();
-                for r in &self.results {
-                    *hash_count.entry(&r.output_hash).or_default() += 1;
+                let mut hash_count: BTreeMap<OutputDigest, u32> = BTreeMap::new();
+                for result in &valid_results {
+                    *hash_count
+                        .entry(OutputDigest::of(&result.output))
+                        .or_default() += 1;
                 }
-                // 가장 많은 해시
                 if let Some((hash, count)) = hash_count.iter().max_by_key(|(_, c)| *c) {
-                    let threshold = (*replicas).div_ceil(2); // 과반수
-                    if *count >= threshold {
-                        self.status = TaskStatus::Verified;
+                    if *count as usize >= threshold {
                         VerifyResult::QuorumAgreed {
-                            agreed_hash: hash.to_string(),
+                            agreed_hash: hash.to_hex(),
                             agree_count: *count,
                         }
-                    } else {
-                        self.status = TaskStatus::Failed;
+                    } else if valid_results.len() >= replicas {
                         VerifyResult::QuorumDisagreed {
-                            hashes: hash_count.keys().map(|h| h.to_string()).collect(),
+                            hashes: hash_count.keys().map(|hash| hash.to_hex()).collect(),
                         }
+                    } else {
+                        VerifyResult::InsufficientResults
                     }
                 } else {
                     VerifyResult::InsufficientResults
                 }
             }
             TaskType::Canary { expected_hash, .. } => {
-                if let Some(result) = self.results.first() {
-                    if result.output_hash == *expected_hash {
-                        self.status = TaskStatus::Verified;
+                if let Some(result) = valid_results.first() {
+                    if OutputDigest::from_hex(expected_hash)
+                        == Some(OutputDigest::of(&result.output))
+                    {
                         VerifyResult::CanaryPassed
                     } else {
-                        self.status = TaskStatus::Failed;
                         VerifyResult::CanaryFailed { worker_id: result.worker_id }
                     }
                 } else {
                     VerifyResult::InsufficientResults
                 }
             }
+            }
+        };
+
+        match verify {
+            VerifyResult::NoVerificationNeeded
+            | VerifyResult::QuorumAgreed { .. }
+            | VerifyResult::CanaryPassed => self.status = TaskStatus::Verified,
+            VerifyResult::QuorumDisagreed { .. } | VerifyResult::CanaryFailed { .. } => {
+                self.status = TaskStatus::Failed;
+            }
+            VerifyResult::InsufficientResults => {}
         }
+        verify
     }
 }
 
@@ -170,16 +343,34 @@ impl Task {
 mod tests {
     use super::*;
 
+    fn assign_worker(task: &mut Task, worker_id: u32) {
+        assert!(task.record_assignment(TaskAssignment {
+            task_id: task.id,
+            worker_id,
+            assigned_at: 0,
+            timeout_ms: 30_000,
+            reward: 1,
+        }));
+    }
+
+    fn result(task_id: TaskId, worker_id: u32, output: &[u8]) -> TaskResult {
+        TaskResult {
+            task_id,
+            worker_id,
+            output: output.to_vec(),
+            compute_ms: 10,
+            output_hash: output_hash(output),
+        }
+    }
+
     #[test]
     fn embarrassing_no_verification() {
         let mut task = Task::new(1, TaskType::Embarrassing {
             description: "Monte Carlo".into(),
             input: vec![1, 2, 3],
         }, 0);
-        task.submit_result(TaskResult {
-            task_id: 1, worker_id: 10, output: vec![42],
-            compute_ms: 100, output_hash: "abc".into(),
-        });
+        assign_worker(&mut task, 10);
+        task.submit_result(result(1, 10, &[42]));
         assert_eq!(task.verify(), VerifyResult::NoVerificationNeeded);
         assert_eq!(task.status, TaskStatus::Verified);
     }
@@ -190,10 +381,8 @@ mod tests {
             description: "hash search".into(), input: vec![], replicas: 3,
         }, 0);
         for w in [10, 20, 30] {
-            task.submit_result(TaskResult {
-                task_id: 2, worker_id: w, output: vec![1],
-                compute_ms: 50, output_hash: "same_hash".into(),
-            });
+            assign_worker(&mut task, w);
+            task.submit_result(result(2, w, &[1]));
         }
         match task.verify() {
             VerifyResult::QuorumAgreed { agree_count, .. } => assert_eq!(agree_count, 3),
@@ -206,9 +395,12 @@ mod tests {
         let mut task = Task::new(3, TaskType::Quorum {
             description: "test".into(), input: vec![], replicas: 3,
         }, 0);
-        task.submit_result(TaskResult { task_id: 3, worker_id: 10, output: vec![], compute_ms: 0, output_hash: "good".into() });
-        task.submit_result(TaskResult { task_id: 3, worker_id: 20, output: vec![], compute_ms: 0, output_hash: "good".into() });
-        task.submit_result(TaskResult { task_id: 3, worker_id: 30, output: vec![], compute_ms: 0, output_hash: "bad".into() });
+        for worker_id in [10, 20, 30] {
+            assign_worker(&mut task, worker_id);
+        }
+        task.submit_result(result(3, 10, b"good"));
+        task.submit_result(result(3, 20, b"good"));
+        task.submit_result(result(3, 30, b"bad"));
         match task.verify() {
             VerifyResult::QuorumAgreed { agree_count, .. } => assert_eq!(agree_count, 2),
             other => panic!("expected QuorumAgreed, got {:?}", other),
@@ -220,9 +412,12 @@ mod tests {
         let mut task = Task::new(4, TaskType::Quorum {
             description: "test".into(), input: vec![], replicas: 3,
         }, 0);
-        task.submit_result(TaskResult { task_id: 4, worker_id: 10, output: vec![], compute_ms: 0, output_hash: "a".into() });
-        task.submit_result(TaskResult { task_id: 4, worker_id: 20, output: vec![], compute_ms: 0, output_hash: "b".into() });
-        task.submit_result(TaskResult { task_id: 4, worker_id: 30, output: vec![], compute_ms: 0, output_hash: "c".into() });
+        for worker_id in [10, 20, 30] {
+            assign_worker(&mut task, worker_id);
+        }
+        task.submit_result(result(4, 10, b"a"));
+        task.submit_result(result(4, 20, b"b"));
+        task.submit_result(result(4, 30, b"c"));
         match task.verify() {
             VerifyResult::QuorumDisagreed { .. } => {} // 3개 다 다르면 불일치
             other => panic!("expected QuorumDisagreed, got {:?}", other),
@@ -231,19 +426,23 @@ mod tests {
 
     #[test]
     fn canary_pass() {
+        let expected = output_hash(b"correct");
         let mut task = Task::new(5, TaskType::Canary {
-            description: "trap".into(), input: vec![], expected_hash: "correct".into(),
+            description: "trap".into(), input: vec![], expected_hash: expected,
         }, 0);
-        task.submit_result(TaskResult { task_id: 5, worker_id: 10, output: vec![], compute_ms: 0, output_hash: "correct".into() });
+        assign_worker(&mut task, 10);
+        task.submit_result(result(5, 10, b"correct"));
         assert_eq!(task.verify(), VerifyResult::CanaryPassed);
     }
 
     #[test]
     fn canary_fail_catches_cheater() {
+        let expected = output_hash(b"correct");
         let mut task = Task::new(6, TaskType::Canary {
-            description: "trap".into(), input: vec![], expected_hash: "correct".into(),
+            description: "trap".into(), input: vec![], expected_hash: expected,
         }, 0);
-        task.submit_result(TaskResult { task_id: 6, worker_id: 99, output: vec![], compute_ms: 0, output_hash: "wrong".into() });
+        assign_worker(&mut task, 99);
+        task.submit_result(result(6, 99, b"wrong"));
         assert_eq!(task.verify(), VerifyResult::CanaryFailed { worker_id: 99 });
     }
 
@@ -268,21 +467,106 @@ mod tests {
         assert!(task.assignments.is_empty());
     }
 
-    // KG: CONTRACT_333_Compute_Task T2 — submitting result to unassigned task still stores result
+    // KG: CONTRACT_333_Compute_Task T2 — unassigned results are rejected
     #[test]
-    fn submit_result_without_assignment() {
+    fn submit_result_without_assignment_is_rejected() {
         let mut task = Task::new(200, TaskType::Embarrassing {
             description: "no assign".into(), input: vec![],
         }, 0);
-        // Submit result directly (no assignment step)
-        task.submit_result(TaskResult {
-            task_id: 200, worker_id: 5,
-            output: vec![1, 2, 3], compute_ms: 10,
-            output_hash: "h".into(),
-        });
+        task.submit_result(result(200, 5, &[1, 2, 3]));
+        assert!(task.results.is_empty());
+        assert_eq!(task.verify(), VerifyResult::InsufficientResults);
+    }
+
+    #[test]
+    fn result_for_wrong_task_id_is_rejected() {
+        let mut task = Task::new(201, TaskType::Embarrassing {
+            description: "wrong task".into(), input: vec![],
+        }, 0);
+        assign_worker(&mut task, 5);
+
+        task.submit_result(result(999, 5, &[1]));
+
+        assert!(task.results.is_empty());
+    }
+
+    #[test]
+    fn duplicate_worker_cannot_form_quorum() {
+        let mut task = Task::new(202, TaskType::Quorum {
+            description: "distinct workers".into(), input: vec![], replicas: 3,
+        }, 0);
+        for worker_id in [5, 6, 7] {
+            assign_worker(&mut task, worker_id);
+        }
+
+        for _ in 0..3 {
+            task.submit_result(result(202, 5, &[1]));
+        }
+
         assert_eq!(task.results.len(), 1);
-        // Verify still works — Embarrassing accepts any result
-        assert_eq!(task.verify(), VerifyResult::NoVerificationNeeded);
+        assert_eq!(task.verify(), VerifyResult::InsufficientResults);
+    }
+
+    #[test]
+    fn claimed_output_hash_must_match_output_bytes() {
+        let mut task = Task::new(203, TaskType::Embarrassing {
+            description: "hash binding".into(), input: vec![],
+        }, 0);
+        assign_worker(&mut task, 5);
+
+        task.submit_result(TaskResult {
+            task_id: 203, worker_id: 5,
+            output: b"actual bytes".to_vec(), compute_ms: 10,
+            output_hash: "forged".into(),
+        });
+
+        assert!(task.results.is_empty());
+    }
+
+    #[test]
+    fn even_replica_split_is_not_a_quorum() {
+        let mut task = Task::new(204, TaskType::Quorum {
+            description: "strict majority".into(), input: vec![], replicas: 2,
+        }, 0);
+        assign_worker(&mut task, 5);
+        assign_worker(&mut task, 6);
+        task.submit_result(result(204, 5, &[1]));
+        task.submit_result(result(204, 6, &[2]));
+
+        assert!(matches!(task.verify(), VerifyResult::QuorumDisagreed { .. }));
+    }
+
+    #[test]
+    fn terminal_task_rejects_late_result() {
+        let mut task = Task::new(205, TaskType::Quorum {
+            description: "terminal".into(), input: vec![], replicas: 3,
+        }, 0);
+        assign_worker(&mut task, 5);
+        assign_worker(&mut task, 6);
+        assign_worker(&mut task, 7);
+        task.submit_result(result(205, 5, &[1]));
+        task.submit_result(result(205, 6, &[1]));
+        assert!(matches!(task.verify(), VerifyResult::QuorumAgreed { .. }));
+
+        task.submit_result(result(205, 7, &[2]));
+
+        assert_eq!(task.results.len(), 2);
+        assert_eq!(task.status, TaskStatus::Verified);
+    }
+
+    #[test]
+    fn verify_ignores_forged_duplicate_results() {
+        let mut task = Task::new(206, TaskType::Quorum {
+            description: "defensive verify".into(), input: vec![], replicas: 3,
+        }, 0);
+        for worker_id in [5, 6, 7] {
+            assign_worker(&mut task, worker_id);
+        }
+        for _ in 0..3 {
+            task.results.push(result(206, 5, &[1]));
+        }
+
+        assert_eq!(task.verify(), VerifyResult::InsufficientResults);
     }
 
     // KG: CONTRACT_333_Compute_Task T4 — verify on already-Verified task returns same result
@@ -291,11 +575,8 @@ mod tests {
         let mut task = Task::new(300, TaskType::Embarrassing {
             description: "done".into(), input: vec![],
         }, 0);
-        task.submit_result(TaskResult {
-            task_id: 300, worker_id: 1,
-            output: vec![42], compute_ms: 5,
-            output_hash: "h".into(),
-        });
+        assign_worker(&mut task, 1);
+        task.submit_result(result(300, 1, &[42]));
         let v1 = task.verify();
         assert_eq!(v1, VerifyResult::NoVerificationNeeded);
         assert_eq!(task.status, TaskStatus::Verified);

@@ -427,10 +427,9 @@ impl OmCompute {
     pub fn submit_result(&mut self, task_id: u64, worker_id: u32, output: &[u8], compute_ms: u64, output_hash: &str, now_ms: u64) -> String {
         use crate::compute::task::TaskResult;
         let result = TaskResult { task_id, worker_id, output: output.to_vec(), compute_ms, output_hash: output_hash.into() };
-        match self.om.submit_result(result, now_ms) {
-            Some(v) => format!("{:?}", v),
-            None => "TaskNotFound".into(),
-        }
+        crate::wasm::om::submit_result_to_json(
+            self.om.submit_result_from(worker_id, result, now_ms),
+        )
     }
 
     pub fn stats(&self) -> String {
