@@ -1,0 +1,28 @@
+[package]
+name = "transfer333-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Browser bindings for transfer333 — a browser holds its own owner key and verifies quorum certificates itself, with no trusted coordinator."
+
+# KG: browser-gap-shallow-3-blockers-2026-07-15 (PR-1 wasm 지반),
+#     signaling-liveness-only-safety-untrusted-2026-07-15,
+#     rt1-harness-real-execution-unreceipted-2026-07-15 (RT2 = 이 크레이트의 소비자)
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+transfer333 = { path = "../333-transfer" }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+ed25519-dalek = "2"
+sha2 = "0.10"
+
+# wasm32 needs an explicit entropy backend; see 333-transfer/Cargo.toml for why
+# this is a *build* gate rather than a runtime one.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

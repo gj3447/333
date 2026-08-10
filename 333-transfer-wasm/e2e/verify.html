@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RT2 — browser self-verifies a quorum certificate</title>
+<body style="font-family:monospace;padding:2em">
+<pre id="log">booting wasm...</pre>
+<script type="module">
+import init, { verifyCertificate, configFingerprint, BrowserOwner }
+  from "../pkg/transfer333_wasm.js";
+const log = (m)=>{document.getElementById("log").textContent += "\n"+m;};
+const hexToBytes = (h)=>new Uint8Array(h.match(/../g).map(b=>parseInt(b,16)));
+const RESULT = {};
+try {
+  await init();
+  const fx = await (await fetch("./fixture.json")).json();
+
+  // 1) browser generates its OWN key in-page (no coordinator custody)
+  const owner = BrowserOwner.fromSeedHex("browser-payee", "07".repeat(32));
+  RESULT.pubkey = owner.publicKeyHex();
+  RESULT.pubkey_len = owner.publicKeyHex().length;
+
+  // 2) browser verifies the HONEST cert itself
+  log("step: tiny fingerprint...");
+  try {
+    RESULT.tiny_fp = configFingerprint('{"network_id":"x","owners":{"a":"197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61"},"authorities":{"b":"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"}}');
+    log("tiny fp ok");
+  } catch(e){ RESULT.tiny_fp_err = String(e).slice(0,120); log("tiny fp ERR: "+e); }
+  RESULT.fp_early = configFingerprint(fx.config);
+  log("fp ok: "+RESULT.fp_early.slice(0,16));
+  log("step: verify honest ("+(fx.honest_cert_hex.length/2)+" bytes)...");
+  const honest = JSON.parse(verifyCertificate(fx.config, hexToBytes(fx.honest_cert_hex)));
+  RESULT.honest = honest;
+
+  // 3) browser REJECTS a cert from a committee it did not pin
+  try { verifyCertificate(fx.config, hexToBytes(fx.rogue_cert_hex)); RESULT.rogue_rejected = false; }
+  catch(e){ RESULT.rogue_rejected = true; RESULT.rogue_err = String(e).slice(0,80); }
+
+  // 4) browser REJECTS a tampered cert
+  const tam = hexToBytes(fx.honest_cert_hex); tam[Math.floor(tam.length/2)] ^= 0xFF;
+  try { verifyCertificate(fx.config, tam); RESULT.tamper_rejected = false; }
+  catch(e){ RESULT.tamper_rejected = true; }
+
+  RESULT.fingerprint = configFingerprint(fx.config);
+  RESULT.ok = honest.verified === true && honest.to === "browser-payee"
+           && RESULT.rogue_rejected && RESULT.tamper_rejected
+           && RESULT.pubkey_len === 64;
+  log(JSON.stringify(RESULT, null, 2));
+} catch(e) { RESULT.fatal = String(e); log("FATAL "+e); }
+window.__RT2_RESULT__ = RESULT;
+document.title = RESULT.ok ? "RT2_PASS" : "RT2_FAIL";
+</script>
+</body>
