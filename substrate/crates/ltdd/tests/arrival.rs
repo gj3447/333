@@ -51,14 +51,13 @@ fn green_to_absent_flip_is_real() {
 }
 
 #[test]
-fn jsonl_is_the_ooptdd_envelope_for_a_cross_language_python_verifier() {
-    // the bridge: emit the ooptdd wire shape so a Python ooptdd gate (generator != verifier,
-    // across a language boundary) can judge a trace this Rust substrate emitted.
+fn jsonl_round_trips_the_native_trace_envelope() {
+    // The diagnostic envelope round-trips without changing the measured fields.
     let evs = vec![Event::new("cyc-5", "dht_put_ok").with("addr", "/ip4/1.2.3.4")];
-    let line = p333_ltdd::to_ooptdd_jsonl(&evs);
+    let line = p333_ltdd::to_trace_jsonl(&evs);
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(v["cid"], "cyc-5");
-    assert_eq!(v["cycle_id"], "cyc-5"); // ooptdd resolves the cid from cycle_id/cid
+    assert_eq!(v["cycle_id"], "cyc-5");
     assert_eq!(v["event"], "dht_put_ok");
     assert_eq!(v["addr"], "/ip4/1.2.3.4"); // attrs flattened — whole-row passthrough for gate `where:`
 }

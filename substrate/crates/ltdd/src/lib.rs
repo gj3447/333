@@ -2,8 +2,8 @@
 //!
 //! HARD RULE: a receipt asserts what the substrate **actually emitted**, read back from a
 //! store, never a return value. A function returning `"ok"` is a *claim*; the store is the
-//! judge. This is the substrate's own form of ooptdd's *positive (arrival-asserted) gate* —
-//! the same discipline the discovery receipt already uses ("a real DHT put+get, not a
+//! judge. This is a native arrival assertion using the same discipline the discovery
+//! receipt already uses ("a real DHT put+get, not a
 //! serialize-then-read"), generalized into a reusable primitive.
 //!
 //! Three-valued on purpose ([`Verdict`], LTL3): `Present` (⊤, observed), `Absent` (⊥, the
@@ -11,11 +11,9 @@
 //! itself was unreachable). `Inconclusive` MUST NEVER be a hard failure — demoting "couldn't
 //! observe" to "falsified" is how an infra blip becomes a flaky receipt.
 //!
-//! It bridges out of Rust too: [`Event::to_ooptdd_json`] / [`to_ooptdd_jsonl`] emit the exact
-//! envelope the `ooptdd` (Python) reference verifier reads, so a trace this Rust substrate
-//! emitted can be judged by a gate in a *different language and process* — the strongest
-//! generator-≠-verifier separation a verdict can have (it attacks ooptdd's own
-//! single-authority blind spot: the judge no longer descends from the same authority).
+//! [`Event::to_trace_json`] and [`to_trace_jsonl`] provide a transparent diagnostic
+//! envelope. They do not delegate the verdict to an external rule engine; the native
+//! tests assert observed state directly.
 //!
 //! Scope: this is for **side-effect/arrival** facts (a packet was published, a peer resolved
 //! it, a relay forwarded N bytes). It is NOT for the substrate's crypto-correctness invariants
@@ -49,10 +47,8 @@ impl Event {
         self
     }
 
-    /// The ooptdd-compatible flat JSON envelope: `cid` + `cycle_id` + `event` + flattened
-    /// `attrs`. This is the wire shape ooptdd's reader expects (it resolves the cid from
-    /// `cycle_id`/`cid`), so a Python ooptdd gate can judge a Rust-emitted trace unchanged.
-    pub fn to_ooptdd_json(&self) -> Value {
+    /// A flat JSON envelope: `cid` + `cycle_id` + `event` + flattened `attrs`.
+    pub fn to_trace_json(&self) -> Value {
         let mut o = Map::new();
         o.insert("cid".into(), Value::String(self.cid.clone()));
         o.insert("cycle_id".into(), Value::String(self.cid.clone()));
@@ -63,11 +59,11 @@ impl Event {
         Value::Object(o)
     }
 
-    /// Inverse of [`Event::to_ooptdd_json`]: rebuild an event from the flat envelope
+    /// Inverse of [`Event::to_trace_json`]: rebuild an event from the flat envelope
     /// (`cid` — falling back to `cycle_id` — plus `event`; every other key becomes an
     /// attr). `None` when the value is not an envelope. Round-trip law:
-    /// `from_ooptdd_json(&e.to_ooptdd_json()) == Some(e)`.
-    pub fn from_ooptdd_json(v: &Value) -> Option<Event> {
+    /// `from_trace_json(&e.to_trace_json()) == Some(e)`.
+    pub fn from_trace_json(v: &Value) -> Option<Event> {
         let o = v.as_object()?;
         let cid = o.get("cid").or_else(|| o.get("cycle_id"))?.as_str()?.to_string();
         let event = o.get("event")?.as_str()?.to_string();
@@ -93,8 +89,8 @@ pub trait Store {
     }
 }
 
-/// The reference in-process store — zero infra, deterministic (the substrate's equivalent of
-/// ooptdd's memory backend). Test hooks: `dropping()` accepts every ship and silently discards
+/// The reference in-process store is zero-infrastructure and deterministic. Test hooks:
+/// `dropping()` accepts every ship and silently discards
 /// it (the 401 nobody noticed); `unreachable()` fails the read entirely (→ `Inconclusive`).
 #[derive(Default)]
 pub struct MemoryStore {
@@ -131,7 +127,7 @@ impl Store for MemoryStore {
     }
 }
 
-/// The LTL3 three-valued verdict — exactly ooptdd's lattice. `Inconclusive` (store unreachable)
+/// The LTL3 three-valued verdict. `Inconclusive` (store unreachable)
 /// must never be treated as failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -157,12 +153,11 @@ pub fn verify_present(store: &impl Store, cid: &str, event: &str, min_count: usi
     }
 }
 
-/// Serialize a trace to the ooptdd JSONL wire shape — one envelope per line. This is the bridge
-/// an external `ooptdd` (Python) verifier reads to judge a trace this Rust substrate emitted.
-pub fn to_ooptdd_jsonl(events: &[Event]) -> String {
+/// Serialize a trace to the native JSONL diagnostic shape, one envelope per line.
+pub fn to_trace_jsonl(events: &[Event]) -> String {
     events
         .iter()
-        .map(|e| e.to_ooptdd_json().to_string())
+        .map(|e| e.to_trace_json().to_string())
         .collect::<Vec<_>>()
         .join("\n")
 }

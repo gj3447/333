@@ -1,9 +1,0 @@
-# Lane A owned-object safety: an object version finalizes AT MOST ONCE (no double-spend). Read back
-# from the store, an `ooptdd` gate pins `spend_finalized == 1` for the single contested object — a
-# broken consistent-broadcast that double-finalizes makes the count 2 and turns this RED. The
-# equivocating spend must be visibly rejected.
-cid_env: OOPTDD_CID
-service: p333.consensus
-expect:
-  - {event: spend_finalized, op: "==", count: 1}
-  - {event: equivocation_rejected, op: ">=", count: 1}

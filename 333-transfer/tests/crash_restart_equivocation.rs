@@ -9,7 +9,7 @@
 // honest crash into one unit of spent Byzantine budget — more than `f` restarts
 // across a slot's voters break certificate uniqueness outright.
 //
-// Structure follows the ooptdd negative-oracle discipline: the positive tests are
+// Structure uses direct fault injection: the positive tests are
 // paired with a run that *omits* the journal and asserts the bug reproduces. A
 // green that cannot go red proves nothing.
 

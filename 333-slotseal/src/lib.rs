@@ -31,7 +31,7 @@
 //!
 //! KG: `prom16-333-optionA-total-order-leg`,
 //! `design-333-coin-recovery-optionA-reframe-2026-07-21`.
-//! LakatoTree: `LakatosTree_333_Cryptocurrency_20260721` node
+//! The implementation is covered by the crate's direct invariants and regression tests.
 //! `optionA-single-decree-ba-reframe` (predictions pending MCP restore).
 
 pub mod agreement;

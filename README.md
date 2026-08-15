@@ -50,7 +50,7 @@ asset-transfer theorem (Guerraoui et al., PODC 2019).
     in-memory mesh, real framed TCP, and Plumtree-style epidemic dissemination.
     Wire v2 rejects legacy unsigned orders, bounds decoded identity fields, and
     caps decoded certificate votes at the committee limit.
-  - `cargo test --all-targets` → **89 green, 0 ignored**. OOPTDD executes **10/10**
+  - `cargo test --all-targets` directly exercises the crate's unit and integration tests.
     independently bound gates: duplicate authority-key and invalid-genesis config
     rejection plus live-TCP forge-first rejection/zero votes, signed overspend
     rejection, same-slot recovery, certification, four-ledger convergence,

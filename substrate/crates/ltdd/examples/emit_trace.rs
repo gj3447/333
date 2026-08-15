@@ -1,11 +1,7 @@
-//! Emit a sample Super-Peer-announce trace as ooptdd JSONL on stdout — the bridge a Python
-//! `ooptdd` gate reads to judge a trace this Rust substrate emitted (generator ≠ verifier,
-//! across a language boundary).
-//!
-//!   cargo run -p p333-ltdd --example emit_trace > verify/trace.jsonl
-//!   python verify/ooptdd_verify.py verify/trace.jsonl verify/superpeer.yaml
+//! Emit a sample Super-Peer announcement trace as JSONL on stdout.
+//! The output is a transparent diagnostic format; native tests own the verdict.
 
-use p333_ltdd::{to_ooptdd_jsonl, Event};
+use p333_ltdd::{to_trace_jsonl, Event};
 
 fn main() {
     let cid = "superpeer-demo";
@@ -15,5 +11,5 @@ fn main() {
         Event::new(cid, "dht_put_ok").with("addr", "/ip4/10.0.0.1/udp/4001/quic-v1"),
         Event::new(cid, "resolve_ok").with("by", "independent-client"),
     ];
-    println!("{}", to_ooptdd_jsonl(&trace));
+    println!("{}", to_trace_jsonl(&trace));
 }

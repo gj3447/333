@@ -1,11 +1,8 @@
-//! Emit a CRDT convergence trace as ooptdd JSONL — the bridge a Python `ooptdd` gate reads to
-//! assert convergence cross-language (`converged` present, `replica_diverged` ABSENT).
-//!
-//!   cargo run -p p333-crdt --example emit_convergence > verify/convergence.jsonl
-//!   python verify/ooptdd_verify.py verify/convergence.jsonl verify/crdt_convergence.yaml
+//! Emit a CRDT convergence trace as JSONL for direct inspection.
+//! Native tests assert convergence and detect replica divergence.
 
 use p333_crdt::{gossip, record_states, GCounter};
-use p333_ltdd::{to_ooptdd_jsonl, MemoryStore, Store};
+use p333_ltdd::{to_trace_jsonl, MemoryStore, Store};
 
 fn main() {
     let cid = std::env::var("P333_CID")
@@ -23,5 +20,5 @@ fn main() {
     r[2].1.increment("c", 4);
     gossip(&mut r);
     record_states(&mut s, &cid, &r);
-    println!("{}", to_ooptdd_jsonl(&s.query(&cid)));
+    println!("{}", to_trace_jsonl(&s.query(&cid)));
 }

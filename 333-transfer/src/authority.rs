@@ -1657,7 +1657,7 @@ mod tests {
     // (Cuttlefish/Stingray FastUnlock routed through the 333-platform HotStuff
     // engine) would be needed for forced recovery WITHOUT owner cooperation,
     // NEVER a CRDT/LWW tie-break (CALM).
-    // LakatoTree: LakatosTree_333_Cryptocurrency_20260721 node `baseline-gap`
+    // Direct regression for the baseline split-vote gap.
     //   (pred recovery_paths_for_uncertified_contested_lock=0 for the
     //    UNCOOPERATIVE owner; cooperating-owner round-bump recovery landed).
     #[test]
@@ -1905,7 +1905,7 @@ mod tests {
     // terminal lock, decided only by what a straggler observes next. Preserving
     // cert-uniqueness therefore needs the consensus (Cuttlefish/Stingray Theorem 2
     // shared-log) leg, not just Theorem 1 quorum arithmetic.
-    // LakatoTree: LakatosTree_333_Cryptocurrency_20260721 node oq1-total-order-required.
+    // Direct regression for the total-order requirement.
     #[test]
     fn contested_slot_outcome_is_delivery_order_dependent_so_seal_needs_total_order() {
         // Snapshot common to both universes: a0,a1 lock order_a, a2 locks order_b,

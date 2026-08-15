@@ -148,7 +148,7 @@ broadcasts `EpochProposal`, collects `EpochVote`s like `VoteCollector`
 trigger); the operator is expected to quiet user traffic first — the fence
 makes this safe rather than merely polite.
 
-## 7. Oracle tests (ooptdd, to be added with implementation)
+## 7. Direct process tests (to be added with implementation)
 
 - `REQ-EPOCH-CHANGE`: reconfigure 4 → 4 (one member swapped). A transfer then
   certifies under the new committee; the retired member's votes are rejected.

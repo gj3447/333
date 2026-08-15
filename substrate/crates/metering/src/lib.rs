@@ -9,8 +9,8 @@
 //! HARD RULE (LTDD): the verdict is read back from the store, never the return value. A relay
 //! that reports "forwarded ok" while the debit silently never lands is FREE-RIDING; the
 //! conservation invariant `sum(cost@relay_forwarded) == sum(amount@credit_debited)` catches it.
-//! That invariant is a *value-consistency* relation (ooptdd's `invariant` / the queryable-causal
-//! rung), strictly stronger than asserting the events merely exist.
+//! That invariant is a value-consistency relation, strictly stronger than asserting
+//! that the events merely exist.
 
 use p333_ltdd::{Event, Store};
 

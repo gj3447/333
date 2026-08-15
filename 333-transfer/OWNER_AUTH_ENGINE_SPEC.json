@@ -156,7 +156,7 @@
     "Alias-bound authority signature preimages, duplicate-key committee rejection, and checked genesis and settlement arithmetic",
     "Wire v3 and verified-before-dedup collectors",
     "Public-key rosters plus separate authority and owner secret loading",
-    "Forge-first multi-process OOPTDD conformance"
+    "Forge-first multi-process direct conformance"
   ],
   "falsifiers": [
     "Any unsigned network Order reaches Authority::handle.",

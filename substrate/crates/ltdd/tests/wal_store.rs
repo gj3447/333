@@ -19,7 +19,7 @@ fn tmpdir() -> tempfile::TempDir {
 #[test]
 fn envelope_roundtrip_law() {
     let e = Event::new("cid-1", "spend_finalized").with("object", "coin-A").with("version", 3u64);
-    assert_eq!(Event::from_ooptdd_json(&e.to_ooptdd_json()), Some(e));
+    assert_eq!(Event::from_trace_json(&e.to_trace_json()), Some(e));
 }
 
 #[test]

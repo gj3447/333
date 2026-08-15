@@ -55,8 +55,8 @@ pub fn gossip(replicas: &mut [(&str, GCounter)]) {
     }
 }
 
-/// Generic convergence recorder — CRDT-agnostic, so the SAME ooptdd gate judges a G-Counter or a
-/// yrs document. Emits `replica_final{state}` per replica; `converged` iff all states agree, else a
+/// Generic convergence recorder for both a G-Counter and a yrs document. Emits
+/// `replica_final{state}` per replica; `converged` iff all states agree, else a
 /// `replica_diverged{state,expected}` per offender. The store — not this bool — is the judge.
 pub fn record_convergence(store: &mut impl Store, cid: &str, states: &[(&str, String)]) -> bool {
     let canonical = states.first().map(|(_, s)| s.clone()).unwrap_or_default();

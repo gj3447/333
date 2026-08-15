@@ -118,7 +118,7 @@ impl WalStore {
         for e in entries {
             let value: serde_json::Value = serde_json::from_slice(&e.payload)
                 .map_err(|err| WalStoreError::Envelope { seq: e.seq, detail: err.to_string() })?;
-            let event = Event::from_ooptdd_json(&value).ok_or_else(|| WalStoreError::Envelope {
+            let event = Event::from_trace_json(&value).ok_or_else(|| WalStoreError::Envelope {
                 seq: e.seq,
                 detail: "missing cid/event keys".into(),
             })?;
@@ -185,7 +185,7 @@ impl Store for WalStore {
             return; // already failing: hold the line, never resume silently
         }
         for e in events {
-            let payload = e.to_ooptdd_json().to_string();
+            let payload = e.to_trace_json().to_string();
             match self.wal.append(payload.as_bytes()) {
                 Ok(_seq) => self.index.push(e.clone()),
                 Err(err) => {

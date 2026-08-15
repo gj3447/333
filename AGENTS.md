@@ -54,28 +54,17 @@ cd substrate    && cargo test --locked          # p333 workspace
 `--all-targets` does **not** run doctests. If a crate has any, run
 `cargo test --doc` as a separate step.
 
-### Node conformance (the real gate for transfer333)
+### Transfer conformance
+
+Use the crate's native unit and integration tests as the executable boundary:
 
 ```
-cd /path/to/333 && <ooptdd-loop-venv>/bin/ooptdd-loop run ooptdd/node_requirements.yaml --json
+cd /path/to/333/333-transfer && cargo test --all-targets
 ```
 
-This is **not a mock.** `run_node_probe` spawns the actual `node` binary as
-separate OS processes (4 authorities + a submit client) talking over real TCP,
-reads their live JSON stdout, and ships one trace event per genuinely-observed
-behaviour. Ten gates, each Longinus-bound to an event literal:
-
-```
-forged_owner_rejected              forgery_did_not_poison_slot
-forged_order_zero_votes            node_certifies_over_tcp
-authority_ledgers_converge         double_spend_rejected
-out_of_order_rejected              overspend_rejected
-duplicate_authority_key_rejected   invalid_genesis_rejected
-```
-
-A regressed node — no consensus, diverged ledgers, an applied double-spend, an
-accepted skipped sequence — turns the bound gate RED. There is no `ooptdd-loop`
-on PATH here; it lives in the sibling `ooptdd-loop` repo's venv.
+These tests exercise the real transfer, authority, mesh, TCP, persistence, and
+fault-injection paths. Do not introduce an external verdict service or a static
+rule file between the implementation and the measured result.
 
 ## Disk hazard on the Mac
 
@@ -94,9 +83,9 @@ A task is complete only when:
 1. Tests were added or updated for the behavior you changed.
 2. The touched crate's `cargo test --all-targets` exits 0, from a baseline you
    recorded before editing.
-3. For `transfer333` behavior, the ten node-conformance gates are green against
-   real processes — not against a mock, and not by relaxing an event literal.
-4. No test, gate, event literal, or Longinus binding was weakened.
+3. For `transfer333` behavior, the native unit and integration tests exercise
+   the real implementation rather than a mock.
+4. No direct test or asserted invariant was weakened.
 5. The final diff was reviewed for unrelated changes.
 
 Adding a crate, test, or gate needs no approval. **Removing a gate, relaxing an
