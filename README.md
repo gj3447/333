@@ -104,3 +104,11 @@ modification notices, and the distinction between derived source and design
 references are recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
 and [`333-crdt/NOTICE`](333-crdt/NOTICE). Package dependencies retain their own
 licenses.
+
+## MetaHumotonic adoption boundary
+
+**MetaHumotonic License 1.2** — [METAHUMOTONIC-LICENSE](METAHUMOTONIC-LICENSE); [scope, prior grants and third-party notices](LICENSE-NOTICE.md).
+
+지정한 하드웨어의 접근권한과 전체 관리 권한을 합의한 명세서에 따라 공유하고, **CHU의 일부가 된다**는 참여 원칙을 적용합니다. 실제 접근에는 별도 승인이 필요합니다.
+
+**Existing combined software remains AGPL-3.0-only.** MHL is limited to independently licensable new works; see LICENSE-NOTICE.md.
